@@ -9,17 +9,7 @@
 Tile Language (**tile-lang**) is a concise domain-specific language designed to streamline the development of high-performance GPU/CPU kernels (e.g., GEMM, Dequant GEMM, FlashAttention, LinearAttention). By employing a Pythonic syntax with an underlying compiler infrastructure on top of [TVM](https://tvm.apache.org/), tile-lang allows developers to focus on productivity without sacrificing the low-level optimizations necessary for state-of-the-art performance.
 
 ## Tested Devices
-Although tile-lang aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices:
-- **NVIDIA GPUS**: 
-    - H100 (**with Auto TMA/WGMMA Support**), 
-    - A100
-    - V100
-    - RTX 4090
-    - RTX 3090
-    - RTX A600
-- **AMD GPUS**:
-    - MI250 (**with Auto MatrixCore Support**)
-    - MI300 (**with Async Copy Support**)
+Although tile-lang aims to be portable across a range of Devices, it has been specifically tested and validated on the following devices: for NVIDIA GPUs, this includes the H100 (with Auto TMA/WGMMA support), A100, V100, RTX 4090, RTX 3090, and RTX A600; for AMD GPUs, it includes the MI250 (with Auto MatrixCore support) and the MI300X (with Async Copy support).
 
 ## OP Implementation Examples
 **tile-lang** provides the building blocks to implement a wide variety of operators. Some examples include:
@@ -35,16 +25,16 @@ Within the `examples` repository, you will also find additional complex kernelsâ
 
 TileLang achieves exceptional performance across a variety of computational patterns. Below are selected results showcasing its capabilities:
 
-- Operator Performance Vs. Baselines on H100
+- Flash Attention Performance on H100
 
   <div>
-    <img src="./images/op_benchmark_h100.png" alt="operator performance on H100" />
+    <img src="./images/mha_performance_h100.png" alt="operator performance on H100" />
   </div>
 
-- MatrixCore FP16 GEMM Performance Vs. Baselines on MI300X
+- Matmul Performance on GPUs (RTX 4090, A100, H100, MI300X)
 
   <div>
-    <img src="./images/op_benchmark_mi300_fp16_gemm_normalized_latency.png" alt="gemm fp16 performance on MI300X" />
+    <img src="./images/op_benchmark_consistent_gemm_fp16.png" alt="gemm fp16 performance on Gpus" />
   </div>
 
 ## Installation
