@@ -48,6 +48,38 @@ def mma_store_32x8_to_shared_16x16_layout(thread_id, local_id):
     return row, col
 
 
+# sr represents spatial + reduction layout
+# the first axis is spatial while the second axis is reduction
+def shared_16x16_to_mma_32x8_layout_sr(i, j):
+    thread_id = 4 * (i % 8) + (j % 8) // 2
+    return thread_id, 4 * (j // 8) + (i // 8) * 2 + (j % 2)
+
+
+def shared_16x16_to_mma_32x8_layout_rs(i, j):
+    thread_id = 4 * (j % 8) + (i % 8) // 2
+    return thread_id, 4 * (i // 8) + (j // 8) * 2 + (i % 2)
+
+
+shared_16x16_to_mma_32x8_layout = shared_16x16_to_mma_32x8_layout_sr
+shared_16x16_to_mma_32x8_layout_trans = shared_16x16_to_mma_32x8_layout_rs
+
+
+def shared_16x32_to_mma_32x16_layout(i, j):
+    thread_id = 4 * (i % 8) + (j % 16) // 4
+    return thread_id, 8 * (j // 16) + (i // 8) * 4 + j % 4
+
+
+def shared_32x16_to_mma_32x16_layout(i, j):
+    thread_id = (i % 16) // 4 + 4 * (j % 8)
+    return thread_id, 8 * (j // 8) + (i // 16) * 4 + i % 4
+
+
+def mma_32x8_to_shared_16x16_layout(thread_id, local_id):
+    row = 8 * (local_id % 4 // 2) + (thread_id // 4)
+    col = 8 * (local_id // 4) + (thread_id % 4) * 2 + (local_id % 2)
+    return row, col
+
+
 def shared_16x16_to_mma_32x8_smoothlayout(i, j):
     return (i * 2 + j // 8, j % 8)
 

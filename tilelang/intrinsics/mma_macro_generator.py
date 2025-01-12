@@ -11,6 +11,7 @@ from .utils import (
     mma_store_index_map,
     get_ldmatrix_offset,
 )
+from tilelang.utils import is_fragment
 
 lift = convert
 
@@ -97,7 +98,7 @@ class TensorCoreIntrinEmitter(object):
         self.b_dtype_abbrv = self.dtype_abbrv[b_dtype]
         self.accum_dtype_abbrv = self.dtype_abbrv[accum_dtype]
 
-    def _initialize_mma_prefix(self, k_dim=16):
+    def _initialize_mma_prefix(self, k_dim: int = 16):
         if k_dim == 16:
             self.mma_prefix = "m16n8k16"
         elif k_dim == 32:
@@ -105,7 +106,7 @@ class TensorCoreIntrinEmitter(object):
         else:
             raise ValueError("Unsupported k_dim")
 
-    def _initialize_micro_size(self, m_dim=16, n_dim=16, k_dim=16):
+    def _initialize_micro_size(self, m_dim: int = 16, n_dim: int = 16, k_dim: int = 16):
         self.micro_size_x = m_dim
         self.micro_size_y = n_dim
         self.micro_size_k = k_dim
@@ -122,9 +123,10 @@ class TensorCoreIntrinEmitter(object):
         inverse_index_map = index_map.inverse([warp_size, local_size_c])
         return inverse_index_map
 
-    def extract_thread_binding(self,
-                               thread_id,
-                               is_m_first=None) -> Tuple[PrimExpr, PrimExpr, PrimExpr]:
+    def extract_thread_binding(
+            self,
+            thread_id: PrimExpr,
+            is_m_first: Optional[bool] = None) -> Tuple[PrimExpr, PrimExpr, PrimExpr]:
         """
         is_m_first: True if the thread binding is in the form of (tx, warp_n, warp_m)
         which represents [warp_size, block_row_warps (split n), block_col_warps (split m)]
@@ -153,7 +155,12 @@ class TensorCoreIntrinEmitter(object):
             )
             return lane_id, warp_n, warp_m
 
-    def ldmatrix_a(self, A_local_buf, A_shared_buf, ki, thread_bindings, rk=0):
+    def ldmatrix_a(self,
+                   A_local_buf: Buffer,
+                   A_shared_buf: Buffer,
+                   ki: PrimExpr,
+                   thread_bindings: PrimExpr,
+                   rk: Optional[PrimExpr] = 0):
         warp_row_tiles = self.warp_row_tiles
         warp_rows = self.warp_rows
         chunk = self.chunk
@@ -190,7 +197,12 @@ class TensorCoreIntrinEmitter(object):
 
         return _warp_ldmatrix_a(A_local_buf, A_shared_buf, ki, thread_bindings, rk)
 
-    def ldmatrix_b(self, B_local_buf, B_shared_buf, ki, thread_bindings, rk=0):
+    def ldmatrix_b(self,
+                   B_local_buf: Buffer,
+                   B_shared_buf: Buffer,
+                   ki: PrimExpr,
+                   thread_bindings: PrimExpr,
+                   rk: Optional[PrimExpr] = 0):
         warp_col_tiles = self.warp_col_tiles
         warp_cols = self.warp_cols
         chunk = self.chunk
@@ -232,7 +244,11 @@ class TensorCoreIntrinEmitter(object):
 
         return _warp_ldmatrix_b(B_local_buf, B_shared_buf, ki, thread_bindings, rk)
 
-    def mma(self, A_local_buf, B_local_buf, C_local_buf, k_inner=0):
+    def mma(self,
+            A_local_buf: Buffer,
+            B_local_buf: Buffer,
+            C_local_buf: Buffer,
+            k_inner: Optional[PrimExpr] = 0):
         warp_rows = self.warp_rows
         warp_cols = self.warp_cols
         local_size_a = self.local_size_a
@@ -243,6 +259,11 @@ class TensorCoreIntrinEmitter(object):
         accum_dtype = self.accum_dtype
         accum_dtype_abbrv = self.accum_dtype_abbrv
         mma_prefix = self.mma_prefix
+
+        a_is_fragment = is_fragment(A_local_buf)
+        b_is_fragment = is_fragment(B_local_buf)
+        a_local_stride: PrimExpr = k_inner * warp_rows * local_size_a if a_is_fragment else 0
+        b_local_stride: PrimExpr = k_inner * warp_cols * local_size_b if b_is_fragment else 0
 
         @T.macro
         def _warp_mma(A_local_buf, B_local_buf, C_local_buf):
@@ -256,9 +277,9 @@ class TensorCoreIntrinEmitter(object):
                     b_dtype_abbrv,
                     accum_dtype_abbrv,
                     A_local_buf.data,
-                    k_inner * warp_rows * local_size_a + i * local_size_a,
+                    a_local_stride + i * local_size_a,
                     B_local_buf.data,
-                    k_inner * warp_cols * local_size_b + j * local_size_b,
+                    b_local_stride + j * local_size_b,
                     C_local_buf.data,
                     i * warp_cols * local_size_out + j * local_size_out,
                     T.bool(False),
@@ -273,9 +294,9 @@ class TensorCoreIntrinEmitter(object):
                     b_dtype_abbrv,
                     accum_dtype_abbrv,
                     A_local_buf.data,
-                    k_inner * warp_rows * local_size_a + i * local_size_a,
+                    a_local_stride + i * local_size_a,
                     B_local_buf.data,
-                    k_inner * warp_cols * local_size_b + j * local_size_b + lift(local_size_b) // 2,
+                    b_local_stride + j * local_size_b + lift(local_size_b) // 2,
                     C_local_buf.data,
                     i * warp_cols * local_size_out + j * local_size_out + lift(local_size_out) // 2,
                     T.bool(False),
@@ -352,105 +373,85 @@ class TensorCoreIntrinEmitter(object):
         AssertionError
             If `local_buf` is not detected to be a fragment buffer.
         """
-        from tilelang.primitives.utils import is_fragment
+        from tilelang.utils import is_fragment
         from tilelang.intrinsics.mma_layout import (
-            ldmatrix_32x8_to_shared_16x16_layout,
-            ldmatrix_trans_32x8_to_shared_16x16_layout,
-            ldmatrix_16x32_to_shared_16x32_layout_a,
-            ldmatrix_16x32_to_shared_16x32_layout_b,
+            shared_16x16_to_mma_32x8_layout_sr,
+            shared_16x16_to_mma_32x8_layout_rs,
+            shared_16x32_to_mma_32x16_layout,
+            shared_32x16_to_mma_32x16_layout,
         )
         assert matrix in ["A", "B"], "matrix should be either A or B"
         dtype = self.a_dtype if matrix == "A" else self.b_dtype
         dtype_bits = DataType(dtype).bits
         transposed = self.a_transposed
-        transform_func: Callable = None
-        transform_func_trans: Callable = None
+        assert transposed is False, "transposed is not supported yet"
+        # s represents spatial axis
+        # r represents reduction axis
+        # sr represents the two dims are spatial + reduction
+        # rs represents the two dims are reduction + spatial
+        transform_func_sr: Callable = None
+        transform_func_rs: Callable = None
         if dtype_bits == 16:
-            transform_func = ldmatrix_32x8_to_shared_16x16_layout
-            transform_func_trans = ldmatrix_trans_32x8_to_shared_16x16_layout
+            transform_func_sr = shared_16x16_to_mma_32x8_layout_sr
+            transform_func_rs = shared_16x16_to_mma_32x8_layout_rs
         elif dtype_bits == 8:
-            if matrix == "B" and transposed:
-                transform_func = ldmatrix_16x32_to_shared_16x32_layout_b
-            elif matrix == "A" and not transposed:
-                transform_func = ldmatrix_16x32_to_shared_16x32_layout_a
-            else:
-                raise ValueError(
-                    "ldmatrix only supports B transposed and A non-transposed for int8")
+            transform_func_sr = shared_16x32_to_mma_32x16_layout
+            transform_func_rs = shared_32x16_to_mma_32x16_layout
         else:
             raise ValueError(f"Unsupported dtype {dtype}")
+        is_sr_conditions = [False]
+        is_sr_conditions.append(matrix == "A" and not transposed)
+        is_sr_conditions.append(matrix == "B" and transposed)
+        is_sr_axis_order = any(is_sr_conditions)
 
-        shape = local_buf.shape
+        transform_func: Callable = transform_func_sr if is_sr_axis_order else transform_func_rs
+
         assert is_fragment(local_buf), "local_buf must be a fragment, but got {}".format(
             local_buf.scope())
 
         if matrix == "A":
-            micro_size_x, micro_size_y = self.micro_size_x, self.micro_size_k
+            micro_size_s, micro_size_r = self.micro_size_x, self.micro_size_k
         else:
-            micro_size_x, micro_size_y = self.micro_size_k, self.micro_size_y
-        if transposed:
-            micro_size_x, micro_size_y = micro_size_y, micro_size_x
+            micro_size_r, micro_size_s = self.micro_size_k, self.micro_size_y
 
-        local_size_out = self.local_size_out
         block_row_warps, block_col_warps = (
             self.block_row_warps,
             self.block_col_warps,
         )
         warp_rows, warp_cols = self.warp_rows, self.warp_cols
-        warp_size = self.WARP_SIZE
-        is_m_first = self.is_m_first
-        transform_func = transform_func if not transposed else transform_func_trans
-        warp_size, local_size_a, local_size_b = self.WARP_SIZE, self.local_size_a, self.local_size_b
-        local_size = local_size_a if matrix == "A" else local_size_b
-        inverse_mma_load_layout = IndexMap.from_func(
-            transform_func, index_dtype="int32").inverse([warp_size, local_size])
+        warp_s = warp_rows if matrix == "A" else warp_cols
+        chunk = self.chunk
+        transform_func = transform_func
+        inverse_mma_load_layout = IndexMap.from_func(transform_func, index_dtype="int32")
 
         def forward_thread(i: int, j: int) -> int:
             """
             Given the row index `i` and column index `j` in the fragment,
-            map them to a thread index according to `inverse_mma_store_layout`.
             """
-            # the upper bounds of i and j are block_row_warps * warp_rows * micro_size_x and block_col_warps * warp_cols * micro_size_y
-            # the upper bounds of block_row_warps and block_col_warps are warp_rows and warp_cols
-            block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
-            # the upper bounds of warp_i and warp_j are warp_rows and warp_cols
-            warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
-            # upper bounds of mma_i and mma_j are micro_size_x and micro_size_y
-            mma_i, mma_j = i % micro_size_x, j % micro_size_y
-            lane_id, _ = inverse_mma_load_layout.map_indices([mma_i, mma_j])
-            if is_m_first:
-                thread_id = (
-                    block_i * (block_col_warps * warp_cols) + block_j * warp_rows +
-                    warp_i * warp_cols + warp_j)
-            else:
-                thread_id = (
-                    block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id)
-            return thread_id
+            lane_id, _ = inverse_mma_load_layout.map_indices([i, j])
+            return lane_id
 
         def forward_index(i: int, j: int) -> int:
             """
             Given the row index `i` and column index `j` in the fragment,
-            map them to a local index in a single thread according
-            to `inverse_mma_store_layout`.
             """
-            # the upper bounds of i and j are block_row_warps * warp_rows * micro_size_x and block_col_warps * warp_cols * micro_size_y
-            # the upper bounds of block_row_warps and block_col_warps are warp_rows and warp_cols
-            block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
-            # the upper bounds of warp_i and warp_j are warp_rows and warp_cols
-            warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
-            # upper bounds of mma_i and mma_j are micro_size_x and micro_size_y
-            mma_i, mma_j = i % micro_size_x, j % micro_size_y
-            _, local_id = inverse_mma_load_layout.map_indices([mma_i, mma_j])
-            return (warp_i * (warp_cols * local_size_out) + warp_j * local_size_out + local_id)
+            _, local_id = inverse_mma_load_layout.map_indices([i, j])
+            return local_id
 
-        fragment = T.Fragment(
-            shape,
+        base_fragment = T.Fragment(
+            [micro_size_r, micro_size_s],
             forward_thread_fn=forward_thread,
             forward_index_fn=forward_index,
         )
-        print(f"fragment.shape: {local_buf.shape}")
-        print(f"fragment.thread: {fragment.thread}")
-        print(f"fragment.index: {fragment.index}")
-        return fragment
+        warp_fragment = base_fragment.repeat([block_row_warps, 1],
+                                             repeat_on_thread=True).replicate(block_col_warps)
+        block_fragment = warp_fragment.repeat([warp_s, chunk // micro_size_r],
+                                              repeat_on_thread=False,
+                                              lower_dim_first=False)
+        print(f"base_fragment: {base_fragment}")
+        print(f"warp_fragment: {warp_fragment}")
+        print(f"block_fragment: {block_fragment}")
+        return block_fragment
 
     def make_mma_store_layout(self, local_buf: Buffer) -> T.Fragment:
         """
@@ -474,7 +475,7 @@ class TensorCoreIntrinEmitter(object):
         AssertionError
             If `local_buf` is not detected to be a fragment buffer.
         """
-        from tilelang.primitives.utils import is_fragment
+        from tilelang.utils import is_fragment
 
         shape = local_buf.shape
         inverse_mma_store_layout = self.get_store_index_map(inverse=True)
@@ -494,14 +495,11 @@ class TensorCoreIntrinEmitter(object):
             # the upper bounds of i and j are block_row_warps * warp_rows * micro_size_x and block_col_warps * warp_cols * micro_size_y
             # the upper bounds of block_row_warps and block_col_warps are warp_rows and warp_cols
             block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
-            # the upper bounds of warp_i and warp_j are warp_rows and warp_cols
-            warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             # upper bounds of mma_i and mma_j are micro_size_x and micro_size_y
             mma_i, mma_j = i % micro_size_x, j % micro_size_y
             lane_id, _ = inverse_mma_store_layout.map_indices([mma_i, mma_j])
             if is_m_first:
-                thread_id = block_i * (
-                    block_col_warps * warp_cols) + block_j * warp_rows + warp_i * warp_cols + warp_j
+                thread_id = block_i * (block_col_warps * warp_cols) + block_j * warp_size + lane_id
             else:
                 thread_id = block_j * (block_row_warps * warp_size) + block_i * warp_size + lane_id
             return thread_id
@@ -513,8 +511,6 @@ class TensorCoreIntrinEmitter(object):
             to `inverse_mma_store_layout`.
             """
             # the upper bounds of i and j are block_row_warps * warp_rows * micro_size_x and block_col_warps * warp_cols * micro_size_y
-            # the upper bounds of block_row_warps and block_col_warps are warp_rows and warp_cols
-            block_i, block_j = (i // micro_size_x) // warp_rows, (j // micro_size_y) // warp_cols
             # the upper bounds of warp_i and warp_j are warp_rows and warp_cols
             warp_i, warp_j = (i // micro_size_x) % warp_rows, (j // micro_size_y) % warp_cols
             # upper bounds of mma_i and mma_j are micro_size_x and micro_size_y

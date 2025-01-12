@@ -4,6 +4,7 @@
 from tvm.tir import Buffer
 from typing import List
 from functools import reduce
+
 # Scope Checkers for TVM Buffers
 # These utility functions check the memory scope of a given TVM buffer.
 
