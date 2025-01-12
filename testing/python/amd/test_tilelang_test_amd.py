@@ -101,6 +101,7 @@ def run_gemm(
     mod.assert_allclose(ref_program, atol=1e-2, rtol=1e-2)
 
 
+@tilelang.testing.requires_rocm
 def test_gemm_f16f32f32_nt():
     run_gemm(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 128, 32)
     run_gemm(1024, 1024, 1024, False, True, "float16", "float32", "float32", 128, 128, 32, k_pack=2)

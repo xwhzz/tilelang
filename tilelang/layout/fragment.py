@@ -30,6 +30,7 @@ class Fragment(Layout):
         else:
             thread_replicate = None
             forward_thread = forward_thread_fn(*vars)
+
         self.__init_handle_by_constructor__(
             _ffi_api.Fragment,
             forward_vars,
@@ -45,11 +46,20 @@ class Fragment(Layout):
     def get_thread_size(self):
         return _ffi_api.Fragment_thread_size(self)
 
-    def repeat(self, repeats, repeat_on_thread: bool = False) -> "Fragment":
-        return _ffi_api.Fragment_repeat(self, repeats, repeat_on_thread)
+    def repeat(self,
+               repeats,
+               repeat_on_thread: bool = False,
+               lower_dim_first: bool = True) -> "Fragment":
+        return _ffi_api.Fragment_repeat(self, repeats, repeat_on_thread, lower_dim_first)
+
+    def replicate(self, replicate: int) -> "Fragment":
+        return _ffi_api.Fragment_replicate(self, replicate)
 
     def condense_rep_var(self) -> "Fragment":
         return _ffi_api.Fragment_condense_rep_var(self)
+
+    def __repr__(self):
+        return f"Fragment<thread={self.thread}, index={self.index}>"
 
 
 def make_swizzled_layout(buffer: tvm.tir.Buffer):

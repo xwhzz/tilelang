@@ -1,13 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from __future__ import annotations
-from typing import Optional, Dict
-
 from dataclasses import dataclass
 from tvm import tir
 import tilelang.language as T
-from tilelang.primitives.utils import is_fragment, array_reduce
+from tilelang.utils import is_fragment
 from tilelang.primitives.gemm.base import GemmBaseParams
 from tilelang.intrinsics.mma_macro_generator import TensorCoreIntrinEmitter
 
@@ -39,9 +36,7 @@ class GemmPrimitiveMMA(GemmBaseParams):
     ) -> tir.PrimExpr:
 
         in_dtype = self.in_dtype
-        warp_rows = mma_emitter.warp_rows
         warp_cols = mma_emitter.warp_cols
-        local_size_a = mma_emitter.local_size_a
         local_size_b = mma_emitter.local_size_b
         block_K = mma_emitter.chunk
         micro_size_k = mma_emitter.micro_size_k
@@ -71,6 +66,10 @@ class GemmPrimitiveMMA(GemmBaseParams):
                     C_local: mma_emitter.make_mma_store_layout(C_local),
                 })
 
+            # Make default swizzle layout for shared memory
+            # T.annotate_layout({
+            #     B_shared: make_mma_swizzle_layout(B_shared),
+            # })
             for ki in T.serial(0, (block_K // micro_size_k)):
 
                 # Load B into fragment
@@ -197,7 +196,7 @@ class GemmPrimitiveMMA(GemmBaseParams):
         """
 
         # Infer block partition if necessary
-        current_frame = T.kernel.KernelLaunchFrame.Current()
+        current_frame = T.KernelLaunchFrame.Current()
         threads = current_frame.num_threads
         self.infer_block_partition(threads)
 

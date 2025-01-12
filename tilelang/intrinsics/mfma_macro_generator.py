@@ -1,7 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-import tvm.tl.language as T
+from tilelang import tvm as tvm
+import tilelang.language as T
 from typing import Tuple
 from tvm import DataType
 from tvm.tir import PrimExpr
