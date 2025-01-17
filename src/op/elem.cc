@@ -138,6 +138,8 @@ For Copy::MakeSIMTLoop(arith::Analyzer *analyzer) const {
 }
 
 Stmt Copy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  Target target = T.target;
+  bool is_cpu_target = target->GetTargetDeviceType() == kDLCPU;
   Stmt ldsm_stmt = LowerLDSMCopy(T, analyzer);
   if (ldsm_stmt.defined())
     return ldsm_stmt;
@@ -148,12 +150,19 @@ Stmt Copy::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
   auto simt_loop = MakeSIMTLoop(analyzer);
   auto fused_loop = Downcast<For>(ParallelLoopFuser::Fuse(simt_loop));
 
+  For vectorized_thread_loop;
   auto par_op = std::make_unique<ParallelOp>(fused_loop);
-  par_op->InferLayout({T.target, T.block_size, T.layout_map, T.buffer_remap},
-                      InferLevel::kFree);
-  auto thread_loop = PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer,
-                                   par_op->GetLoopLayout());
-  auto vectorized_thread_loop = VectorizeLoop(thread_loop);
+
+  if (is_cpu_target) {
+    vectorized_thread_loop = VectorizeLoop(fused_loop);
+  } else {
+    par_op->InferLayout({T.target, T.block_size, T.layout_map, T.buffer_remap},
+                        InferLevel::kFree);
+    auto thread_loop = PartitionLoop(par_op->GetRoot(), T.thread_var, analyzer,
+                                     par_op->GetLoopLayout());
+    vectorized_thread_loop = VectorizeLoop(thread_loop);
+  }
+
   if (par_op->GetPredicate(T.thread_var).defined()) {
     return IfThenElse(par_op->GetPredicate(T.thread_var).value(),
                       vectorized_thread_loop);

@@ -7,6 +7,14 @@ from tvm.target import Target
 from tvm.contrib import rocm
 from tilelang.contrib import nvcc
 
+AVALIABLE_TARGETS = {
+    "auto",
+    "cuda",
+    "hip",
+    "c",  # represent c source backend
+    "llvm",
+}
+
 
 def check_cuda_availability() -> bool:
     """
@@ -64,8 +72,6 @@ def determine_target(target: Union[str, Target, Literal["auto"]]) -> Union[str, 
             raise ValueError("No CUDA or HIP available on this system.")
     else:
         # Validate the target if it's not "auto"
-        assert isinstance(target, Target) or target in [
-            "cuda",
-            "hip",
-        ], f"Target {target} is not supported"
+        assert isinstance(
+            target, Target) or target in AVALIABLE_TARGETS, f"Target {target} is not supported"
         return target
