@@ -164,3 +164,25 @@ def LegalizeSafeMemoryAccess():
         The result pass
     """
     return _ffi_api.LegalizeSafeMemoryAccess()  # type: ignore
+
+
+def MakePackedAPI():
+    """MakePackedAPI
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.MakePackedAPI()  # type: ignore
+
+
+def AnnotateDeviceRegions():
+    """AnnotateDeviceRegions
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.AnnotateDeviceRegions()  # type: ignore

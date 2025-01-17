@@ -6,7 +6,7 @@ from typing import Union, List, Tuple, Optional
 from collections import deque
 from tvm import tir
 from tvm.tir import Var
-from tvm.script.ir_builder.tir.frame import TIRFrame
+from tvm.script.ir_builder.tir.frame import TIRFrame, BlockFrame
 from tvm._ffi import register_object
 from tilelang import _ffi_api
 
@@ -73,13 +73,22 @@ class KernelLaunchFrame(TIRFrame):
         """
         super().__enter__()
         _kernel_launch_frame_stack.push(self)
-
         # If we have exactly 5 frames, return the single iter_var.var.
         if len(self.frames) == 5:
             return self.frames[0].iter_var.var
 
-        # Otherwise, return a list of iter_var.var objects (excluding the last 4 frames).
-        return [frame.iter_var.var for frame in self.frames[0:-4]]
+        last_block_frame = self.frames[-1]
+        assert isinstance(last_block_frame, BlockFrame), "Last frame must be a block frame"
+
+        maybe_cpu = last_block_frame.annotations.get("tilelang.is_cpu_kernel_frame", False)
+
+        if maybe_cpu:
+            # CPU kernel frame, return a list of for frame items.
+            return [frame.vars[0] for frame in self.frames[0:-1]]
+        else:
+            # Otherwise, return a list of iter_var.var objects (excluding the last 4 frames).
+            # As 4 frames for threadIdx.x, threadIdx.y, threadIdx.z and block frame with attributes
+            return [frame.iter_var.var for frame in self.frames[0:-4]]
 
     def __exit__(self, ptype, value, trace):
         """
@@ -148,7 +157,8 @@ class KernelLaunchFrame(TIRFrame):
 
 def Kernel(
     *blocks: List[tir.PrimExpr],
-    threads: Union[int, List[int], Tuple] = 128,
+    threads: Optional[Union[int, List[int], Tuple]] = None,
+    is_cpu: bool = False,
     prelude: Optional[str] = None,
 ):
     """Tools to quickly construct a GPU kernel launch frame.
@@ -161,11 +171,13 @@ def Kernel(
         A integer representing blockDim.x
         Or a list of integers representing blockDim.(x|y|z)
         if the value is -1, we skip the threadIdx.x binding.
+    is_cpu : bool
+        Whether the kernel is running on CPU.
+        Thus we will not bind threadIdx.x, threadIdx.y, threadIdx.z.
+        and blockIdx.x, blockIdx.y, blockIdx.z.
     prelude : str
         The import c code of the kernel,
         will be injected before the generated kernel code.
-    layout_annotation: Optional[Map[tir.Buffer, tir.IndexMap]]
-        The layout annotation map, used to annotate the layout of the buffers.
 
     Returns
     -------
@@ -174,6 +186,9 @@ def Kernel(
     """
     attrs: dict = {}
 
+    if not is_cpu and threads is None:
+        threads = 128  # default thread number
+
     if isinstance(threads, int):
         threads = [threads, 1, 1]
     elif isinstance(threads, list):
@@ -181,7 +196,10 @@ def Kernel(
     elif isinstance(threads, tuple):
         threads = list(threads) + [1] * (3 - len(threads))
     else:
-        raise ValueError("threads must be an integer or a list of integers")
+        assert is_cpu, "threads must be an integer or a list of integers"
+
+    if is_cpu:
+        attrs["tilelang.is_cpu_kernel_frame"] = True
 
     if prelude is not None:
         attrs["pragma_import_c"] = prelude

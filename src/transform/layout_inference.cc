@@ -35,9 +35,85 @@
 #include "common/loop_fusion_utils.h"
 #include "loop_partition.h"
 #include "loop_vectorize.h"
+#include "runtime/thread_storage_scope.h"
+#include "tir/transforms/ir_utils.h"
 
 namespace tvm {
 namespace tl {
+
+using namespace tir;
+
+using runtime::StorageRank;
+using runtime::StorageScope;
+
+static bool IsDynamicSharedMemory(Var buffer_var) {
+  StorageScope storage_scope =
+      runtime::StorageScope::Create(GetPtrStorageScope(buffer_var));
+  return storage_scope.rank == runtime::StorageRank::kShared &&
+         storage_scope.tag == ".dyn";
+}
+
+static bool IsStaticSharedMemory(Var buffer_var) {
+  StorageScope storage_scope =
+      runtime::StorageScope::Create(GetPtrStorageScope(buffer_var));
+  return storage_scope.rank == runtime::StorageRank::kShared &&
+         storage_scope.tag == "";
+}
+
+static bool isLocalFragment(Var buffer_var) {
+  StorageScope storage_scope =
+      runtime::StorageScope::Create(GetPtrStorageScope(buffer_var));
+  return storage_scope.rank == runtime::StorageRank::kLocal &&
+         storage_scope.tag == ".fragment";
+}
+
+/*!
+ * \brief collect the mapping from the buffer var to its allocate
+ */
+class AllocateCollector : public StmtExprVisitor {
+public:
+  void VisitStmt_(const AllocateNode *op) final {
+    if (IsDynamicSharedMemory(op->buffer_var)) {
+      dyn_shmem_allocs_[op->buffer_var.get()] = op;
+    } else if (IsStaticSharedMemory(op->buffer_var)) {
+      static_shmem_allocs_[op->buffer_var.get()] = op;
+    } else if (isLocalFragment(op->buffer_var)) {
+      local_fragment_allocs_[op->buffer_var.get()] = op;
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+  void VisitStmt_(const BlockNode *op) final {
+    for (auto buffer : op->alloc_buffers) {
+      if (IsDynamicSharedMemory(buffer->data)) {
+        dyn_shmem_allocs_[buffer->data.get()] = op;
+      } else if (IsStaticSharedMemory(buffer->data)) {
+        static_shmem_allocs_[buffer->data.get()] = op;
+      } else if (isLocalFragment(buffer->data)) {
+        local_fragment_allocs_[buffer->data.get()] = op;
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AllocateConstNode *op) final {
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const SeqStmtNode *op) final {
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AttrStmtNode *op) final {
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  // The dynamic mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const Object *> dyn_shmem_allocs_;
+  // The static mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const Object *> static_shmem_allocs_;
+  // The local fragment mapping from the original buffer var to its allocate
+  std::unordered_map<const VarNode *, const Object *> local_fragment_allocs_;
+};
 
 using namespace tir;
 using arith::IRMutatorWithAnalyzer;
@@ -50,37 +126,113 @@ struct LayoutInferenceResult {
 
 class BufferUseDefCollector : public StmtExprVisitor {
 public:
-  BufferUseDefCollector() = default;
+  BufferUseDefCollector(bool skip_thread_partition)
+      : skip_thread_partition_(skip_thread_partition) {}
 
   LayoutInferenceResult Run() {
+    // Basic consistency check: infer_list_ and thread_var_vec_ should have the
+    // same size
+    ICHECK_EQ(infer_list_.size(), thread_var_vec_.size())
+        << "Size mismatch: infer_list_ and thread_var_vec_ must match in "
+           "length.";
+
+    // If needed, you can also check that annotated_layout_map_ is not empty, or
+    // anything else relevant to your setup.
+
+    // Copy the annotated layout map to local variable
     Map<Buffer, Layout> layout_map = annotated_layout_map_;
     int num_infer = infer_list_.size();
 
-    // maintain a bfs queue and infer common layout
+    // Prepare BFS queue for iterative inference
     std::queue<int> q;
     std::vector<bool> in_queue(num_infer, true);
-    for (int i = 0; i < num_infer; i++)
-      q.push(i);
+    for (int i = 0; i < num_infer; i++) {
+      // Check that each infer_list_ entry is valid
+      ICHECK(infer_list_[i] != nullptr)
+          << "infer_list_[" << i
+          << "] is null. The inference object is not allocated properly.";
 
+      // Check that each thread_var_vec_ entry is defined
+      if (!thread_var_vec_[i].defined() && skip_thread_partition_) {
+        // TODO(lei): This is a hack for cpu backend
+        if (!thread_var_.defined()) {
+          // Fake thread var to inference predicate for the buffer
+          thread_var_ = IterVar(Range::FromMinExtent(PrimExpr(0), PrimExpr(1)),
+                                Var(""), IterVarType::kDataPar);
+        }
+        thread_var_vec_[i] = thread_var_;
+      }
+      q.push(i);
+    }
     auto run_infer_step = [&](int cur_infer_id, InferLevel level,
                               bool update_queue) {
+      // Range check for cur_infer_id
+      ICHECK_GE(cur_infer_id, 0)
+          << "cur_infer_id is negative, which is invalid.";
+      ICHECK_LT(cur_infer_id, num_infer)
+          << "cur_infer_id " << cur_infer_id << " is out of range, must be < "
+          << num_infer << ".";
+
+      // Make sure we can safely access infer_list_[cur_infer_id] and
+      // thread_var_vec_[cur_infer_id]
       auto &next = infer_list_[cur_infer_id];
       auto iter_var = thread_var_vec_[cur_infer_id];
+
+      // Double-check that 'next' is valid
+      ICHECK(next != nullptr) << "infer_list_[" << cur_infer_id
+                              << "] is null inside run_infer_step.";
+
+      // Check iter_var->dom and dom->extent
+      ICHECK(iter_var.defined())
+          << "thread_var_vec_[" << cur_infer_id << "] is not defined.";
+      ICHECK(iter_var->dom.defined())
+          << "iter_var->dom is not defined for infer_list_[" << cur_infer_id
+          << "].";
+      ICHECK(iter_var->dom->extent.defined())
+          << "iter_var->dom->extent is not defined for infer_list_["
+          << cur_infer_id << "].";
+
+      const int64_t *extent_ptr = as_const_int(iter_var->dom->extent);
+      ICHECK(extent_ptr != nullptr)
+          << "iter_var->dom->extent is not a constant integer, which is "
+             "required for layout inference.";
+
+      // Run InferLayout
       auto updates = next->InferLayout(
-          LayoutInferArgs{
-              target_,
-              static_cast<size_t>(*as_const_int(iter_var->dom->extent)),
-              layout_map},
+          LayoutInferArgs{target_, static_cast<size_t>(*extent_ptr),
+                          layout_map},
           level);
+
+      // Process the returned updates
       for (const auto &[buffer, layout] : updates) {
+        // Basic validity checks
+        ICHECK(buffer.defined()) << "InferLayout returned an undefined buffer.";
+        ICHECK(layout.defined()) << "InferLayout returned an undefined layout.";
+
         if (layout_map.count(buffer)) {
+          // If already in map, ensure they are structurally equal
           ICHECK(StructuralEqual()(layout, layout_map[buffer]))
-              << "Get different layout for " << buffer;
+              << "Get different layout for " << buffer
+              << " in cur_infer_id = " << cur_infer_id;
         } else {
+          // Otherwise, update map
           layout_map.Set(buffer, layout);
           if (!update_queue)
             continue;
+
+          // Check if buffer exists in use_list_
+          ICHECK(use_list_.count(buffer))
+              << "Buffer " << buffer << " not found in use_list_. "
+              << "Potential mismatch between inference updates and use_list_.";
+
+          // Push back into BFS queue
           for (int idx : use_list_[buffer]) {
+            ICHECK_GE(idx, 0) << "Index in use_list_ for buffer " << buffer
+                              << " is negative.";
+            ICHECK_LT(idx, num_infer)
+                << "Index in use_list_ for buffer " << buffer
+                << " out of range: " << idx << " >= " << num_infer << ".";
+
             if (!in_queue[idx] && idx != cur_infer_id) {
               in_queue[idx] = true;
               q.push(idx);
@@ -89,47 +241,64 @@ public:
         }
       }
     };
+
     auto finish_infer_queue = [&]() {
       while (!q.empty()) {
         int cur_infer_id = q.front();
         q.pop();
+        // Range check again, just to be safe
+        ICHECK_GE(cur_infer_id, 0);
+        ICHECK_LT(cur_infer_id, num_infer);
+
         in_queue[cur_infer_id] = false;
         run_infer_step(cur_infer_id, InferLevel::kCommon, true);
       }
     };
 
-    // step 1, infer strict layout
+    // step 1: infer strict layout
     for (int i = 0; i < num_infer; i++) {
       run_infer_step(i, InferLevel::kStrict, false);
     }
+    // step 2: infer common layout with BFS
 
-    // step2, infer common layout with bfs
     finish_infer_queue();
-
-    // step 3, relax the infer constraint to free and rerun.
+    // step 3: relax constraints to free and re-run
     for (int i = 0; i < num_infer; i++) {
       run_infer_step(i, InferLevel::kFree, true);
       finish_infer_queue();
     }
 
-    // Check that all fragments have been inferred
+    // Check that all local.fragment buffers have inferred layouts
     for (const auto &[buffer, _] : use_list_) {
-      if (buffer.scope() == "local.fragment" && layout_map.count(buffer) == 0)
-        LOG_ERROR << "The layout for fragment " << buffer
-                  << " can not be inferred correctly.";
+      if (buffer.scope() == "local.fragment") {
+        ICHECK_NE(layout_map.count(buffer), 0)
+            << "The layout for fragment " << buffer
+            << " can not be inferred correctly.";
+      }
     }
 
-    // Collect the layout for for nodes
+    // Collect layout info for For nodes
     Map<For, Fragment> for_map;
     Map<For, PrimExpr> predicate_map;
     for (auto &base_infer : infer_list_) {
+      // Check if base_infer is valid
+      ICHECK(base_infer != nullptr) << "Null pointer encountered in "
+                                       "infer_list_ while collecting for_map.";
+
       if (auto for_infer = dynamic_cast<ParallelOp *>(base_infer.get())) {
+        // Check that the loop layout is defined
         ICHECK(for_infer->GetLoopLayout().defined())
-            << "The Layout for Parallel for can not be inferred correctly : \n"
+            << "The Layout for Parallel for cannot be inferred correctly:\n"
             << for_infer->GetRoot();
         for_map.Set(for_infer->GetRoot(), for_infer->GetLoopLayout());
-        if (auto predicate = for_infer->GetPredicate(thread_var_->var))
+
+        // thread_var_ should be defined if we rely on it
+        ICHECK(thread_var_.defined())
+            << "thread_var_ is not defined. Cannot retrieve predicate.";
+
+        if (auto predicate = for_infer->GetPredicate(thread_var_->var)) {
           predicate_map.Set(for_infer->GetRoot(), predicate.value());
+        }
       }
     }
 
@@ -231,26 +400,28 @@ private:
   std::vector<IterVar> thread_var_vec_;
   Target target_;
   LayoutMap annotated_layout_map_;
+  bool skip_thread_partition_{false};
 };
 
 class LayoutInferencer : public IRMutatorWithAnalyzer {
 public:
-  static PrimFunc Substitute(PrimFunc f) {
+  static PrimFunc Substitute(PrimFunc f, bool skip_thread_partition = false) {
     arith::Analyzer analyzer;
     PrimFuncNode *fptr = f.CopyOnWrite();
     fptr->body = ParallelLoopFuser::Fuse(f->body);
-    BufferUseDefCollector collector;
+    BufferUseDefCollector collector(skip_thread_partition);
     collector.Collect(f);
     auto result = collector.Run();
-    LayoutInferencer substituter(result, &analyzer);
+    LayoutInferencer substituter(result, skip_thread_partition, &analyzer);
     fptr->body = substituter.VisitStmt(f->body);
     return f;
   }
 
 private:
   LayoutInferencer(const LayoutInferenceResult result,
-                   arith::Analyzer *analyzer)
-      : arith::IRMutatorWithAnalyzer(analyzer), result_(result){};
+                   bool skip_thread_partition, arith::Analyzer *analyzer)
+      : arith::IRMutatorWithAnalyzer(analyzer), result_(result),
+        skip_thread_partition_(skip_thread_partition){};
 
   Stmt VisitStmt_(const BlockNode *op) final {
     Block block = Downcast<Block>(IRMutatorWithAnalyzer::VisitStmt_(op));
@@ -270,8 +441,12 @@ private:
     For for_node = Downcast<For>(IRMutatorWithAnalyzer::VisitStmt_(op));
     if (result_.for_map.count(GetRef<For>(op))) {
       auto loop_layout = result_.for_map[GetRef<For>(op)];
-      for_node =
-          PartitionLoop(for_node, thread_var_->var, analyzer_, loop_layout);
+
+      if (!skip_thread_partition_) {
+        // If none thread bindings are provided, partition the loop
+        for_node =
+            PartitionLoop(for_node, thread_var_->var, analyzer_, loop_layout);
+      }
       for_node = VectorizeLoop(for_node);
       if (result_.predicate_map.count(GetRef<For>(op))) {
         return IfThenElse(result_.predicate_map[GetRef<For>(op)], for_node);
@@ -296,12 +471,22 @@ private:
 private:
   const LayoutInferenceResult result_;
   IterVar thread_var_;
+  bool skip_thread_partition_{false};
 };
 
 tvm::transform::Pass LayoutInference() {
   using namespace tir::transform;
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
-    return LayoutInferencer::Substitute(std::move(f));
+    AllocateCollector collector;
+    collector(f->body);
+    // TODO(Lei): This is a hack to avoid the issue of thread partition
+    // for cpu backend. We should remove this after we have a better
+    // solution for thread partition detect.
+    bool need_thread_partition = (collector.dyn_shmem_allocs_.size() > 1 ||
+                                  collector.static_shmem_allocs_.size() > 1 ||
+                                  collector.local_fragment_allocs_.size() > 1);
+    bool skip_thread_partition = !need_thread_partition;
+    return LayoutInferencer::Substitute(std::move(f), skip_thread_partition);
   };
   return CreatePrimFuncPass(pass_func, 0, "tl.LayoutInference", {});
 }

@@ -5,16 +5,26 @@
 import tilelang as tl
 import os
 import os.path as osp
-from typing import Literal, Union
+from typing import Union, Optional
 from tilelang import tvm as tvm
 from tvm import tir, relay
+from tvm.ir import CallingConv
 from tvm.target import Target
 from tilelang.contrib import hipcc, nvcc
-from tilelang.utils import determine_target
+from tilelang.utils.target import determine_target
 
 
 def is_device_call(func: tir.PrimFunc):
-    return bool(func.attrs and "calling_conv" in func.attrs and func.attrs["calling_conv"] == 2)
+    attrs = func.attrs
+
+    # consider c source as a device call
+    if "target" in attrs:
+        target = attrs["target"]
+        if target.kind.name == "c":
+            return True
+
+    return bool(func.attrs and "calling_conv" in func.attrs and
+                func.attrs["calling_conv"] == CallingConv.DEVICE_KERNEL_LAUNCH)
 
 
 def is_host_call(func: tir.PrimFunc):
@@ -95,13 +105,26 @@ def extrac_params(func: tir.PrimFunc):
     return tensor_types
 
 
+def canon_target_host(target: Union[str, Target], target_host: Optional[Union[str, Target]]):
+
+    def target_is_c(target):
+        if isinstance(target, str):
+            return target == "c"
+        return target.kind.name == "c"
+
+    if not target_host:
+        target_host = "llvm" if tvm.runtime.enabled("llvm") else "stackvm"
+
+    return target_host
+
+
 def lower(
     func_or_mod: Union[tir.PrimFunc, tvm.IRModule],
-    target: Union[Literal["auto", "cuda", "hip"], Target] = "auto",
-    target_host="llvm",
+    target: Union[str, Target] = "auto",
+    target_host: Optional[Union[str, Target]] = None,
     runtime_only=False,
 ):
-    # TODO(lei): Append C Source code host generation to the runtime
+
     mod = func_or_mod
     if isinstance(func_or_mod, tir.PrimFunc):
         func = func_or_mod
@@ -110,6 +133,8 @@ def lower(
 
     if isinstance(target, str):
         target = determine_target(target)
+
+    target_host = canon_target_host(target, target_host)
 
     target_host = tvm.target.Target.canon_target(target_host)
     target = tvm.target.Target(target, target_host)
@@ -167,13 +192,13 @@ def lower(
     mod = tl.transform.LowerHopperIntrin()(mod)
     mod = tir.transform.InjectPTXAsyncCopy()(mod)
 
-    mod = tir.transform.AnnotateDeviceRegions()(mod)
+    mod = tl.transform.AnnotateDeviceRegions()(mod)
     mod = tir.transform.SplitHostDevice()(mod)
     mod = tir.transform.MergeSharedMemoryAllocations()(mod)
     mod = tir.transform.ThreadSync("shared")(mod)
     mod = tir.transform.ThreadSync("shared.dyn")(mod)
 
-    mod = tir.transform.MakePackedAPI()(mod)
+    mod = tl.transform.MakePackedAPI()(mod)
     mod = tir.transform.LowerDeviceKernelLaunch()(mod)
     host_mod = tir.transform.Filter(is_host_call)(mod)
     host_mod = tir.transform.BindTarget(target_host)(host_mod)
@@ -187,6 +212,8 @@ def lower(
 
     if target_host.kind.name == "llvm":
         host_mod = tvm._ffi.get_global_func("target.build.llvm")(host_mod, target_host)
+    elif target_host.kind.name == "c":
+        host_mod = tvm._ffi.get_global_func("target.build.tilelang_cpp")(host_mod, target_host)
     else:
         raise ValueError("Target host is not supported")
 
@@ -201,6 +228,10 @@ def lower(
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_cuda")(device_mod, target)
     elif target.kind.name == "hip":
         device_mod = tvm._ffi.get_global_func("target.build.tilelang_hip")(device_mod, target)
+    elif target.kind.name == "c":
+        device_mod = tvm._ffi.get_global_func("target.build.tilelang_cpp")(device_mod, target)
+    elif target.kind.name == "llvm":
+        device_mod = tvm._ffi.get_global_func("target.build.llvm")(device_mod, target)
     else:
         raise ValueError("Target is not supported")
 
