@@ -2,7 +2,7 @@
 # Licensed under the MIT License.
 """The profiler and convert to torch utils"""
 
-from typing import Any, List, Literal
+from typing import List, Literal
 from functools import partial
 import torch
 from contextlib import suppress
@@ -11,8 +11,8 @@ import tvm
 from torch.utils.dlpack import to_dlpack
 from tvm.runtime import ndarray
 from tvm.relay import TensorType
-from tvm.contrib.dlpack import to_pytorch_func
 
+from tilelang.jit.adapter import TorchDLPackKernelAdapter
 from tilelang.utils.tensor import (
     get_tensor_supply,
     TensorSupplyType,
@@ -20,53 +20,7 @@ from tilelang.utils.tensor import (
 )
 
 
-class ConvertTorch:
-
-    def __init__(self, mod, params: List[TensorType], result_idx: List[int]) -> None:
-        self.mod = mod
-        self.params = params
-        self.result_idx = result_idx
-        self.func = self._convert_torch_func()
-
-    def _convert_torch_func(self) -> callable:
-        torch_func = to_pytorch_func(self.mod)
-
-        def func(*ins: List[torch.Tensor]):
-            if len(ins) + len(self.result_idx) != len(self.params):
-                raise ValueError(
-                    f"Expected {len(self.params)} inputs, got {len(ins) + len(self.result_idx)} with {len(ins)} inputs and {len(self.result_idx)} outputs"
-                )
-            ins_idx = 0
-            args = []
-
-            # use the device of the first input tensor if available
-            device = ins[0].device if len(ins) > 0 else torch.cuda.current_device()
-
-            for i in range(len(self.params)):
-                if i in self.result_idx:
-                    dtype = torch.__getattribute__(str(self.params[i].dtype))
-                    shape = list(map(int, self.params[i].shape))
-                    tensor = torch.empty(*shape, dtype=dtype, device=device)
-                else:
-                    tensor = ins[ins_idx]
-                    ins_idx += 1
-                args.append(tensor)
-            torch_func(*args)
-            if len(self.result_idx) == 1:
-                return args[self.result_idx[0]]
-            else:
-                return [args[i] for i in self.result_idx]
-
-        return func
-
-    def __call__(self, *args: Any, **kwds: Any) -> Any:
-        return self.func(*args, **kwds)
-
-    def get_kernel_source(self) -> str:
-        return self.mod.imported_modules[0].get_source()
-
-
-class Profiler(ConvertTorch):
+class Profiler(TorchDLPackKernelAdapter):
 
     def __init__(
         self,
@@ -145,7 +99,7 @@ class Profiler(ConvertTorch):
 
     def do_bench(
         self,
-        func: callable,
+        func: callable = None,
         warmup=25,
         rep=100,
         n_warmup=1,
@@ -153,6 +107,11 @@ class Profiler(ConvertTorch):
         profiler: Literal["torch", "tvm", "auto"] = "auto",
         input_tensors: List[torch.Tensor] = None,
     ):
+        if func is None:
+            # set default value if not provided
+            func = self.mod
+            profiler = "tvm"
+
         if profiler == "torch":
             ins = self._get_inputs() if input_tensors is None else input_tensors
             bench_func = partial(func, *ins)
@@ -179,6 +138,8 @@ class Profiler(ConvertTorch):
             # Transform Latency to ms
             return time_evaluator(*tvm_inputs).mean * 1e3
         elif profiler == "auto":
+            # TODO(lei): select appropriate profiler based on the function
+            # class
             ins = self._get_inputs()
             bench_func = partial(func, *ins)
             torch_res = do_bench(
