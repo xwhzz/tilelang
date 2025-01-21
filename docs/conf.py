@@ -12,7 +12,7 @@ autodoc_mock_imports = ["torch"]
 
 # General information about the project.
 project = "tilelang"
-author = " Contributors"
+author = "Tile Lang Contributors"
 copyright = "2025-2025, %s" % author
 
 # Version information.
@@ -68,21 +68,13 @@ html_theme_options = {
 header_links = [
     ("Home", "https://github.com/tile-ai/tilelang"),
     ("Github", "https://github.com/tile-ai/tilelang"),
-    ("Discord Server", "https://discord.gg"),
 ]
 
-header_dropdown = {
-    "name": "Other Resources",
-    "items": [
-
-    ],
-}
 
 html_context = {
     "footer_copyright": footer_copyright,
     "footer_note": footer_note,
     "header_links": header_links,
-    "header_dropdown": header_dropdown,
     "display_github": True,
     "github_user": "tile-ai",
     "github_repo": "tilelang",
