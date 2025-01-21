@@ -70,7 +70,6 @@ header_links = [
     ("Github", "https://github.com/tile-ai/tilelang"),
 ]
 
-
 html_context = {
     "footer_copyright": footer_copyright,
     "footer_note": footer_note,
@@ -84,7 +83,6 @@ html_context = {
     # "header_logo_link": "",
     # "version_selecter": "",
 }
-
 
 # add additional overrides
 templates_path += [tlcpack_sphinx_addon.get_templates_path()]
