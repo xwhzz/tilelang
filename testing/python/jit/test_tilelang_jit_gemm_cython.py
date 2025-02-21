@@ -92,7 +92,7 @@ def run_gemm(
         code = f"// {stramp}\n" + code
         return code
 
-    matmul_kernel = tilelang.compile(program, out_idx=-1, execution_backend="ctypes")
+    matmul_kernel = tilelang.compile(program, out_idx=-1, execution_backend="cython")
 
     kernel_source = matmul_kernel.get_kernel_source()
 
@@ -195,7 +195,7 @@ def run_gemm_jit_kernel(
         num_threads,
     )
 
-    matmul_kernel = tilelang.compile(program, out_idx=-1, execution_backend="ctypes")
+    matmul_kernel = tilelang.compile(program, out_idx=-1, execution_backend="cython")
 
     A = torch.randn(M, K, dtype=torch.__getattribute__(in_dtype)).cuda()
     B = torch.randn(K, N, dtype=torch.__getattribute__(in_dtype)).cuda()
@@ -234,7 +234,7 @@ def test_gemm_jit_kernel():
     )
 
 
-def run_ctypes_kernel_do_bench(M,
+def run_cython_kernel_do_bench(M,
                                N,
                                K,
                                trans_A,
@@ -263,27 +263,34 @@ def run_ctypes_kernel_do_bench(M,
         num_threads,
     )
 
-    matmul_kernel = tilelang.compile(program, execution_backend="ctypes")
+    cython_matmul_kernel = tilelang.compile(program, execution_backend="cython")
+    ctypes_matmul_kernel = tilelang.compile(program, execution_backend="ctypes")
 
-    profiler = matmul_kernel.get_profiler()
+    cython_profiler = cython_matmul_kernel.get_profiler()
+    ctypes_profiler = ctypes_matmul_kernel.get_profiler()
 
-    ctypes_latency = profiler.do_bench(func=matmul_kernel, profiler="torch")
-    print(f"Ctypes Latency: {ctypes_latency} ms")
+    cython_latency = cython_profiler.do_bench(func=cython_matmul_kernel, profiler="torch")
+    print(f"cython Latency: {cython_latency} ms")
 
-    assert ctypes_latency is not None
+    # assert ctypes_latency is not None
 
-    tvm_latency = profiler.do_bench()
+    tvm_latency = cython_profiler.do_bench()
     print(f"TVM Latency: {tvm_latency} ms")
 
     assert tvm_latency is not None
 
+    ctypes_latency = ctypes_profiler.do_bench(func=ctypes_matmul_kernel, profiler="torch")
+    print(f"ctypes Latency: {ctypes_latency} ms")
 
-def test_ctypes_kernel_do_bench():
-    run_ctypes_kernel_do_bench(512, 1024, 768, False, False, "float16", "float16", "float16", 128,
+    assert cython_latency is not None
+
+
+def test_cython_kernel_do_bench():
+    run_cython_kernel_do_bench(512, 1024, 768, False, False, "float16", "float16", "float16", 128,
                                256, 32, 2)
 
 
-def run_ctypes_kernel_multi_stream(M,
+def run_cython_kernel_multi_stream(M,
                                    N,
                                    K,
                                    trans_A,
@@ -312,7 +319,7 @@ def run_ctypes_kernel_multi_stream(M,
         num_threads,
     )
 
-    matmul_kernel = tilelang.compile(program, execution_backend="ctypes")
+    matmul_kernel = tilelang.compile(program, execution_backend="cython")
 
     tensor_a = torch.randn(M, K, dtype=torch.__getattribute__(in_dtype)).cuda()
     tensor_b = torch.randn(K, N, dtype=torch.__getattribute__(in_dtype)).cuda()
@@ -330,12 +337,12 @@ def run_ctypes_kernel_multi_stream(M,
             matmul_kernel(tensor_a, tensor_b, tensor_c)
 
 
-def test_ctypes_kernel_multi_stream():
-    run_ctypes_kernel_multi_stream(512, 1024, 768, False, False, "float16", "float16", "float16",
+def test_cython_kernel_multi_stream():
+    run_cython_kernel_multi_stream(512, 1024, 768, False, False, "float16", "float16", "float16",
                                    128, 256, 32, 2)
 
 
-def run_ctypes_dynamic_shape(M,
+def run_cython_dynamic_shape(M,
                              N,
                              K,
                              trans_A,
@@ -364,7 +371,7 @@ def run_ctypes_dynamic_shape(M,
         num_threads,
     )
 
-    matmul_kernel = tilelang.compile(program, execution_backend="ctypes")
+    matmul_kernel = tilelang.compile(program, execution_backend="cython")
     if isinstance(M, T.Var):
         M = 1024
     if isinstance(N, T.Var):
@@ -387,15 +394,15 @@ def run_ctypes_dynamic_shape(M,
         tensor_c, tensor_ref_c, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
 
-def test_ctypes_dynamic_shape():
-    run_ctypes_dynamic_shape(
+def test_cython_dynamic_shape():
+    run_cython_dynamic_shape(
         T.symbolic("m"), 1024, 768, False, False, "float16", "float16", "float16", 128, 256, 32, 2)
 
-    run_ctypes_dynamic_shape(
+    run_cython_dynamic_shape(
         T.symbolic("m"), T.symbolic("n"), 768, False, False, "float16", "float16", "float16", 128,
         256, 32, 2)
 
-    run_ctypes_dynamic_shape(
+    run_cython_dynamic_shape(
         T.symbolic("m"), T.symbolic("n"), T.symbolic("k"), False, False, "float16", "float16",
         "float16", 128, 256, 32, 2)
 

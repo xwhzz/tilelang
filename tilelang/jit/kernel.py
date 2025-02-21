@@ -7,7 +7,7 @@ import tilelang
 from tilelang import tvm as tvm
 from tvm.tir import PrimFunc
 
-from tilelang.jit.adapter import TorchCPPKernelAdapter, TorchDLPackKernelAdapter, BaseKernelAdapter, CtypesKernelAdapter
+from tilelang.jit.adapter import TorchCPPKernelAdapter, TorchDLPackKernelAdapter, BaseKernelAdapter, CtypesKernelAdapter, CythonKernelAdapter
 from tilelang.utils.target import determine_target, AVALIABLE_TARGETS
 from tilelang.profiler import Profiler, TensorSupplyType
 
@@ -34,7 +34,7 @@ class JITKernel(object):
         self,
         func: PrimFunc = None,
         out_idx: Union[List[int], int] = None,
-        execution_backend: Literal["dlpack", "torch_cpp", "ctypes"] = "dlpack",
+        execution_backend: Literal["dlpack", "torch_cpp", "ctypes", "cython"] = "cython",
         target: Union[str, Target] = "auto",
         target_host: Union[str, Target] = None,
         verbose: bool = False,
@@ -73,8 +73,12 @@ class JITKernel(object):
         target = Target(target)
 
         # Validate the execution backend.
-        assert execution_backend in ["dlpack", "torch_cpp",
-                                     "ctypes"], f"Invalid execution backend. {execution_backend}"
+        assert execution_backend in ["dlpack", "torch_cpp", "ctypes",
+                                     "cython"], f"Invalid execution backend. {execution_backend}"
+        if execution_backend == "cython":
+            from tilelang.contrib.cc import get_cplus_compiler
+            assert get_cplus_compiler(
+            ) is not None, "Cython backend requires a C++ compiler, please install or use other backends."
 
         # Compile the TileLang function and create a kernel adapter for execution.
         adapter = self._compile_and_create_adapter(func)
@@ -145,8 +149,16 @@ class JITKernel(object):
             )
             raise NotImplementedError("Torch CPP backend is not fully implemented.")
         elif execution_backend == "ctypes":
-            # CTYPES backend (not fully tested yet).
             adapter = CtypesKernelAdapter(
+                rt_mod,
+                params=params,
+                result_idx=out_idx,
+                target=target,
+                func_or_mod=tilelang_func,
+                verbose=verbose,
+            )
+        elif execution_backend == "cython":
+            adapter = CythonKernelAdapter(
                 rt_mod,
                 params=params,
                 result_idx=out_idx,
@@ -205,6 +217,8 @@ class JITKernel(object):
         str
             The source code of the compiled kernel function.
         """
+        if self.execution_backend == "ctypes":
+            return self.adapter.get_kernel_source()
         return self.rt_module.imported_modules[0].get_source()
 
     def get_host_source(self) -> str:

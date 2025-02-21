@@ -2,7 +2,6 @@
 # Licensed under the MIT License.
 """The profiler and convert to torch utils"""
 
-import torch
 from ..base import BaseKernelAdapter
 import ctypes
 from typing import List, Optional, Union, Callable, Dict, Tuple
@@ -14,9 +13,113 @@ from .wrapper import TLWrapper
 from .libgen import LibraryGenerator
 from tilelang.utils.target import determine_target
 from tilelang.utils.language import retrieve_func_from_module
+from tilelang.contrib.cc import get_cplus_compiler
+
+import sys
+import sysconfig
+import hashlib
+import os
+from pathlib import Path
+import logging
+
+logger = logging.getLogger("tilelang")
 
 
-class CtypesKernelAdapter(BaseKernelAdapter):
+def get_cython_compiler() -> Optional[str]:
+    """Return the path to the Cython compiler.
+
+    Returns
+    -------
+    out: Optional[str]
+        The path to the Cython compiler, or None if none was found.
+    """
+
+    cython_names = ["cython", "cython3"]
+    dirs_in_path = os.get_exec_path()
+    for cython_name in cython_names:
+        for d in dirs_in_path:
+            cython_path = os.path.join(d, cython_name)
+            if os.path.isfile(cython_path) and os.access(cython_path, os.X_OK):
+                return cython_path
+    return None
+
+
+# Add cache management functions at module level
+def get_cache_dir() -> Path:
+    """Get the cache directory for the current Python version."""
+    py_version = f"py{sys.version_info.major}{sys.version_info.minor}"
+    # current directory
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = Path(current_dir) / ".cycache" / py_version
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir
+
+
+def get_cached_lib(source_code: str) -> Tuple[Optional[ctypes.CDLL], Path]:
+    """Try to load cached library or return None if not found."""
+    code_hash = hashlib.sha256(source_code.encode()).hexdigest()
+    cache_path = get_cache_dir() / f"{code_hash}.so"
+    if cache_path.exists():
+        try:
+            return ctypes.CDLL(str(cache_path)), cache_path
+        except Exception as e:
+            logger.error(f"Failed to load cached library: {e}")
+            return None, cache_path
+    return None, cache_path
+
+
+# read the cython_wrapper.pyx file
+current_dir = os.path.dirname(os.path.abspath(__file__))
+cython_wrapper_path = os.path.join(current_dir, "cython_wrapper.pyx")
+
+with open(cython_wrapper_path, "r") as f:
+    cython_wrapper_code = f.read()
+    cache_dir = get_cache_dir()
+    source_path = cache_dir / "cython_wrapper.cpp"
+    library_path = cache_dir / "cython_wrapper.so"
+    md5_path = cache_dir / "md5.txt"
+    code_hash = hashlib.sha256(cython_wrapper_code.encode()).hexdigest()
+
+    # Check if cached version exists and is valid
+    need_compile = True
+    if md5_path.exists() and library_path.exists():
+        with open(md5_path, "r") as f:
+            cached_hash = f.read().strip()
+            if cached_hash == code_hash:
+                logger.debug("Cython jit adapter is up to date, no need to compile...")
+                need_compile = False
+            else:
+                logger.info("Cython jit adapter is out of date, need to compile...")
+    else:
+        logger.info("No cached version found for cython jit adapter, need to compile...")
+
+    if need_compile:
+        logger.info("Compiling cython jit adapter...")
+        with open(md5_path, "w") as f:
+            f.write(code_hash)
+        # compile the cython_wrapper.pyx file into .cpp
+        cython = get_cython_compiler()
+        if cython is None:
+            raise Exception("Cython is not installed, please install it first.")
+        os.system(f"{cython} {cython_wrapper_path} --cplus -o {source_path}")
+        # compile the .cpp file into .so
+        python_include_path = sysconfig.get_path("include")
+        cc = get_cplus_compiler()
+        command = f"{cc} -shared -pthread -fPIC -fwrapv -O2 -Wall -fno-strict-aliasing -I{python_include_path} {source_path} -o {library_path}"
+        try:
+            os.system(command)
+        except Exception as e:
+            raise Exception(f"Failed to compile cython jit adapter: {e}") from e
+
+    # add the .so file to the sys.path
+    cache_dir_str = str(cache_dir)
+    if cache_dir_str not in sys.path:
+        sys.path.append(cache_dir_str)
+
+from cython_wrapper import CythonKernelWrapper
+
+
+class CythonKernelAdapter(BaseKernelAdapter):
     """Adapter class that converts TVM/TIR functions to callable CUDA kernels using ctypes.
     
     This adapter handles:
@@ -26,8 +129,8 @@ class CtypesKernelAdapter(BaseKernelAdapter):
     """
 
     # Class attributes to store compiled kernel information
-    target = "cuda"
-    ir_module = None
+    target: str = "cuda"
+    ir_module: Optional[tvm.IRModule] = None
     lib: Optional[ctypes.CDLL] = None  # Compiled library handle
     wrapped_source: Optional[str] = None  # Generated C++ wrapper code
     # Maps symbolic variables to their corresponding buffer and shape indices
@@ -74,6 +177,9 @@ class CtypesKernelAdapter(BaseKernelAdapter):
         self.lib = self.lib_generator.load_lib()
         self.lib.init()
 
+        self.cython_wrapper = CythonKernelWrapper(self.dynamic_symbolic_map, self.result_idx,
+                                                  self.params, self.lib)
+
         self._post_init()
 
     def _process_dynamic_symbolic(self):
@@ -104,62 +210,13 @@ class CtypesKernelAdapter(BaseKernelAdapter):
         ctypes_args.append(ctypes.c_void_p(stream))
         self.lib.call(*ctypes_args)
 
-    def _warp_forward_from_prebuild_lib(self,
-                                        *ins: List[torch.Tensor],
-                                        stream: Optional[int] = None):
-        """High-level wrapper for kernel execution.
-        
-        Handles:
-        1. Input validation
-        2. Output tensor allocation
-        3. Dynamic shape resolution
-        4. CUDA stream management
-        
-        Args:
-            ins: Input PyTorch tensors
-            stream: Optional CUDA stream for asynchronous execution
-        
-        Returns:
-            Single tensor or list of tensors containing the kernel results
-        """
-        if len(ins) + len(self.result_idx) != len(self.params):
-            raise ValueError(
-                f"Expected {len(self.params)} inputs, got {len(ins) + len(self.result_idx)} with {len(ins)} inputs and {len(self.result_idx)} outputs"
-            )
-        ins_idx = 0
-        args = []
-
-        # tensor pointers
-        for i in range(len(self.params)):
-            if i in self.result_idx:
-                dtype = torch.__getattribute__(str(self.params[i].dtype))
-                shape = list(map(int, self.params[i].shape))
-                # use the device of the first input tensor if available
-                device = ins[0].device if len(ins) > 0 else torch.cuda.current_device()
-                tensor = torch.empty(*shape, dtype=dtype, device=device)
-            else:
-                tensor = ins[ins_idx]
-                ins_idx += 1
-            args.append(tensor)
-
-        # dynamic symbolics
-        for _, (buffer_idx, shape_idx) in self.dynamic_symbolic_map.items():
-            args.append(ins[buffer_idx].shape[shape_idx])
-
-        # if stream is not None, we need to pass the stream to the library
-        if stream is None:
-            stream = torch.cuda.current_stream().cuda_stream
-
-        self._forward_from_prebuild_lib(*args, stream=stream)
-
-        if len(self.result_idx) == 1:
-            return args[self.result_idx[0]]
-        else:
-            return [args[i] for i in self.result_idx]
-
     def _convert_torch_func(self) -> Callable:
         """Returns a PyTorch-compatible function wrapper for the kernel."""
-        return self._warp_forward_from_prebuild_lib
+
+        def lambda_forward(*args, stream: int = -1):
+            return self.cython_wrapper.forward([*args], stream=stream)
+
+        return lambda_forward
 
     @property
     def prim_func(self) -> tir.PrimFunc:
