@@ -127,6 +127,7 @@ def compile_cuda(code,
 
 def find_cuda_path():
     """Utility function to find cuda path
+    
     Returns
     -------
     path : str
