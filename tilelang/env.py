@@ -7,7 +7,6 @@ import glob
 
 logger = logging.getLogger(__name__)
 
-IS_WINDOWS = sys.platform == 'win32'
 
 
 def _find_cuda_home() -> str:
@@ -24,7 +23,7 @@ def _find_cuda_home() -> str:
             cuda_home = os.path.dirname(os.path.dirname(nvcc_path))
         else:
             # Guess #3
-            if IS_WINDOWS:
+            if sys.platform == 'win32':
                 cuda_homes = glob.glob('C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v*.*')
                 cuda_home = '' if len(cuda_homes) == 0 else cuda_homes[0]
             else:
