@@ -25,7 +25,7 @@ nnfusion.tar.gz
 # makeenv and test intermediate files
 tmp/
 
-venv/
+*venv/
 .vscode/
 .vs/
 

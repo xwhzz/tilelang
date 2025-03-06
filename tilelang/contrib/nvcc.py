@@ -8,6 +8,7 @@ from __future__ import absolute_import as _abs
 import os
 import subprocess
 import warnings
+from ..env import CUDA_HOME
 
 import tvm._ffi
 from tvm.target import Target
@@ -124,28 +125,6 @@ def compile_cuda(code,
         return data
 
 
-def find_cuda_path():
-    """Utility function to find cuda path
-
-    Returns
-    -------
-    path : str
-        Path to cuda root.
-    """
-    if "CUDA_PATH" in os.environ:
-        return os.environ["CUDA_PATH"]
-    cmd = ["which", "nvcc"]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-    (out, _) = proc.communicate()
-    out = py_str(out)
-    if proc.returncode == 0:
-        return os.path.realpath(os.path.join(str(out).strip(), "../.."))
-    cuda_path = "/usr/local/cuda"
-    if os.path.exists(os.path.join(cuda_path, "bin/nvcc")):
-        return cuda_path
-    raise RuntimeError("Cannot find cuda path")
-
-
 def get_cuda_version(cuda_path=None):
     """Utility function to get cuda version
 
@@ -163,7 +142,7 @@ def get_cuda_version(cuda_path=None):
 
     """
     if cuda_path is None:
-        cuda_path = find_cuda_path()
+        cuda_path = CUDA_HOME
 
     version_file_path = os.path.join(cuda_path, "version.txt")
     if not os.path.exists(version_file_path):
@@ -209,7 +188,7 @@ def find_libdevice_path(arch):
     path : str
         Path to libdevice.
     """
-    cuda_path = find_cuda_path()
+    cuda_path = CUDA_HOME
     lib_path = os.path.join(cuda_path, "nvvm/libdevice")
     if not os.path.exists(lib_path):
         # Debian/Ubuntu repackaged CUDA path
