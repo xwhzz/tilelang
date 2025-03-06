@@ -39,7 +39,7 @@ def load_module_from_path(module_name, path):
 envs = load_module_from_path('env', os.path.join(ROOT_DIR, PACKAGE_NAME, 'env.py'))
 CUDA_HOME = envs.CUDA_HOME
 
-assert CUDA_HOME, "Automatically detect CUDA failed!"
+assert CUDA_HOME, "Failed to automatically detect CUDA installation. Please set the CUDA_HOME environment variable manually (e.g., export CUDA_HOME=/usr/local/cuda)."
 
 # TileLang only supports Linux platform
 assert sys.platform.startswith("linux"), "TileLang only supports Linux platform (including WSL)."
