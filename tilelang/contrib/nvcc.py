@@ -125,6 +125,18 @@ def compile_cuda(code,
         return data
 
 
+def find_cuda_path():
+    """Utility function to find cuda path
+    Returns
+    -------
+    path : str
+        Path to cuda root.
+    """
+    if CUDA_HOME:
+        return CUDA_HOME
+    raise RuntimeError("Cannot find cuda path")
+
+
 def get_cuda_version(cuda_path=None):
     """Utility function to get cuda version
 
@@ -142,7 +154,7 @@ def get_cuda_version(cuda_path=None):
 
     """
     if cuda_path is None:
-        cuda_path = CUDA_HOME
+        cuda_path = find_cuda_path()
 
     version_file_path = os.path.join(cuda_path, "version.txt")
     if not os.path.exists(version_file_path):
@@ -188,7 +200,7 @@ def find_libdevice_path(arch):
     path : str
         Path to libdevice.
     """
-    cuda_path = CUDA_HOME
+    cuda_path = find_cuda_path()
     lib_path = os.path.join(cuda_path, "nvvm/libdevice")
     if not os.path.exists(lib_path):
         # Debian/Ubuntu repackaged CUDA path
