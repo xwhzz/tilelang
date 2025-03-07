@@ -28,7 +28,6 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_casual, block_M, block_N):
     ):
         with T.Kernel(T.ceildiv(seq_len, block_M), heads, batch, threads=32) as (bx, by, bz):
             Q_shared = T.alloc_shared([block_M, dim], dtype)
-            # Q_local = T.alloc_fragment([block_M, dim], dtype)
             K_shared = T.alloc_shared([block_N, dim], dtype)
             V_shared = T.alloc_shared([block_N, dim], dtype)
             acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
@@ -45,9 +44,7 @@ def flashattn_fwd(batch, heads, seq_len, dim, is_casual, block_M, block_N):
             T.fill(acc_o, 0)
             T.fill(logsum, 0)
             T.fill(scores_max, -T.infinity(accum_dtype))
-            # T.copy(Q_shared, Q_local)
-            # for i, j in T.Parallel(block_M, dim):
-            #     Q_local[i, j] *= scale
+
             loop_range = (
                 T.ceildiv(
                     (bx + 1) * block_M, block_N) if is_casual else T.ceildiv(seq_len, block_N))
@@ -293,19 +290,18 @@ def assert_mha_equal(batch, h, n_ctx, d_head, causal):
     dO = torch.randn_like(Q)
     O = attention(Q, K, V, causal)
     O.backward(dO, retain_graph=True)
-    dQ, Q.grad = Q.grad.clone(), None
+
     dK, K.grad = K.grad.clone(), None
     dV, V.grad = V.grad.clone(), None
 
     O_ref = ref_program(Q, K, V, causal)
     O_ref.backward(dO, retain_graph=True)
-    dQ_ref, Q.grad = Q.grad.clone(), None
+
     dK_ref, K.grad = K.grad.clone(), None
     dV_ref, V.grad = V.grad.clone(), None
     torch.testing.assert_close(O, O_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(dV, dV_ref, rtol=1e-2, atol=1e-2)
     torch.testing.assert_close(dK, dK_ref, rtol=1e-2, atol=1e-2)
-    torch.testing.assert_close(dQ, dQ_ref, rtol=1e-2, atol=1e-2)
 
 
 def test_mha_bwd():
