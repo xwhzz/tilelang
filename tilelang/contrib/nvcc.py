@@ -135,7 +135,9 @@ def find_cuda_path():
     """
     if CUDA_HOME:
         return CUDA_HOME
-    raise RuntimeError("Failed to automatically detect CUDA installation. Please set the CUDA_HOME environment variable manually (e.g., export CUDA_HOME=/usr/local/cuda).")
+    raise RuntimeError(
+        "Failed to automatically detect CUDA installation. Please set the CUDA_HOME environment variable manually (e.g., export CUDA_HOME=/usr/local/cuda)."
+    )
 
 
 def get_cuda_version(cuda_path=None):
