@@ -1,5 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
 import torch
 import torch.backends
 import tilelang.testing
@@ -67,8 +65,8 @@ def gemv_simt(
             accum_res = T.alloc_local((1,), accum_dtype)
             reduced_accum_res = T.alloc_local((1,), accum_dtype)
 
-            kr = T.thread_binding(0, reduce_thread, thread="threadIdx.x")
-            ni = T.thread_binding(0, n_partition, thread="threadIdx.y")
+            kr = T.get_thread_binding(0)
+            ni = T.get_thread_binding(1)
 
             T.clear(accum_res)
             for ko in T.serial(T.ceildiv(K, block_K)):
