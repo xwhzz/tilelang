@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
-
 /*!
  * \file tl/op/builtin.cc
  * \brief Builtin intrinsics.
@@ -18,6 +15,8 @@
 
 namespace tvm {
 namespace tl {
+
+TVM_REGISTER_PASS_CONFIG_OPTION(kDisableTMALower, Bool);
 
 #define TIR_DEFINE_TL_BUILTIN(OpName)                                          \
   const Op &OpName() {                                                         \

@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
-
 /*!
  * \file tl/op/bulk_copy.cc
  * \brief Bulk copy operator.
@@ -88,6 +85,8 @@ template <typename T> static Array<T> ReverseArray(Array<T> array) {
 }
 
 Stmt Copy::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer) const {
+  if (T.disable_tma_lower)
+    return Stmt();
   if (!TargetIsHopper(T.target))
     return Stmt();
   bool is_load;
@@ -120,7 +119,11 @@ Stmt Copy::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer) const {
   ICHECK(desc.rank >= 1 && desc.rank <= 5) << desc.rank;
 
   // Verify datatype
-  ICHECK(global_tensor->dtype == shared_tensor->dtype);
+  ICHECK(global_tensor->dtype == shared_tensor->dtype)
+      << "Copy between buffer " << global_tensor->name << " and "
+      << shared_tensor->name << " with different data type "
+      << global_tensor->dtype << " and " << shared_tensor->dtype;
+
   desc.data_type = to_CUtensorMapDataType(global_tensor->dtype);
 
   // Global Tensor Shape and Stride

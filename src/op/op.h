@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
-
 /*!
  * \file tl/op/op.h
  * \brief Tile library operations.
@@ -52,6 +49,7 @@ struct LowerArgs {
   AddWorkspaceCallback AddWorkspace;
   LayoutMap layout_map;
   Map<Buffer, Buffer> buffer_remap;
+  bool disable_tma_lower;
 };
 
 struct LayoutInferArgs {

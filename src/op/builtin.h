@@ -1,6 +1,3 @@
-// Copyright (c) Microsoft Corporation.
-// Licensed under the MIT License.
-
 /*!
  * \file tl/op/builtin.h
  * \brief Builtin intrinsics.
@@ -11,9 +8,12 @@
 #define TVM_TL_OP_BUILTIN_H_
 
 #include "op.h"
+#include <tvm/ir/transform.h>
 
 namespace tvm {
 namespace tl {
+
+static constexpr const char *kDisableTMALower = "tl.disable_tma_lower";
 
 /*!
  * \brief tvm intrinsics for TMADescriptor creation for tiled load
