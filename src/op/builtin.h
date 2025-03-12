@@ -137,6 +137,22 @@ const Op &SyncThreadsPartialOp();
 const Op &FenceProxyAsyncOp();
 
 /*!
+ * \brief Indicate arrival of warp issuing TMA_STORE
+ *
+ * TMAStoreArrive()
+ *
+ */
+const Op &TMAStoreArrive();
+
+/*!
+ * \brief Wait for TMA_STORE to finish
+ *
+ * TMAStoreWait()
+ *
+ */
+const Op &TMAStoreWait();
+
+/*!
  * \brief Set reg hint for warp-specialized branched
  *
  * SetMaxNRegInc(num_reg, is_inc)
