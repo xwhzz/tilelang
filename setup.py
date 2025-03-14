@@ -550,7 +550,7 @@ setup(
              if PYPI_BUILD else get_tilelang_version()),
     packages=find_packages(where="."),
     package_dir={"": "."},
-    author="Microsoft Research",
+    author="Tile-AI",
     description="A tile level programming language to generate high performance code.",
     long_description=read_readme(),
     long_description_content_type="text/markdown",
