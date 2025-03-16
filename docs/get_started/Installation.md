@@ -8,25 +8,25 @@
 - **Python Version**: >= 3.8
 - **CUDA Version**: >= 11.0
 
-The easiest way to install TileLang is directly from PyPI using pip. To install the latest version, run the following command in your terminal:
+The easiest way to install **tile-lang** is directly from PyPI using pip. To install the latest version, run the following command in your terminal:
 
 ```bash
 pip install tilelang
 ```
 
-Alternatively, you may choose to install TileLang using prebuilt packages available on the Release Page:
+Alternatively, you may choose to install **tile-lang** using prebuilt packages available on the Release Page:
 
 ```bash
 pip install tilelang-0.0.0.dev0+ubuntu.20.4.cu120-py3-none-any.whl
 ```
 
-To install the latest version of TileLang from the GitHub repository, you can run the following command:
+To install the latest version of **tile-lang** from the GitHub repository, you can run the following command:
 
 ```bash
 pip install git+https://github.com/tile-ai/tilelang.git
 ```
 
-After installing TileLang, you can verify the installation by running:
+After installing **tile-lang**, you can verify the installation by running:
 
 ```bash
 python -c "import tilelang; print(tilelang.__version__)"
