@@ -43,6 +43,8 @@ static int to_CUtensorMapDataType(DataType dtype) {
     }
   } else if (dtype.is_bfloat16()) {
     tp = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
+  } else if (dtype.is_e4m3_float8() or dtype.is_e5m2_float8()) {
+    tp = CU_TENSOR_MAP_DATA_TYPE_UINT8;
   } else if (dtype.is_int()) {
     switch (dtype.bits()) {
     case 64:
@@ -170,8 +172,13 @@ Stmt Copy::LowerBulkCopy(const LowerArgs &T, arith::Analyzer *analyzer) const {
     auto stride = as_const_int(shared_layout->InputShape()[0]);
     auto continuous = as_const_int(shared_layout->InputShape()[1]);
     ICHECK(stride != nullptr && continuous != nullptr);
-    if (StructuralEqual()(shared_layout, makeHalfBankSwizzleLayout(
+    if (StructuralEqual()(shared_layout, makeGemmABLayoutPadded(
                                              *stride, *continuous,
+                                             shared_tensor->dtype.bits()))) {
+      desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_NONE);
+    } else if (StructuralEqual()(
+                   shared_layout,
+                   makeHalfBankSwizzleLayout(*stride, *continuous,
                                              shared_tensor->dtype.bits()))) {
       desc.swizzle = static_cast<int>(CU_TENSOR_MAP_SWIZZLE_64B);
     } else if (StructuralEqual()(

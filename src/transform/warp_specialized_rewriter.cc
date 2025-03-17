@@ -182,6 +182,46 @@ static Stmt makeParityWait(PrimExpr barrier_id, PrimExpr parity) {
 //   return is_gemm;
 // }
 
+class TMAExpectTxRewriter : public StmtExprMutator {
+public:
+  TMAExpectTxRewriter(Stmt expect_tx) : expect_tx_(expect_tx) {}
+  static Stmt Rewrite(Stmt stmt, Stmt expect_tx) {
+    TMAExpectTxRewriter rewriter(expect_tx);
+    return rewriter(stmt);
+  }
+
+private:
+  Stmt VisitStmt_(const ForNode *op) final {
+    insert_in_evaluate_ = false;
+    StmtExprMutator::VisitStmt_(op);
+    insert_in_evaluate_ = true;
+    if (contain_tma_load_) {
+      Array<Stmt> new_seq = {expect_tx_, GetRef<For>(op)};
+      contain_tma_load_ = false;
+      return SeqStmt(std::move(new_seq));
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(TMALoadOp()) ||
+          call->op.same_as(TMALoadIm2ColOp())) {
+        contain_tma_load_ = true;
+        if (insert_in_evaluate_) {
+          Array<Stmt> new_seq = {expect_tx_, GetRef<Evaluate>(op)};
+          return SeqStmt(std::move(new_seq));
+        }
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
+  }
+
+  Stmt expect_tx_;
+  bool contain_tma_load_;
+  bool insert_in_evaluate_;
+};
+
 class ProducerTraitsCollector : public StmtExprVisitor {
 public:
   ProducerTraitsCollector() { Clear(); }
@@ -216,14 +256,29 @@ private:
     loop_extents = old_loop_evtents;
   }
 
+  void VisitStmt_(const IfThenElseNode *op) final {
+    bool old_in_if_cond = in_if_cond_;
+    in_if_cond_ = true;
+    VisitExpr(op->condition);
+    in_if_cond_ = old_in_if_cond;
+
+    VisitStmt(op->then_case);
+    if (op->else_case.defined()) {
+      VisitStmt(op->else_case.value());
+    }
+  }
+
   void VisitExpr_(const BufferLoadNode *op) final {
-    has_simt_copy = true;
+    if (!in_if_cond_) {
+      has_simt_copy = true;
+    }
     StmtExprVisitor::VisitExpr_(op);
   }
 
   bool has_simt_copy;
   PrimExpr bulk_copy_bytes;
   PrimExpr loop_extents;
+  bool in_if_cond_ = false;
 };
 
 // Rewrite the producer Stmt to use the correct barrier index
@@ -515,9 +570,10 @@ private:
           auto expect_tx = IfThenElse(
               EQ(thread_var_, 0),
               makeExpectTX(release_barrier_id, collector.BulkCopyBytes()));
-          block_stmt.push_back(expect_tx);
+          block_stmt.push_back(TMAExpectTxRewriter::Rewrite(stmt, expect_tx));
+        } else {
+          block_stmt.push_back(stmt);
         }
-        block_stmt.push_back(stmt);
         if (collector.HasSimtCopy() > 0) {
           block_stmt.push_back(makeCpAsyncBarrier(release_barrier_id));
         }
@@ -910,6 +966,36 @@ private:
   bool is_valid_ = true;
 };
 
+class SetMaxNRegCollector : public StmtExprVisitor {
+public:
+  static Array<IntImm> Collect(const PrimFunc &f) {
+    SetMaxNRegCollector collector;
+    collector(f->body);
+    return collector.nreg_;
+  }
+
+private:
+  void VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(SetMaxNReg())) {
+        int reg_hint = call->args[0].as<IntImmNode>()->value;
+        int is_inc = call->args[1].as<IntImmNode>()->value;
+        ICHECK(reg_hint <= 240 && reg_hint >= 24)
+            << "Invalid reg hint: " << reg_hint;
+        ICHECK(is_inc == 0 || is_inc == 1) << "Invalid is_inc: " << is_inc;
+
+        // producer should decrease register hint while consumer should increase
+        // register hint
+        nreg_.Set(is_inc, IntImm(DataType::Int(32), reg_hint));
+      }
+    }
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  Array<IntImm> nreg_{IntImm(DataType::Int(32), 0),
+                      IntImm(DataType::Int(32), 0)};
+};
+
 class WarpSpecializedRewriter : public StmtExprMutator {
 public:
   static PrimFunc Substitute(PrimFunc f) {
@@ -924,6 +1010,7 @@ public:
     }
 
     auto T = WarpSpecializedRewriter();
+    T.nreg_ = SetMaxNRegCollector::Collect(f);
     T.buffer_lca_ = DetectBufferAccessLCA(f);
     for (auto [buffer, _] : T.buffer_lca_)
       T.buffer_data_to_buffer_.Set(buffer->data, buffer);
@@ -948,6 +1035,15 @@ private:
     } else {
       return StmtExprMutator::VisitStmt_(op);
     }
+  }
+
+  Stmt VisitStmt_(const EvaluateNode *op) final {
+    if (const CallNode *call = op->value.as<CallNode>()) {
+      if (call->op.same_as(SetMaxNReg())) {
+        return Evaluate(0);
+      }
+    }
+    return StmtExprMutator::VisitStmt_(op);
   }
 
   // If users define a thread binding, we will replace the thread binding with
@@ -995,10 +1091,14 @@ private:
       producer_thread_extent = 128;
 
     // TODO: estimate the correct reg usage.
-    auto inc_reg_stmt =
-        Evaluate(Call(DataType::Handle(), SetMaxNReg(), {240, 1}));
-    auto dec_reg_stmt =
-        Evaluate(Call(DataType::Handle(), SetMaxNReg(), {24, 0}));
+
+    int dec_reg = nreg_[0].as<IntImmNode>()->value;
+    int inc_reg = nreg_[1].as<IntImmNode>()->value;
+
+    auto inc_reg_stmt = Evaluate(Call(DataType::Handle(), SetMaxNReg(),
+                                      {inc_reg == 0 ? 240 : inc_reg, 1}));
+    auto dec_reg_stmt = Evaluate(Call(DataType::Handle(), SetMaxNReg(),
+                                      {dec_reg == 0 ? 24 : dec_reg, 0}));
 
     producer_code = SeqStmt({dec_reg_stmt, producer_code});
     consumer_code = SeqStmt({inc_reg_stmt, consumer_code});
@@ -1043,6 +1143,7 @@ private:
   IterVar thread_iv_;
   Optional<PrimExpr> updated_thread_extent_;
   bool need_update_thread_extent_ = false;
+  Array<IntImm> nreg_;
 };
 
 using namespace tir::transform;

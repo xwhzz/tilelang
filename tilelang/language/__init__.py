@@ -31,6 +31,9 @@ from .customize import (
     atomic_add,  # noqa: F401
     atomic_addx2,  # noqa: F401
     dp4a,  # noqa: F401
+    clamp,  # noqa: F401
+    reshape,  # noqa: F401
+    view,  # noqa: F401
 )
 from .builtin import *  # noqa: F401
 
