@@ -17,7 +17,9 @@ jobs:
  
   performance-test:
     runs-on: self-hosted
-    needs: format-check build-test
+    needs: |
+      format-check 
+      build-test
 
     steps:
     - name: Checkout repository
