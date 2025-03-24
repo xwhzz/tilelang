@@ -6,14 +6,14 @@ def parse_output(output):
     data = {}
     for line in output.split('\n'):
         line = line.strip()
-        if line.startswith('Best latency (s):'):
-            match = re.search(r'Best latency $s$: ([\d.]+)', line)
+        if line.startswith('Latency:'):
+            match = re.search(r'Latency: ([\d.]+)', line)
             data['latency'] = match.group(1) if match else 'N/A'
-        elif line.startswith('Best TFlops:'):
-            match = re.search(r'Best TFlops: ([\d.]+)', line)
+        elif line.startswith('TFlops:'):
+            match = re.search(r'TFlops: ([\d.]+)', line)
             data['best_tflops'] = match.group(1) if match else 'N/A'
-        elif line.startswith('Best config:'):
-            data['config'] = line.split('Best config: ')[-1]
+        elif line.startswith('Config:'):
+            data['config'] = line.split('Config: ')[-1]
         elif line.startswith('Reference TFlops:'):
             match = re.search(r'Reference TFlops: ([\d.]+)', line)
             data['ref_tflops'] = match.group(1) if match else 'N/A'
