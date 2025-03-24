@@ -1,6 +1,7 @@
 name: CI
 
-on: [pull_request]
+on: 
+  workflow_dispatch:
 
 jobs:
   format-check:
@@ -69,3 +70,45 @@ jobs:
         cd testing/python
         export TILELANG_CLEAR_CACHE=1
         python -m pytest
+    
+  performance-test:
+    runs-on: self-hosted
+    needs: format-check build-test
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v2
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v2
+      with:
+        python-version: '3.9'
+
+    - name: Create virtual environment
+      run: python -m venv tll
+
+    - name: Activate virtual environment and install dependencies
+      run: |
+        source tll/bin/activate
+        python -m pip install --upgrade pip
+        if [ -f requirements-test.txt ]; then python -m pip install -r requirements-test.txt; fi
+
+    - name: Install project in wheel mode
+      run: |
+        source tll/bin/activate
+        python -m pip install .
+
+    - name: Build original version
+      run: |
+        echo "Check files to be deleted!"
+        git clean -dxn | grep -v 'tll/' | xargs -I{} echo {} 
+        git clean -dxn | grep -v 'tll/' | xargs -I{} rm -rf {}
+        echo "Delete files completed!"
+        git checkout main
+        python -m venv tl
+        source tl/bin/activate
+        python -m pip install --upgrade pip
+        python -m pip install . tabulate
+        python ./maint/scripts/ci_performance.py
