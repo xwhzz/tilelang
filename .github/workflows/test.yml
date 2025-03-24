@@ -20,6 +20,9 @@ jobs:
     needs: |
       format-check 
       build-test
+    # 设置环境变量
+    env:
+      CUDA_CUDART_LIBRARY: /usr/local/cuda-12.5/lib64/libcudart.so
 
     steps:
     - name: Checkout repository
@@ -37,6 +40,7 @@ jobs:
 
     - name: Activate virtual environment and install dependencies
       run: |
+        echo $CUDA_CUDART_LIBRARY
         source tll/bin/activate
         python -m pip install --upgrade pip
         if [ -f requirements-test.txt ]; then python -m pip install -r requirements-test.txt; fi
