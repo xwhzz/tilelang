@@ -1,7 +1,6 @@
 name: CI
 
-on: 
-  workflow_dispatch:
+on: [pull_request]
 
 jobs:
   format-check:
@@ -95,14 +94,10 @@ jobs:
       run: |
         source tll/bin/activate
         python -m pip install --upgrade pip
-        if [ -f requirements-test.txt ]; then python -m pip install -r requirements-test.txt; fi
-
-    - name: Install project in wheel mode
-      run: |
-        source tll/bin/activate
+        python -m pip install -r requirements-test.txt
         python -m pip install .
 
-    - name: Run performance test
+    - name: Build the original version
       run: |
         echo "Check files to be deleted!"
         git clean -dxn | grep -v 'tll/' | xargs -I{} echo {} 
@@ -112,5 +107,10 @@ jobs:
         python -m venv tl
         source tl/bin/activate
         python -m pip install --upgrade pip
-        python -m pip install . tabulate
+        python -m pip install -r requirements-test.txt
+        python -m pip install .     
+
+    - name: Run performance test
+      run: |
+        source tl/bin/activate
         python ./maint/scripts/ci_performance.py
