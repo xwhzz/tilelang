@@ -1,0 +1,46 @@
+import subprocess
+import re
+from tabulate import tabulate
+
+def parse_output(output):
+    data = {}
+    for line in output.split('\n'):
+        line = line.strip()
+        if line.startswith('Best latency (s):'):
+            match = re.search(r'Best latency $s$: ([\d.]+)', line)
+            data['latency'] = match.group(1) if match else 'N/A'
+        elif line.startswith('Best TFlops:'):
+            match = re.search(r'Best TFlops: ([\d.]+)', line)
+            data['best_tflops'] = match.group(1) if match else 'N/A'
+        elif line.startswith('Best config:'):
+            data['config'] = line.split('Best config: ')[-1]
+        elif line.startswith('Reference TFlops:'):
+            match = re.search(r'Reference TFlops: ([\d.]+)', line)
+            data['ref_tflops'] = match.group(1) if match else 'N/A'
+    return data
+
+print("Running initial version...")
+output_v1 = subprocess.run(
+        ['./tl/bin/python', './maint/scripts/performance.py'], 
+        capture_output=True,
+        text=True
+    ).stdout
+data_v1 = parse_output(output_v1)
+
+print("Running current version...")
+output_v2 = subprocess.run(
+        ['./tll/bin/python', './maint/scripts/performance.py'], 
+        capture_output=True,
+        text=True
+    ).stdout
+data_v2 = parse_output(output_v2)
+
+
+table = [
+    ["original", data_v1['latency'], data_v1['best_tflops'], data_v1['ref_tflops'], data_v1['config']],
+    ["current", data_v2['latency'], data_v2['best_tflops'], data_v2['ref_tflops'], data_v2['config']]
+]
+
+headers = ["version", "Best Latency (s)", "Best TFlops", "Reference TFlops", "Best Config"]
+
+print(tabulate(table, headers=headers, tablefmt="grid", stralign="left", numalign="decimal"))
