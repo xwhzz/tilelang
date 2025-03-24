@@ -17,10 +17,9 @@ jobs:
  
   performance-test:
     runs-on: self-hosted
-    needs: |
-      format-check 
-      build-test
-    # 设置环境变量
+    needs: 
+      - format-check
+      - build-test
     env:
       CUDA_CUDART_LIBRARY: /usr/local/cuda-12.5/lib64/libcudart.so
 
