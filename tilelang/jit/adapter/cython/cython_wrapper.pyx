@@ -74,7 +74,7 @@ cdef class CythonKernelWrapper:
             )
 
         # Use current CUDA stream if none specified
-        if stream == -1:
+        if stream == -1: 
             stream = torch.cuda.current_stream().cuda_stream
 
         cdef int ins_idx = 0
@@ -88,8 +88,10 @@ cdef class CythonKernelWrapper:
                 # Now working with native Python list, no FFI calls needed
                 for s in self.param_shapes[i]:
                     if isinstance(s, tir.Var):
-                        ref_tensor_idx, ref_shape_idx = self.dynamic_symbolic_map[s]
-                        shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
+                        for key in self.dynamic_symbolic_map:
+                            if(str(s) == str(key)):
+                                ref_tensor_idx, ref_shape_idx = self.dynamic_symbolic_map[key]
+                                shape.append(tensor_list[ref_tensor_idx].shape[ref_shape_idx])
                     else:  # Already converted to Python int during initialization
                         shape.append(s)
                 device = inputs[0].device if len(inputs) > 0 else torch.cuda.current_device()
@@ -107,6 +109,10 @@ cdef class CythonKernelWrapper:
             elif isinstance(tensor_list[i], int):
                 # Dynamic symbolics which are passed as integer arguments
                 call_args.append(tensor_list[i])
+            elif isinstance(tensor_list[i], float):
+                call_args.append(ctypes.c_float(tensor_list[i]))
+            elif isinstance(tensor_list[i], bool):
+                call_args.append(ctypes.c_bool(tensor_list[i]))
             else:
                 raise ValueError(f"Unsupported tensor type: {type(tensor_list[i])}")
 
@@ -137,7 +143,10 @@ cdef class CythonKernelWrapper:
         call_args.append(ctypes.c_void_p(stream))
 
         # Execute the kernel
-        self.lib.call(*call_args)
+        result = self.lib.call(*call_args)
+        if result != 0:
+            error_msg = self.lib.get_last_error().decode('utf-8')
+            raise RuntimeError(f"Kernel call failed: {error_msg}")
 
         # Return output tensor(s)
         if len(self.result_idx) == 1:

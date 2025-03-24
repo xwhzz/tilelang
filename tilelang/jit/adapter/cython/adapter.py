@@ -9,6 +9,7 @@ from tilelang import tvm as tvm
 from tvm.target import Target
 from tilelang.engine.param import KernelParam
 from tvm import tir
+from tvm.relay import TensorType
 from tilelang.jit.adapter.wrapper import TLWrapper
 from tilelang.jit.adapter.libgen import LibraryGenerator
 from tilelang.jit.adapter.utils import is_cuda_target, is_hip_target, is_cpu_target
@@ -157,13 +158,14 @@ class CythonKernelAdapter(BaseKernelAdapter):
                  result_idx: List[int],
                  target: Union[str, Target],
                  func_or_mod: Union[tir.PrimFunc, tvm.IRModule],
-                 kernel_global_source: str,
+                 host_mod: Optional[tvm.IRModule] = None,
+                 device_mod: Optional[tvm.IRModule] = None,
+                 kernel_global_source: Optional[str] = None,
                  verbose: bool = False,
                  pass_configs: Optional[Dict[str, Any]] = None):
         """Initialize the adapter with the given TIR function or module.
         
         Args:
-            rt_mod: Runtime module
             params: List of tensor types for inputs/outputs
             result_idx: Indices of output tensors
             target: Target platform (e.g., 'cuda')
@@ -192,17 +194,19 @@ class CythonKernelAdapter(BaseKernelAdapter):
 
         self.wrapper.assign_optimized_module(self.ir_module)
         self.wrapper.assign_pass_configs(pass_configs)
+        self.wrapper.assign_host_module(host_mod)
+        self.wrapper.assign_device_module(device_mod)
         self.wrapped_source = self.wrapper.wrap(self.get_kernel_source(kernel_only=True))
 
         self.lib_generator.update_lib_code(self.wrapped_source)
         self.lib_generator.compile_lib()
         self.lib = self.lib_generator.load_lib()
 
-        try:
-            self.lib.init()
-        except Exception as e:
-            raise Exception(
-                f"Failed to initialize the compiled library for {self.target}: {e}") from e
+        self.lib.get_last_error.restype = ctypes.c_char_p
+        result = self.lib.init()
+        if result != 0:
+            error_msg = self.lib.get_last_error().decode('utf-8')
+            raise RuntimeError(f"Initialization failed: {error_msg}")
 
         self.cython_wrapper = CythonKernelWrapper(self.result_idx, self.params, self.lib)
         self.cython_wrapper.set_dynamic_symbolic_map(self.dynamic_symbolic_map)
@@ -210,6 +214,54 @@ class CythonKernelAdapter(BaseKernelAdapter):
         self.cython_wrapper.set_static_shape_map(self.static_shape_map)
         self.cython_wrapper.set_buffer_device_map(self.buffer_device_map)
         self._post_init()
+
+    @classmethod
+    def from_database(cls,
+                      params: List[TensorType],
+                      result_idx: List[int],
+                      target: str,
+                      func_or_mod: Union[tir.PrimFunc, tvm.IRModule],
+                      kernel_global_source: str,
+                      kernel_lib_path: str,
+                      verbose: bool = False,
+                      pass_configs: Optional[Dict[str, Any]] = None):
+        adapter = cls.__new__(cls)
+        adapter.params = params
+        adapter.result_idx = adapter._legalize_result_idx(result_idx)
+        adapter.kernel_global_source = kernel_global_source
+        adapter.wrapped_source = kernel_global_source
+
+        if isinstance(func_or_mod, tir.PrimFunc):
+            adapter.ir_module = tvm.IRModule({func_or_mod.attrs["global_symbol"]: func_or_mod})
+        else:
+            adapter.ir_module = func_or_mod
+
+        target = determine_target(target, return_object=True)
+        adapter.target = Target.canon_target(determine_target(target))
+
+        adapter.dynamic_symbolic_map = adapter._process_dynamic_symbolic()
+        adapter.buffer_dtype_map = adapter._process_buffer_dtype()
+        adapter.static_shape_map = adapter._process_static_shape()
+        adapter.buffer_device_map = adapter._process_buffer_device()
+
+        adapter.verbose = verbose
+        adapter.lib_generator = LibraryGenerator(adapter.target)
+        adapter.lib = adapter.lib_generator.load_lib(lib_path=kernel_lib_path)
+
+        adapter.lib.get_last_error.restype = ctypes.c_char_p
+        result = adapter.lib.init()
+        if result != 0:
+            error_msg = adapter.lib.get_last_error().decode('utf-8')
+            raise RuntimeError(f"Initialization failed: {error_msg}")
+
+        adapter.cython_wrapper = CythonKernelWrapper(adapter.result_idx, adapter.params,
+                                                     adapter.lib)
+        adapter.cython_wrapper.set_dynamic_symbolic_map(adapter.dynamic_symbolic_map)
+        adapter.cython_wrapper.set_buffer_dtype_map(adapter.buffer_dtype_map)
+        adapter.cython_wrapper.set_static_shape_map(adapter.static_shape_map)
+        adapter.cython_wrapper.set_buffer_device_map(adapter.buffer_device_map)
+        adapter._post_init()
+        return adapter
 
     def _process_dynamic_symbolic(self) -> Dict[tir.Var, Tuple[int, int]]:
         """Extract information about dynamic shapes from the TIR function.
