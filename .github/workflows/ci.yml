@@ -1,6 +1,9 @@
 name: CI
 
-on: [pull_request]
+on: 
+  pull_request:
+  issue_comment:
+    types: [created]
 
 jobs:
   format-check:
@@ -71,46 +74,57 @@ jobs:
         python -m pytest
     
   performance-test:
+    if: |
+      (contains(github.event.comment.body, '/performance-report') || contains(github.event.comment.body, '/perf'))&&
+      github.event.issue.pull_request
+    permissions:
+      pull-requests: write
     runs-on: self-hosted
-    needs: 
-      - format-check 
-      - build-test
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: Checkout repository
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
 
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.9'
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.9'
 
-    - name: Create virtual environment
-      run: python -m venv tll
+      - name: Create virtual environment
+        run: python -m venv tll
 
-    - name: Activate virtual environment and install dependencies
-      run: |
-        source tll/bin/activate
-        python -m pip install --upgrade pip
-        python -m pip install -r requirements-test.txt
-        python -m pip install .
+      - name: Install dependencies
+        run: |
+          source tll/bin/activate
+          pip install -r requirements-test.txt
+          pip install .
 
-    - name: Build the original version
-      run: |
-        echo "Check files to be deleted!"
-        git clean -dxn | grep -v 'tll/' | xargs -I{} echo {} 
-        git clean -dxn | grep -v 'tll/' | xargs -I{} rm -rf {}
-        echo "Delete files completed!"
-        git checkout main
-        python -m venv tl
-        source tl/bin/activate
-        python -m pip install --upgrade pip
-        python -m pip install -r requirements-test.txt
-        python -m pip install .     
+      - name: Build original version
+        run: |
+          git clean -dxf
+          git checkout main
+          python -m venv tl
+          source tl/bin/activate
+          pip install -r requirements-test.txt
+          pip install .
 
-    - name: Run performance test
-      run: |
-        source tl/bin/activate
-        python ./maint/scripts/ci_performance.py
+      - name: Run performance test
+        id: perf-test
+        run: |
+          source tl/bin/activate
+          git checkout refs/remotes/pull/274/merge
+          TEST_RESULTS=$(python ./maint/scripts/ci_performance.py)
+          echo "PERF_RESULTS=$TEST_RESULTS" >> $GITHUB_ENV
+
+      - name: Post Test Results to PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          COMMENT_BODY="📊 ​**Performance Test Results** (triggered by @${{ github.event.comment.user.login }}): \n\n${{ env.PERF_RESULTS }}"
+          curl -X POST \
+            -H "Authorization: token $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.issue.number }}/comments" \
+            -d "{\"body\": \"$COMMENT_BODY\"}"

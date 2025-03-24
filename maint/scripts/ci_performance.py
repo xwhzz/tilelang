@@ -41,4 +41,4 @@ table = [[
 
 headers = ["version", "Best Latency (s)", "Best TFlops", "Reference TFlops", "Best Config"]
 
-print(tabulate(table, headers=headers, tablefmt="grid", stralign="left", numalign="decimal"))
+print(tabulate(table, headers=headers, tablefmt="github", stralign="left", numalign="decimal"))
