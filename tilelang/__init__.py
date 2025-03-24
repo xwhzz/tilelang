@@ -12,7 +12,7 @@ from tqdm import tqdm
 """
 test
 """
-
+print("hello")
 class TqdmLoggingHandler(logging.Handler):
     """Custom logging handler that directs log output to tqdm progress bar to avoid interference."""
 
