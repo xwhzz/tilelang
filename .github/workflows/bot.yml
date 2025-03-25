@@ -18,8 +18,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.ref }}  
+          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
+          fetch-extra: |
+            +refs/pull/*/head:refs/remotes/origin/pull/*
 
       - name: Set up Python
         uses: actions/setup-python@v2
