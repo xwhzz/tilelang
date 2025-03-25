@@ -18,10 +18,9 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
-          fetch-extra: |
-            +refs/pull/*/head:refs/remotes/origin/pull/*
+      - name: Switch the correct branch
+        run: git checkout remotes/pull/${{ github.event.issue.number }}/merge
 
       - name: Set up Python
         uses: actions/setup-python@v2
