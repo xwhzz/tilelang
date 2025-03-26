@@ -46,11 +46,11 @@ myst_enable_extensions = [
 
 redirects = {"get_started/try_out": "../index.html#getting-started"}
 
-source_suffix = [".md"]
+source_suffix = [".md", ".rst"]
 
 language = "en"
 
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md", "**/*libinfo*", "**/*version*"]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = "sphinx"
