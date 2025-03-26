@@ -12,10 +12,17 @@ permissions:
 jobs:
   docs:
     if: ${{ github.event.pull_request.merged == true && github.event.pull_request.base.ref == 'main' }} || ${{ github.event_name == 'workflow_dispatch' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+      - name: Build package
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install .
       - name: Build docs
         run: |
           chmod +x ./maint/scripts/build_docs.sh
