@@ -24,8 +24,8 @@ jobs:
           ./maint/scripts/build_docs.sh
       - name: Configure git
         run: |
-          git config --global user.email "tilelang@outlook.com"
-          git config --global user.name "GitHub Actions"
+          git config --local user.name "github-actions[bot]"
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
       - name: Push to another repo
         env:
           TARGET_REPO: ${{ secrets.TARGET_REPO }}
