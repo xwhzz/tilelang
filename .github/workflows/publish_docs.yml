@@ -20,9 +20,9 @@ jobs:
         run: |
           python -m venv .venv
           source .venv/bin/activate
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install .
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install .
       - name: Build docs
         run: |
           chmod +x ./maint/scripts/build_docs.sh
