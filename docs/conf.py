@@ -8,7 +8,12 @@ import sys
 
 sys.path.insert(0, os.path.abspath("../tilelang"))
 sys.path.insert(0, os.path.abspath("../"))
-autodoc_mock_imports = ["torch"]
+
+autodoc_mock_imports = [
+    "torch",
+    "tilelang.language.ast",
+    "tilelang.language.parser"
+]
 
 # General information about the project.
 project = "Tile Language <br>"
