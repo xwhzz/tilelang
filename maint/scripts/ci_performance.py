@@ -3,8 +3,10 @@ import re
 from tabulate import tabulate
 
 import os
+
 env = os.environ.copy()
 env["TILELANG_CLEAR_CACHE"] = "1"
+
 
 def parse_output(output):
     data = {}
