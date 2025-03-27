@@ -18,5 +18,5 @@ help:
 # "make mode" option.  $(O) is meant as a shortcut for $(SPHINXOPTS).
 %: Makefile
 	rm -rf api/
-	sphinx-apidoc -o ./api/ ../tilelang --separate -H "TileLang API"
+	sphinx-apidoc --separate -H "Python API" -o ./api/ ../tilelang "../tilelang/language/ast*" "../tilelang/language/parser*" "*libinfo*" "*version*"
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
