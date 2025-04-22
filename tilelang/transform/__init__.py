@@ -285,3 +285,26 @@ def LoopVectorizeDynamic():
     ----
     """
     return _ffi_api.LoopVectorizeDynamic()  # type: ignore
+
+
+def ConfigIndexBitwidth():
+    """Config index bitwidth.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    ----
+    """
+    return _ffi_api.ConfigIndexBitwidth()  # type: ignore
+
+
+def FlattenBuffer():
+    """FlattenBuffer
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.FlattenBuffer()  # type: ignore

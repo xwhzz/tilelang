@@ -43,7 +43,7 @@ def _init_logger():
     logger = logging.getLogger(__name__)
     handler = TqdmLoggingHandler()
     formatter = logging.Formatter(
-        fmt="%(asctime)s [TileLang:%(levelname)s]: %(message)s",
+        fmt="%(asctime)s  [TileLang:%(name)s:%(levelname)s]: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
     handler.setFormatter(formatter)
@@ -100,7 +100,7 @@ from . import (
     engine,  # noqa: F401
 )
 
-from .engine import lower  # noqa: F401
+from .engine import lower, register_cuda_postproc, register_hip_postproc  # noqa: F401
 
 from .version import __version__  # noqa: F401
 

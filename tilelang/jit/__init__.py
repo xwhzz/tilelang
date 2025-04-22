@@ -111,7 +111,7 @@ def jit(
 
 def compile(
     func: PrimFunc = None,
-    out_idx: Union[List[int], int] = None,
+    out_idx: Union[List[int], int, None] = None,
     execution_backend: Literal["dlpack", "ctypes", "cython"] = "cython",
     target: Union[str, Target] = "auto",
     target_host: Union[str, Target] = None,
@@ -120,6 +120,29 @@ def compile(
 ) -> JITKernel:
     """
     Compile the given TileLang PrimFunc with TVM and build a JITKernel.
+    Parameters
+    ----------
+    func : tvm.tir.PrimFunc, optional
+        The TileLang TIR function to compile and wrap.
+    out_idx : Union[List[int], int], optional
+        Index(es) of the output tensors to return (default: None).
+    execution_backend : Literal["dlpack", "ctypes"], optional
+        Execution backend to use for kernel execution (default: "dlpack").
+    target : Union[str, Target], optional
+        Compilation target, either as a string or a TVM Target object (default: "auto").
+    target_host : Union[str, Target], optional
+        Target host for cross-compilation (default: None).
+    verbose : bool, optional
+        Whether to enable verbose output (default: False).
+    pass_configs : dict, optional
+        Additional keyword arguments to pass to the Compiler PassContext.
+        Available options:
+            "tir.disable_vectorize": bool, default: False
+            "tl.disable_tma_lower": bool, default: False
+            "tl.disable_warp_specialized": bool, default: False
+            "tl.config_index_bitwidth": int, default: None
+            "tl.disable_dynamic_tail_split": bool, default: False
+            "tl.dynamic_vectorize_size_bits": int, default: 128
     """
     return cached(
         func=func,
