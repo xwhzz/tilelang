@@ -204,12 +204,19 @@ Fragment FragmentNode::DeReplicate() const {
                   int(*rep_size) / factor, NullOpt);
 }
 
+Fragment FragmentNode::BindThreadRange(Range thread_range) const {
+  auto n = make_object<FragmentNode>(*this);
+  n->thread_range_ = thread_range;
+  return Fragment(n);
+}
+
 Layout LayoutNode::Inverse() const {
   arith::Analyzer analyzer;
   arith::IterMapResult res =
       arith::DetectIterMap(forward_index_, getVarMap(), 1,
                            arith::IterMapLevel::Bijective, &analyzer);
-  ICHECK(res->errors.empty()) << res->errors;
+  ICHECK(res->errors.empty())
+      << "Layout " << DebugOutput() << " has errors: " << res->errors;
 
   auto outputs_shape = OutputShape();
   Array<PrimExpr> outputs;
@@ -378,6 +385,7 @@ std::string FragmentNode::DebugOutput() const {
   ss << " -> thread: " << ThreadExtent();
   ss << " -> forward_thread: " << forward_thread_;
   ss << " -> forward_index: " << GetForwardIndex();
+  ss << " -> thread_range: " << thread_range_;
   return ss.str();
 }
 
@@ -414,6 +422,9 @@ bool FragmentNode::IsEqual(const FragmentNode *other, bool skip_index) const {
   if (!ret) {
     // may be broadcast case
     return true;
+  }
+  if (this->thread_range_.defined() && other->thread_range_.defined()) {
+    ret &= StructuralEqual()(this->thread_range_, other->thread_range_);
   }
   ret &= StructuralEqual()(this->OutputShape(), other->OutputShape());
   ret &= StructuralEqual()(this->ReplicateExtent(), other->ReplicateExtent());

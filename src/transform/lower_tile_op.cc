@@ -40,9 +40,32 @@ static Buffer makeBufferWithLayout(const Buffer &buffer, const Layout &layout) {
   } else {
     new_var = Var(buffer->data->name_hint, new_type);
   }
-  return Buffer(new_var, buffer->dtype, layout->OutputShape(), {},
-                buffer->elem_offset, buffer->name, buffer->data_alignment,
-                buffer->offset_factor, buffer->buffer_type);
+  Array<PrimExpr> layout_shape = layout->OutputShape();
+  Array<PrimExpr> output_shape = layout_shape;
+
+  if (ptr_type->storage_scope == "shared" ||
+      ptr_type->storage_scope == "shared.dyn") {
+    int replicate_extent = 1;
+    Array<PrimExpr> buffer_shape = buffer->shape;
+    int buffer_extent = 1;
+    int layout_extent = 1;
+    for (size_t i = 0; i < buffer_shape.size(); i++) {
+      auto shape = buffer_shape[i].as<IntImmNode>();
+      buffer_extent *= shape->value;
+    }
+    for (size_t i = 0; i < layout_shape.size(); i++) {
+      auto shape = layout_shape[i].as<IntImmNode>();
+      layout_extent *= shape->value;
+    }
+    replicate_extent = buffer_extent / layout_extent;
+    if (replicate_extent > 1) {
+      output_shape.insert(output_shape.begin(), replicate_extent);
+    }
+  }
+
+  return Buffer(new_var, buffer->dtype, output_shape, {}, buffer->elem_offset,
+                buffer->name, buffer->data_alignment, buffer->offset_factor,
+                buffer->buffer_type);
 }
 
 class LowerTileOpPass : arith::IRMutatorWithAnalyzer {
@@ -292,11 +315,24 @@ private:
     Optional<Bool> opt_disable_tma_lower =
         ctxt->GetConfig(kDisableTMALower, Optional<Bool>());
     bool disable_tma_lower = opt_disable_tma_lower.value_or(Bool(false));
+    Range thread_bounds;
 
-    auto lowered = tile_op->Lower(LowerArgs{target_, thread_block_size_,
-                                            thread_var_, callback, layout_map_,
-                                            buffer_remap_, disable_tma_lower},
-                                  analyzer_);
+    if (analyzer_->const_int_bound.IsBound(thread_var_->var)) {
+      auto const_int_bound = analyzer_->const_int_bound(thread_var_);
+      auto min_value = const_int_bound->min_value;
+      auto max_value = const_int_bound->max_value;
+      auto extent = max_value + 1 - min_value;
+      thread_bounds =
+          Range::FromMinExtent(IntImm(thread_var_->var.dtype(), min_value),
+                               IntImm(thread_var_->var.dtype(), extent));
+    } else {
+      thread_bounds = Range::FromMinExtent(0, 1);
+    }
+
+    auto lowered = tile_op->Lower(
+        LowerArgs{target_, thread_bounds, thread_var_->var, callback,
+                  layout_map_, buffer_remap_, disable_tma_lower},
+        analyzer_);
     return IRMutatorWithAnalyzer::VisitStmt(lowered);
   }
 
@@ -305,7 +341,7 @@ private:
       IterVar iv = Downcast<IterVar>(op->node);
       ICHECK_NE(iv->thread_tag.length(), 0U);
       if (iv->thread_tag == "threadIdx.x") {
-        thread_var_ = iv->var;
+        thread_var_ = iv;
         ICHECK(iv->dom->extent.as<IntImmNode>());
         thread_block_size_ = iv->dom->extent.as<IntImmNode>()->value;
       }
@@ -317,7 +353,10 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Layout> layout_map_;
   Map<Buffer, Buffer> buffer_remap_;
-  Var thread_var_;
+  // This is a workaround for cpu backend,
+  // we need to define a thread_var for the serial loop.
+  IterVar thread_var_ = IterVar(Range::FromMinExtent(0, 1), Var("v_thread"),
+                                IterVarType::kDataPar);
   size_t thread_block_size_ = 0;
   Array<Buffer> workspaces_;
   // For ptx Node, we need to remap the buffer and indices

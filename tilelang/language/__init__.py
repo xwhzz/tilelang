@@ -34,6 +34,7 @@ from .kernel import (
     get_block_binding,  # noqa: F401
     get_block_bindings,  # noqa: F401
 )
+from .warpgroup import ws  # noqa: F401
 from .allocate import (
     alloc_local,  # noqa: F401
     alloc_shared,  # noqa: F401
@@ -50,6 +51,7 @@ from .reduce import (
     reduce_sum,  # noqa: F401
     reduce_abssum,  # noqa: F401
     reduce_absmax,  # noqa: F401
+    cumsum,  # noqa: F401
 )
 from .print import print  # noqa: F401
 from .customize import (
