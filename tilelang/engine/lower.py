@@ -214,8 +214,9 @@ def lower(
         params = extrac_params(func) if not runtime_only else None
         mod = tvm.IRModule({func.attrs["global_symbol"]: func})
 
-    if isinstance(target, str):
-        target = determine_target(target)
+    # if isinstance(target, str):
+    #     target = determine_target(target)
+    target = tvm.target.cuda(arch="sm_80")
 
     target_host = canon_target_host(target, target_host)
 

@@ -25,8 +25,11 @@ Fragment makeGemmFragment8x8() {
   IterVar i = make_itervar("i", 8);
   IterVar j = make_itervar("j", 8);
   IterVar rep = make_itervar("rep", 1);
-  PrimExpr forward_thread = FloorDiv(j->var, 2) + 4 * i;
-  PrimExpr index = FloorMod(j->var, 2);
+  // PrimExpr forward_thread = FloorDiv(j->var, 2) + 4 * i;
+  // PrimExpr index = FloorMod(j->var, 2);
+  // Note: the following is corresponding to aica arch instead of original cuda
+  PrimExpr forward_thread = FloorMod(j->var, 4) + 4 * i; 
+  PrimExpr index = FloorDiv(j->var, 4);
   return Fragment({i, j}, {index}, forward_thread, rep);
 }
 /*
