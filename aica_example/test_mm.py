@@ -1,5 +1,16 @@
 import ctypes
 import torch
+import argparse
+
+parser = argparse.ArgumentParser(description="AICA Kernel Compilation")
+parser.add_argument("--m", type=int, default=1024, help="Matrix M dimension")
+parser.add_argument("--n", type=int, default=1024, help="Matrix N dimension")
+parser.add_argument("--k", type=int, default=1024, help="Matrix K dimension")
+args = parser.parse_args()
+
+M = args.m
+N = args.n
+K = args.k
 
 # Load the AICA runtime and the compiled kernel library
 lib = ctypes.CDLL("/usr/local/aica/lib/libaicart.so")
@@ -7,9 +18,9 @@ compute_lib = ctypes.CDLL("./kernel_lib.so")
 
 # --- 1. Setup Host Tensors ---
 # Use float16 (half precision) as indicated by the kernel signature (half_t)
-a = torch.randn(1024, 1024, dtype=torch.float16)
-b = torch.randn(1024, 1024, dtype=torch.float16)
-c = torch.empty(1024, 1024, dtype=torch.float16)
+a = torch.randn(M, K, dtype=torch.float16)
+b = torch.randn(K, N, dtype=torch.float16)
+c = torch.empty(M, N, dtype=torch.float16)
 
 # Get host memory pointers (as integers)
 a_ptr = a.data_ptr()

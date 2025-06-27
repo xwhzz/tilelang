@@ -31,7 +31,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
 
 
 def main():
-    func = matmul(1024, 1024, 1024, 128, 128, 32)
+    func = matmul(1024, 2048, 5192, 128, 128, 32)
 
     print(func)
 

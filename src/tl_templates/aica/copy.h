@@ -26,8 +26,16 @@ TL_DEVICE void cp_async_gs(void *smem_addr, void const *global_ptr) {
     arch::cp_async<4, arch::CacheOperation::Always>(reinterpret_cast<void *>(addr + i),
                                                     (const char *)global_ptr + i);
   }
-  // arch::cp_async<N, arch::CacheOperation::Always>(
-  //     smem_addr, global_ptr);
+}
+
+template <int N>
+TL_DEVICE void cp_async_gs_conditional(void *smem_addr, void const *global_ptr, bool cond) {
+  unsigned int addr = smem_ptr_to_uint(smem_addr);
+  #pragma unroll
+  for (int i = 0; i < N; i+=4){
+    arch::cp_async_zfill<4, arch::CacheOperation::Always>(reinterpret_cast<void *>(addr + i),
+                                                    (const char *)global_ptr + i, cond);
+  }
 }
 
 } // namespace tl
