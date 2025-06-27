@@ -124,6 +124,8 @@ def flashattn(batch, heads, seq_len, dim, is_causal, tune=False):
                 O_shared = T.alloc_shared([block_M, dim], dtype)
                 acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
                 # acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
+                # Note this is a hack, because fragment A and C may use different 8x8 layout.
+                # so we need to use a shared buffer to store the casted acc_s.
                 acc_s_cast = T.alloc_shared([block_M, block_N], dtype)
                 acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
                 scores_max = T.alloc_fragment([block_M], accum_dtype)
