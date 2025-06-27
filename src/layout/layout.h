@@ -135,7 +135,7 @@ public:
 Var InputPlaceholder(size_t idx);
 Var ReplicationPlaceholder();
 
-Fragment makeGemmFragment8x8();
+Fragment makeGemmFragment8x8(bool change = false);
 Fragment makeGemmFragment8x8Transposed();
 Fragment makeGemmFragmentC(const int block_m, const int block_n,
                            const int warp_m, const int warp_n,

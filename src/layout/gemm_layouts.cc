@@ -21,15 +21,19 @@ static IterVar make_itervar(std::string name, PrimExpr dom) {
   return IterVar(Range(0, dom), var, IterVarType::kDataPar);
 }
 
-Fragment makeGemmFragment8x8() {
+Fragment makeGemmFragment8x8(bool change) {
   IterVar i = make_itervar("i", 8);
   IterVar j = make_itervar("j", 8);
   IterVar rep = make_itervar("rep", 1);
-  // PrimExpr forward_thread = FloorDiv(j->var, 2) + 4 * i;
-  // PrimExpr index = FloorMod(j->var, 2);
-  // Note: the following is corresponding to aica arch instead of original cuda
-  PrimExpr forward_thread = FloorMod(j->var, 4) + 4 * i; 
-  PrimExpr index = FloorDiv(j->var, 4);
+  PrimExpr forward_thread, index;
+  if (change) {
+    forward_thread = FloorMod(j->var, 4) + 4 * i; 
+    index = FloorDiv(j->var, 4);
+  } else {
+    forward_thread = FloorDiv(j->var, 2) + 4 * i;
+    index = FloorMod(j->var, 2);
+  }
+
   return Fragment({i, j}, {index}, forward_thread, rep);
 }
 /*
@@ -105,7 +109,7 @@ Fragment makeGemmFragmentC(const int block_m, const int block_n,
   ICHECK(block_n % warp_n == 0);
   ICHECK(warp_m % 16 == 0) << "warp_m=" << warp_m;
   ICHECK(warp_n % 8 == 0) << "warp_n=" << warp_n;
-  auto base_layout = makeGemmFragment8x8()->Repeat({2, 1}, false);
+  auto base_layout = makeGemmFragment8x8(true)->Repeat({2, 1}, false);
   auto warp_layout =
       base_layout->Repeat({block_m / warp_m, block_n / warp_n}, true, false);
   auto block_layout =
