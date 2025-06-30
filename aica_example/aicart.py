@@ -32,7 +32,7 @@ def torch_empty_aica(*args, **kwargs) -> tuple[torch.Tensor, ctypes.c_void_p]:
     _device_tensor.append(tensor_d)
     return tensor, tensor_d
 
-def torch_dump_aica(tensor, d_ptr) -> None:
+def torch_dump_aica(tensor: torch.Tensor, d_ptr: ctypes.c_void_p) -> None:
     """
     Copy tensor from device to host and free device memory.
     """

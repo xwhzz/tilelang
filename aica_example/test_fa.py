@@ -2,6 +2,7 @@ import ctypes
 import torch
 import argparse
 import torch.nn.functional as F
+from aicart import torch_randn_aica, torch_empty_aica, torch_dump_aica, release_all
 
 parser = argparse.ArgumentParser(description="AICA Kernel Compilation")
 parser.add_argument('--batch', type=int, default=8, help='batch size')
@@ -15,48 +16,15 @@ heads = args.heads
 seq_len = args.seq_len
 dim = args.dim
 
-# Load the AICA runtime and the compiled kernel library
-lib = ctypes.CDLL("/usr/local/aica/lib/libaicart.so")
 compute_lib = ctypes.CDLL("./kernel_lib.so")
 shape = (batch, seq_len, heads, dim)
 # --- 1. Setup Host Tensors ---
 # Use float16 (half precision) as indicated by the kernel signature (half_t)
-q = torch.randn(shape, dtype=torch.float16)
-k = torch.randn(shape, dtype=torch.float16)
-v = torch.randn(shape, dtype=torch.float16)
+q, q_d = torch_randn_aica(shape, dtype=torch.float16)
+k, k_d = torch_randn_aica(shape, dtype=torch.float16)
+v, v_d = torch_randn_aica(shape, dtype=torch.float16)
+out, out_d = torch_empty_aica(shape, dtype=torch.float16)
 
-out = torch.empty(shape, dtype=torch.float16)
-
-# Get host memory pointers (as integers)
-q_ptr = q.data_ptr()
-k_ptr = k.data_ptr()
-v_ptr = v.data_ptr()
-out_ptr = out.data_ptr()
-
-
-# --- 2. Allocate Device Memory ---
-# Create ctypes void pointers that will hold the device addresses.
-# These will be populated by the aicaMalloc call.
-q_d = ctypes.c_void_p()
-k_d = ctypes.c_void_p()
-v_d = ctypes.c_void_p()
-out_d = ctypes.c_void_p()
-
-# aicaMalloc expects a pointer to a pointer (void**) to write the address into.
-# ctypes.byref(a_d) correctly creates this reference.
-print("Allocating device memory...")
-lib.aicaMalloc(ctypes.byref(q_d), q.numel() * q.element_size())
-lib.aicaMalloc(ctypes.byref(k_d), k.numel() * k.element_size())
-lib.aicaMalloc(ctypes.byref(v_d), v.numel() * v.element_size())
-lib.aicaMalloc(ctypes.byref(out_d), out.numel() * out.element_size())
-
-# --- 3. Copy Data from Host to Device ---
-# aicaMemcpyHostToDevice has enum value 1.
-# The source is the host pointer, destination is the device pointer.
-print("Copying data from host to device...")
-lib.aicaMemcpy(q_d, ctypes.c_void_p(q_ptr), q.numel() * q.element_size(), 1)
-lib.aicaMemcpy(k_d, ctypes.c_void_p(k_ptr), k.numel() * k.element_size(), 1)
-lib.aicaMemcpy(v_d, ctypes.c_void_p(v_ptr), v.numel() * v.element_size(), 1)
 
 # --- 4. Launch Kernel on Device ---
 # The kernel must be called with the DEVICE pointers (a_d, b_d, c_d).
@@ -67,14 +35,11 @@ compute_lib.call(q_d, k_d, v_d, out_d)
 # aicaMemcpyDeviceToHost has enum value 2.
 # The source is the device pointer, destination is the host pointer.
 print("Copying result from device to host...")
-lib.aicaMemcpy(ctypes.c_void_p(out_ptr), out_d, out.numel() * out.element_size(), 2)
+torch_dump_aica(out, out_d)
 
 # --- 6. Free Device Memory ---
 print("Freeing device memory...")
-lib.aicaFree(q_d)
-lib.aicaFree(k_d)
-lib.aicaFree(v_d)
-lib.aicaFree(out_d)
+release_all()
 # --- 7. Verify the Result ---
 print("Verifying result...")
 
