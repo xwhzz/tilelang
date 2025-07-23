@@ -117,6 +117,7 @@ class KernelCache:
         execution_backend: Literal["dlpack", "ctypes", "cython", "nvrtc"] = "cython",
         verbose: bool = False,
         pass_configs: dict = None,
+        compile_flags: Optional[List[str]] = None,
     ) -> JITKernel:
         """
         Caches and reuses compiled kernels to avoid redundant compilation.
@@ -140,6 +141,7 @@ class KernelCache:
                 target_host=target_host,
                 verbose=verbose,
                 pass_configs=pass_configs,
+                compile_flags=compile_flags,
             )
 
         key = self._generate_key(
