@@ -132,7 +132,9 @@ std::string CodeGenTileLangCUDA::Finish() {
   decl_stream << "#include <tl_templates/cuda/ldsm.h>\n";
   decl_stream << "#include <tl_templates/cuda/threadblock_swizzle.h>\n";
   decl_stream << "#include <tl_templates/cuda/debug.h>\n";
+  decl_stream << "#ifdef ENABLE_BF16\n";
   decl_stream << "#include <tl_templates/cuda/cuda_bf16_fallbacks.cuh>\n";
+  decl_stream << "#endif\n";
 
   if (need_global_barrier_) {
     decl_stream << "__device__ unsigned " << vid_global_barrier_state_
