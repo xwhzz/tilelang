@@ -258,6 +258,8 @@ private:
     // TODO(tqchen) more standard set based testing.
     bool has_same_index = true;
     bool range_is_equal = true;
+    bool range_is_overlap = true;
+
     for (const auto &kv : prev.thread_range) {
       if (!StructuralEqual()(kv.second, curr.thread_range[kv.first])) {
         range_is_equal = false;
@@ -275,6 +277,40 @@ private:
       const auto &curr_indice = curr.buffer_indices[i];
       if (!ExprDeepEqual()(prev_indice, curr_indice)) {
         has_same_index = false;
+
+        // If both are const, we can check if they are disjoint
+        // by checking if the bounds are disjoint
+        // [1024, 2048], [2048, 3072] are disjoint
+        // [1024, 2048], [1024, 1024] are not disjoint
+        auto prev_bound = analyzer_.const_int_bound(prev_indice);
+        auto curr_bound = analyzer_.const_int_bound(curr_indice);
+        if (prev_bound.defined() && curr_bound.defined()) {
+          if (prev_bound->min_value > curr_bound->max_value ||
+              curr_bound->min_value > prev_bound->max_value) {
+            range_is_overlap = false;
+            break;
+          }
+        }
+
+        // if we can prove prev_indice < curr_indice or prev_indice >
+        // curr_indice, then they are not overlap
+        auto prev_dtype = prev_indice.dtype();
+        auto curr_dtype = curr_indice.dtype();
+        if (prev_dtype.lanes() != curr_dtype.lanes()) {
+          // can not support different lanes binary op like <, >, <=, >=
+          // skip otherwise it will lead to error
+          continue;
+        }
+        bool provably_disjoint =
+            analyzer_.CanProve(prev_indice < curr_indice,
+                               arith::ProofStrength::kSymbolicBound) ||
+            analyzer_.CanProve(prev_indice > curr_indice,
+                               arith::ProofStrength::kSymbolicBound);
+
+        if (provably_disjoint) {
+          range_is_overlap = false;
+          break;
+        }
       }
 
       if (!(has_same_index)) {
@@ -291,9 +327,13 @@ private:
     if (prev.double_buffer_write && curr.type == kRead && !loop_carry) {
       return false;
     }
+
     // If nothing else allows sharing the same buffer, then they are
     // in conflict.
-    return true;
+    // if range_is_overlap is true, then they are in conflict, we should return
+    // true. if range_is_overlap is false, then they are not in conflict, we
+    // should return false.
+    return range_is_overlap;
   }
 
   void VisitStmt_(const AttrStmtNode *op) final {
