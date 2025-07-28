@@ -1,5 +1,5 @@
 name: CI
-on: [pull_request]
+on: [pull_request_target]
 
 env:
   PYTHON_VERSION: '3.9'
@@ -9,11 +9,18 @@ jobs:
   format-check:
     runs-on: self-hosted
 
+    permissions:
+      contents: write
+      pull-requests: write
+    
+
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        ref: ${{ github.head_ref }}
+        token: ${{ secrets.PAT }}
 
     - name: Set up Python
       uses: actions/setup-python@v2
@@ -41,13 +48,18 @@ jobs:
           touch "$MARKER"
         fi
 
-    - name: Update submodules
-      run: git submodule update --init --recursive
-
     - name: Run format check
       run: |
         source "${{ runner.tool_cache }}/${{ env.VENV_DIR }}/bin/activate"
-        ./format.sh
+        if ! output=$(./format.sh 2>&1); then
+          printf '%s\n' "$output" | grep "Please review and stage the changes."
+        fi
+    
+    - name: Commit and Push Changes
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: "lint: Auto-format code"
+
 
   build-test:
     runs-on: self-hosted
