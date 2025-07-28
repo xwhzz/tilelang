@@ -11,12 +11,16 @@ jobs:
 
     permissions:
       contents: write
+      pull-requests: write
+    
 
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v2
+      uses: actions/checkout@v4
       with:
         fetch-depth: 0
+        repository: ${{ github.event.pull_request.head.repo.full_name }}
+        ref: ${{ github.head_ref }}
 
     - name: Set up Python
       uses: actions/setup-python@v2
@@ -44,9 +48,6 @@ jobs:
           touch "$MARKER"
         fi
 
-    - name: Update submodules
-      run: git submodule update --init --recursive
-
     - name: Run format check
       run: |
         source "${{ runner.tool_cache }}/${{ env.VENV_DIR }}/bin/activate"
@@ -57,10 +58,9 @@ jobs:
     - name: Commit and Push Changes
       uses: stefanzweifel/git-auto-commit-action@v5
       with:
-        commit_message: "lint"
-        commit_user_name: github-actions[bot]
-        commit_user_email: github-actions[bot]@users.noreply.github.com
-        branch: ${{ github.head_ref }}
+        commit_message: "lint: Auto-format code"
+        token: ${{ secrets.PAT }}
+
 
   build-test:
     runs-on: self-hosted
