@@ -47,7 +47,16 @@ jobs:
     - name: Run format check
       run: |
         source "${{ runner.tool_cache }}/${{ env.VENV_DIR }}/bin/activate"
-        ./format.sh
+        if ! output=$(./format.sh 2>&1); then
+          printf '%s\n' "$output" | grep "Please review and stage the changes."
+        fi
+    
+    - name: Commit and Push Changes
+      uses: stefanzweifel/git-auto-commit-action@v5
+      with:
+        commit_message: "lint"
+        commit_user_name: github-actions[bot]
+        commit_user_email: github-actions[bot]@users.noreply.github.com
 
   build-test:
     runs-on: self-hosted
