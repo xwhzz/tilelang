@@ -60,6 +60,7 @@ jobs:
         commit_message: "lint"
         commit_user_name: github-actions[bot]
         commit_user_email: github-actions[bot]@users.noreply.github.com
+        branch: ${{ github.head_ref }}
 
   build-test:
     runs-on: self-hosted
