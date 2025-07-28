@@ -16,7 +16,7 @@ def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="flo
     @T.prim_func
     def main(
             A: T.Tensor((M, K), dtype),
-        B: T.Tensor((K, N), dtype),
+            B: T.Tensor((K, N), dtype),
             C: T.Tensor((M, N), dtype),
     ):
         # Initialize Kernel Context
