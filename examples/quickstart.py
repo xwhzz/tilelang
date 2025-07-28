@@ -10,7 +10,7 @@ from tilelang.intrinsics import (
 
 
 # add decorator @tilelang.jit if you want to return a torch function
-# @tilelang.jit
+# @tilelang.jit abs
 def matmul(M, N, K, block_M, block_N, block_K, dtype="float16", accum_dtype="float"):
 
     @T.prim_func
