@@ -6,7 +6,7 @@
 
 #    # Commit changed files with message 'Run yapf and ruff'
 #
-# up
+#
 # YAPF + Clang formatter (if installed). This script formats all changed files from the last mergebase.
 # You are encouraged to run this locally before pushing changes for review.
 
