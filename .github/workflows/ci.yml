@@ -4,6 +4,7 @@ on: [pull_request]
 env:
   PYTHON_VERSION: '3.9'
   VENV_DIR: tilelang_ci
+  PAT_TOKEN: ${{ secrets.PAT }}
 
 jobs:
   format-check:
@@ -21,6 +22,7 @@ jobs:
         fetch-depth: 0
         repository: ${{ github.event.pull_request.head.repo.full_name }}
         ref: ${{ github.head_ref }}
+        token: ${PAT_TOKEN}
 
     - name: Set up Python
       uses: actions/setup-python@v2
