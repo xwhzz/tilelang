@@ -1,62 +1,24 @@
 name: CI
-on: [pull_request]
+on: 
+  workflow_run:
+    workflows: ["Format Check"]
+    types: [completed]
 
 env:
   PYTHON_VERSION: '3.9'
   VENV_DIR: tilelang_ci
 
 jobs:
-  format-check:
-    runs-on: self-hosted
-
-    steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
-
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: ${{ env.PYTHON_VERSION }}
-
-    - name: Ensure venv (local & persistent)
-      run: |
-        set -e
-        REQS_HASH=$(cat requirements-test.txt 2>/dev/null || true)
-        MARKER="${{ runner.tool_cache }}/.venv_marker_${{ env.PYTHON_VERSION }}_${REQS_HASH:0:8}"
-
-        if [[ -f "$MARKER" ]] && [[ -f "${{ runner.tool_cache }}/${{ env.VENV_DIR }}/bin/activate" ]]; then
-          echo "venv exists and hash matches – reuse it"
-        else
-          echo "venv stale or missing – recreating"
-          rm -rf "${{ runner.tool_cache }}/${{ env.VENV_DIR }}" "$MARKER"
-          python -m venv "${{ runner.tool_cache }}/${{ env.VENV_DIR }}"
-          # shellcheck source=/dev/null
-          source "${{ runner.tool_cache }}/${{ env.VENV_DIR }}/bin/activate"
-          python -m pip install --upgrade pip --no-user
-          [[ -f requirements-test.txt ]] && \
-            PIP_NO_BUILD_ISOLATION=1 pip install -r requirements-test.txt --no-user
-          pip install . --no-user
-          touch "$MARKER"
-        fi
-
-    - name: Update submodules
-      run: git submodule update --init --recursive
-
-    - name: Run format check
-      run: |
-        source "${{ runner.tool_cache }}/${{ env.VENV_DIR }}/bin/activate"
-        ./format.sh
-
   build-test:
-    runs-on: self-hosted
-    needs: format-check
+    runs-on: [ubuntu-latest]
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v2
+    - name: Checkout PR Branch
+      uses: actions/checkout@v4
       with:
+        repository: ${{ github.event.workflow_run.head_repository.full_name }}
+        ref: ${{ github.event.workflow_run.head_branch }}
         fetch-depth: 0
 
     - name: Set up Python
