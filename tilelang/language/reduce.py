@@ -1,7 +1,7 @@
 """The language interface for tl programs."""
 
 from tvm import tir
-from typing import Optional
+from typing import Optional, Literal
 from tilelang.language import copy, macro, alloc_shared
 
 
@@ -11,7 +11,7 @@ def _legalize_dim(buffer: tir.Buffer, dim: int):
     return dim
 
 
-def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool):
+def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clear: bool, scale: Literal["inter-thread", "intra-thread", "block"] = "block"):
     """Perform a reduction operation on a buffer along a specified dimension.
 
     Args:
@@ -34,6 +34,7 @@ def reduce(buffer: tir.Buffer, out: tir.Buffer, reduce_type: str, dim: int, clea
         reduce_type,
         dim,
         clear,
+        scale,
     )
 
 
@@ -74,7 +75,7 @@ def reduce_min(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
     return reduce(buffer, out, "min", dim, clear)
 
 
-def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True):
+def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool = True, scale: Literal["intra-thread", "inter-thread", "block"] = "block"):
     """Perform reduce sum on input buffer, store the result to output buffer.
 
     Args:
@@ -96,7 +97,7 @@ def reduce_sum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1, clear: bool =
         tir.Call: Handle to the reduction operation
     """
     dim = _legalize_dim(buffer, dim)
-    return reduce(buffer, out, "sum", dim, clear)
+    return reduce(buffer, out, "sum", dim, clear, scale)
 
 
 def reduce_abssum(buffer: tir.Buffer, out: tir.Buffer, dim: int = -1):

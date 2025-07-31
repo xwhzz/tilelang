@@ -281,14 +281,18 @@ private:
 
 class ThreadIdxRewriter : public StmtExprMutator {
 public:
-  static Stmt Rewrite(Stmt stmt, Var thread_var, PrimExpr replaced) {
-    auto rewriter = ThreadIdxRewriter(thread_var, replaced);
+  static Stmt Rewrite(Stmt stmt, Var thread_var, PrimExpr replaced,
+                      PrimExpr thread_extent, bool do_shuffle = false) {
+    auto rewriter =
+        ThreadIdxRewriter(thread_var, replaced, thread_extent, do_shuffle);
     return rewriter(stmt);
   }
 
 private:
-  ThreadIdxRewriter(Var thread_var, PrimExpr replaced)
-      : thread_var_(thread_var), replaced_(replaced) {}
+  ThreadIdxRewriter(Var thread_var, PrimExpr replaced, PrimExpr thread_extent,
+                    bool do_shuffle)
+      : thread_var_(thread_var), replaced_(replaced),
+        thread_extent_(thread_extent), do_shuffle_(do_shuffle) {}
 
   PrimExpr VisitExpr_(const VarNode *var) final {
     if (var == thread_var_.get()) {
@@ -298,8 +302,40 @@ private:
     }
   }
 
+  PrimExpr VisitExpr_(const EQNode *op) final {
+    if (op->a.as<VarNode>() == thread_var_.get() ||
+        op->b.as<VarNode>() == thread_var_.get()) {
+
+    } else {
+      maybe_thread_opt_ = false;
+    }
+    return StmtExprMutator::VisitExpr_(op);
+  }
+
+  Stmt VisitStmt_(const IfThenElseNode *op) final {
+    auto f_uses_thread_index = [=](const tvm::tir::VarNode *parameter) {
+      return parameter == thread_var_.get();
+    };
+
+    if (!op->else_case.defined() && op->condition.as<EQNode>() &&
+        UsesVar(op->condition, f_uses_thread_index) &&
+        !(UsesVar(op->then_case, f_uses_thread_index))) {
+      maybe_thread_opt_ = do_shuffle_;
+    }
+    auto res = StmtExprMutator::VisitStmt_(op);
+    if (maybe_thread_opt_) {
+      res = AttrStmt(make_zero(DataType::Int(32)), "shuffle_and_elect",
+                     thread_extent_, res);
+      maybe_thread_opt_ = false;
+    }
+    return res;
+  }
+
   Var thread_var_;
   PrimExpr replaced_;
+  PrimExpr thread_extent_;
+  bool maybe_thread_opt_ = false;
+  bool do_shuffle_;
 };
 
 Block MakeGroupBlock(const Stmt &stmt,
@@ -561,6 +597,7 @@ private:
             block_stmt.push_back(makeCpAsyncBarrier(release_barrier_id));
           }
           if (map.release_after[i][j]) {
+            // we don't need to add arrive barrier
             block_stmt.push_back(makeArriveBarrier(release_barrier_id));
             for (int s = 0; s < num_stages_; s++) {
               released_barrier_.insert(s + num_barriers_ +
@@ -985,9 +1022,12 @@ private:
 
 class WarpSpecializedRewriter : public StmtExprMutator {
 public:
-  WarpSpecializedRewriter(bool disable_warp_specialized)
-      : disable_warp_specialized_(disable_warp_specialized) {}
-  static PrimFunc Substitute(PrimFunc f, bool disable_warp_specialized) {
+  WarpSpecializedRewriter(bool disable_warp_specialized,
+                          bool disable_shuffle_elect)
+      : disable_warp_specialized_(disable_warp_specialized),
+        disable_shuffle_elect_(disable_shuffle_elect) {}
+  static PrimFunc Substitute(PrimFunc f, bool disable_warp_specialized,
+                             bool disable_shuffle_elect) {
     // Check if function only uses threadIdx.x before proceeding
     if (!ThreadTagChecker::HasOnlyThreadIdxX(f)) {
       LOG(WARNING) << "WarpSpecialize will be disabled because the program "
@@ -998,7 +1038,8 @@ public:
       return f;
     }
 
-    auto T = WarpSpecializedRewriter(disable_warp_specialized);
+    auto T = WarpSpecializedRewriter(disable_warp_specialized,
+                                     disable_shuffle_elect);
     T.nreg_ = SetMaxNRegCollector::Collect(f);
     T.buffer_lca_ = DetectBufferAccessLCA(f);
     for (auto [buffer, _] : T.buffer_lca_)
@@ -1048,7 +1089,7 @@ private:
       ICHECK(thread_tag == "threadIdx.x") << "Only support threadIdx.x";
       Var thread_iv = Downcast<Var>(for_node->loop_var);
       Stmt new_body =
-          ThreadIdxRewriter::Rewrite(for_node->body, thread_iv, thread_iv_);
+          ThreadIdxRewriter::Rewrite(for_node->body, thread_iv, thread_iv_, 0);
       return new_body;
     }
     return for_node;
@@ -1113,10 +1154,15 @@ private:
     producer_code = SeqStmt({dec_reg_stmt, producer_code});
     consumer_code = SeqStmt({inc_reg_stmt, consumer_code});
 
-    producer_code =
-        ThreadIdxRewriter::Rewrite(producer_code, thread_iv_->var,
-                                   thread_iv_->var - consumer_thread_extent);
     updated_thread_extent_ = consumer_thread_extent + producer_thread_extent;
+
+    producer_code = ThreadIdxRewriter::Rewrite(
+        producer_code, thread_iv_->var,
+        thread_iv_->var - consumer_thread_extent, producer_thread_extent,
+        !disable_shuffle_elect_);
+    consumer_code = ThreadIdxRewriter::Rewrite(
+        consumer_code, thread_iv_->var, thread_iv_->var, consumer_thread_extent,
+        !disable_shuffle_elect_);
     need_update_thread_extent_ = true;
 
     ICHECK(producer.num_barriers_ == consumer.num_barriers_)
@@ -1125,8 +1171,9 @@ private:
     Array<PrimExpr> barrier_num_threads;
     barrier_num_threads.reserve(num_barriers);
     for (int i = 0; i < num_barriers; i++) {
+      // producer may only need 1 thread
       PrimExpr arrive_thread_count = producer.released_barrier_.count(i)
-                                         ? producer_thread_extent
+                                         ? 1
                                          : consumer_thread_extent;
       barrier_num_threads.push_back(arrive_thread_count);
     }
@@ -1154,6 +1201,7 @@ private:
   Optional<PrimExpr> updated_thread_extent_;
   bool need_update_thread_extent_ = false;
   bool disable_warp_specialized_ = false;
+  bool disable_shuffle_elect_ = false;
   Array<IntImm> nreg_;
 };
 
@@ -1220,10 +1268,13 @@ tvm::transform::Pass WarpSpecialized() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
     bool disable_warp_specialized =
         ctx->GetConfig<Bool>(kDisableWarpSpecialized, Bool(false)).value();
+    bool disable_shuffle_elect =
+        ctx->GetConfig<Bool>(kDisableShuffleElect, Bool(false)).value();
     bool warp_specialized = WarpSpecializedDetector::Detect(f->body);
 
     if (!warp_specialized) {
-      return WarpSpecializedRewriter::Substitute(f, disable_warp_specialized);
+      return WarpSpecializedRewriter::Substitute(f, disable_warp_specialized,
+                                                 disable_shuffle_elect);
     }
     return f;
   };

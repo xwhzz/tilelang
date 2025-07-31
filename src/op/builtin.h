@@ -30,6 +30,7 @@ static constexpr const char *kEnableAggressiveSharedMemoryMerge =
 static constexpr const char *kDisableFastMath = "tl.disable_fast_math";
 static constexpr const char *kEnablePTXASVerboseOutput =
     "tl.enable_ptxas_verbose_output";
+static constexpr const char *kDisableShuffleElect = "tl.disable_shuffle_elect";
 
 /*!
  * \brief Whether to disable dynamic tail split

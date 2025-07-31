@@ -273,6 +273,7 @@ private:
       auto barrier_id = tma_op_to_barrier_id_[GetRef<Call>(op)];
       auto new_args = op->args;
       new_args.Set(1, barrier_id);
+      clear_arrive_ = true;
       return Call(op->dtype, op->op, new_args);
     } else if (op->op.same_as(mbarrier_expect_tx())) {
       ICHECK(tma_op_to_barrier_id_.count(GetRef<Call>(op)))
@@ -281,12 +282,20 @@ private:
       auto new_args = op->args;
       new_args.Set(0, barrier_id);
       return Call(op->dtype, op->op, new_args);
+    } else if (op->op.same_as(builtin::ptx_arrive_barrier())) {
+      if (clear_arrive_) {
+        clear_arrive_ = false;
+        return 0;
+      }
     }
     return IRMutatorWithAnalyzer::VisitExpr_(op);
   }
+
+
   Map<ObjectRef, PrimExpr> tma_op_to_barrier_id_;
   Map<PrimExpr, IntImm> barrier_id_to_range_;
   bool has_create_list_of_mbarrier_;
+  bool clear_arrive_{false};
 };
 
 tvm::transform::Pass InjectTmaBarrier() {

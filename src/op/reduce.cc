@@ -38,6 +38,7 @@ ReduceOp::ReduceOp(Array<PrimExpr> args, BufferMap vmap) {
   else
     ICHECK(0) << "Unknown reduce type: " << reduce_type;
   clear = args[4].as<Bool>().value();
+  scale = args[5].as<StringImm>().value()->value;
 }
 
 PrimExpr ReduceOp::MakeInitValue() const {
@@ -156,17 +157,20 @@ Stmt ReduceOp::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
   bool require_init = this->clear;
   // sum op must be cleared
-  if (this->type == ReduceType::kSum) {
-    require_init = true;
-  } else if (this->type == ReduceType::kAbsSum) {
-    require_init = true;
-  }
+  // should initialize outside 
+  // if (this->type == ReduceType::kSum) {
+  //   require_init = true; 
+  // } else if (this->type == ReduceType::kAbsSum) {
+  //   require_init = true;
+  // }
 
   Buffer clear_buffer = dst_buffer;
   bool need_duplicate = false;
-  if (this->type == ReduceType::kSum && !this->clear) {
-    need_duplicate = true;
-  } else if (this->type == ReduceType::kAbsSum && !this->clear) {
+  // we may not need to duplicate 
+  // if (this->type == ReduceType::kSum && !this->clear) {
+  //   need_duplicate = true;
+  // } else 
+  if (this->type == ReduceType::kAbsSum && !this->clear) {
     need_duplicate = true;
   }
 
@@ -183,92 +187,96 @@ Stmt ReduceOp::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
         BufferStore(clear_buffer, this->MakeInitValue(), dst_indices));
 
   // make thread-local reduce
-  Array<PrimExpr> src_indice_compressed;
-  Array<IterVar> src_var_compressed;
-  for (size_t i = 0; i < src_layout->OutputDim(); i++) {
-    PrimExpr expr;
-    IterVar var;
-    std::tie(expr, var) = CompressIterator(src_indices[i], src_vars,
-                                           src_vars[this->dim]->var, analyzer);
-    src_indice_compressed.push_back(expr);
-    src_var_compressed.push_back(var);
+  if (!(scale == "inter-thread")) {
+    Array<PrimExpr> src_indice_compressed;
+    Array<IterVar> src_var_compressed;
+    for (size_t i = 0; i < src_layout->OutputDim(); i++) {
+      PrimExpr expr;
+      IterVar var;
+      std::tie(expr, var) = CompressIterator(src_indices[i], src_vars,
+                                             src_vars[this->dim]->var, analyzer);
+      src_indice_compressed.push_back(expr);
+      src_var_compressed.push_back(var);
+    }
+    Stmt reduce_local = BufferStore(
+        clear_buffer,
+        this->MakeReduce(BufferLoad(clear_buffer, dst_indices),
+                         BufferLoad(src_buffer, src_indice_compressed)),
+        dst_indices);
+    for (int i = src_layout->OutputDim() - 1; i >= 0; i--) {
+      reduce_local =
+          For(src_var_compressed[i]->var, 0, src_var_compressed[i]->dom->extent,
+              ForKind::kUnrolled, reduce_local, NullOpt,
+              {{tir::attr::pragma_unroll_explicit, Bool(false)}});
+    }
+    stmts.push_back(reduce_local);
   }
-  Stmt reduce_local = BufferStore(
-      clear_buffer,
-      this->MakeReduce(BufferLoad(clear_buffer, dst_indices),
-                       BufferLoad(src_buffer, src_indice_compressed)),
-      dst_indices);
-  for (int i = src_layout->OutputDim() - 1; i >= 0; i--) {
-    reduce_local =
-        For(src_var_compressed[i]->var, 0, src_var_compressed[i]->dom->extent,
-            ForKind::kUnrolled, reduce_local, NullOpt,
-            {{tir::attr::pragma_unroll_explicit, Bool(false)}});
-  }
-  stmts.push_back(reduce_local);
 
   // make inter-thread reduce
-  PrimExpr src_thread = src_layout->ForwardThread(
-      src_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }), {});
-  auto iter_sum =
-      arith::NormalizeToIterSum(src_thread, ToVMap(src_vars), analyzer);
-  for (const auto &iter_split : iter_sum->args) {
-    auto mark = iter_split->source->source.as<Var>();
-    ICHECK(mark.defined());
-    if (mark.value().same_as(src_vars[this->dim]->var)) {
-      auto scale = as_const_int(iter_split->scale);
-      auto extent = as_const_int(iter_split->extent);
-      ICHECK(scale != nullptr && extent != nullptr);
-      if (*extent == 1)
-        continue;
+  if (scale != "intra-thread") {
+    PrimExpr src_thread = src_layout->ForwardThread(
+        src_vars.Map([](const auto &iv) { return PrimExpr(iv->var); }), {});
+    auto iter_sum =
+        arith::NormalizeToIterSum(src_thread, ToVMap(src_vars), analyzer);
+    for (const auto &iter_split : iter_sum->args) {
+      auto mark = iter_split->source->source.as<Var>();
+      ICHECK(mark.defined());
+      if (mark.value().same_as(src_vars[this->dim]->var)) {
+        auto scale = as_const_int(iter_split->scale);
+        auto extent = as_const_int(iter_split->extent);
+        ICHECK(scale != nullptr && extent != nullptr);
+        if (*extent == 1)
+          continue;
 
-      int reducing_threads = (*extent) * (*scale);
-      std::stringstream ss;
+        int reducing_threads = (*extent) * (*scale);
+        std::stringstream ss;
 
-      bool has_arch = T.target->attrs.count("arch") > 0;
-      auto thread_offset = T.thread_bounds->min;
-      if (has_arch && Downcast<String>(T.target->attrs["arch"]) == "sm_90") {
-        auto all_threads = T.thread_bounds->extent;
-        ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-           << reducing_threads << ", " << (*scale) << ", " << thread_offset
-           << ", " << all_threads << ">::run_hopper";
+        bool has_arch = T.target->attrs.count("arch") > 0;
+        auto thread_offset = T.thread_bounds->min;
+        if (has_arch && Downcast<String>(T.target->attrs["arch"]) == "sm_90") {
+          auto all_threads = T.thread_bounds->extent;
+          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+             << reducing_threads << ", " << (*scale) << ", " << thread_offset
+             << ", " << all_threads << ">::run_hopper";
+        } else {
+          ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
+             << reducing_threads << ", " << (*scale) << ", " << thread_offset
+             << ">::run";
+        }
+        Array<PrimExpr> thread_reduce_args = {
+            StringImm(ss.str()), BufferLoad(clear_buffer, dst_indices)};
+        if (reducing_threads >= 32) {
+          PrimExpr workspace = T.AddWorkspace(
+              *as_const_int(T.thread_bounds->extent), clear_buffer->dtype);
+          thread_reduce_args.push_back(workspace);
+        }
+        auto call =
+            Call(clear_buffer->dtype, builtin::call_extern(), thread_reduce_args);
+        stmts.push_back(BufferStore(clear_buffer, call, dst_indices));
+      }
+    }
+    Stmt reduce_interthread = BufferStore(
+        clear_buffer, BufferLoad(clear_buffer, dst_indices), dst_indices);
+
+    // copy clear_buffer to dst_buffer
+    if (need_duplicate) {
+      // if is reduce sum, we should add a copy from clear_buffer to dst_buffer
+      if (this->type == ReduceType::kSum) {
+        stmts.push_back(BufferStore(dst_buffer,
+                                    Add(BufferLoad(dst_buffer, dst_indices),
+                                        BufferLoad(clear_buffer, dst_indices)),
+                                    dst_indices));
+      } else if (this->type == ReduceType::kAbsSum) {
+        stmts.push_back(BufferStore(dst_buffer,
+                                    Add(BufferLoad(dst_buffer, dst_indices),
+                                        BufferLoad(clear_buffer, dst_indices)),
+                                    dst_indices));
       } else {
-        ss << "tl::AllReduce<" << this->MakeCodegenReducer() << ", "
-           << reducing_threads << ", " << (*scale) << ", " << thread_offset
-           << ">::run";
+        ICHECK(false) << "Unsupported reduce type: " << (int)this->type;
       }
-      Array<PrimExpr> thread_reduce_args = {
-          StringImm(ss.str()), BufferLoad(clear_buffer, dst_indices)};
-      if (reducing_threads >= 32) {
-        PrimExpr workspace = T.AddWorkspace(
-            *as_const_int(T.thread_bounds->extent), clear_buffer->dtype);
-        thread_reduce_args.push_back(workspace);
-      }
-      auto call =
-          Call(clear_buffer->dtype, builtin::call_extern(), thread_reduce_args);
-      stmts.push_back(BufferStore(clear_buffer, call, dst_indices));
     }
-  }
-  Stmt reduce_interthread = BufferStore(
-      clear_buffer, BufferLoad(clear_buffer, dst_indices), dst_indices);
-
-  // copy clear_buffer to dst_buffer
-  if (need_duplicate) {
-    // if is reduce sum, we should add a copy from clear_buffer to dst_buffer
-    if (this->type == ReduceType::kSum) {
-      stmts.push_back(BufferStore(dst_buffer,
-                                  Add(BufferLoad(dst_buffer, dst_indices),
-                                      BufferLoad(clear_buffer, dst_indices)),
-                                  dst_indices));
-    } else if (this->type == ReduceType::kAbsSum) {
-      stmts.push_back(BufferStore(dst_buffer,
-                                  Add(BufferLoad(dst_buffer, dst_indices),
-                                      BufferLoad(clear_buffer, dst_indices)),
-                                  dst_indices));
-    } else {
-      ICHECK(false) << "Unsupported reduce type: " << (int)this->type;
-    }
-  }
   // make the outer spatial loop
+  }
   Stmt body = stmts.size() > 1 ? SeqStmt(stmts) : stmts[0];
   for (int i = dst_layout->InputDim() - 1; i >= 0; i--) {
     body = For(dst_vars[i]->var, 0, dst_vars[i]->dom->extent,

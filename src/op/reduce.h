@@ -33,6 +33,8 @@ private:
   } type;
   bool clear;
 
+  String scale;
+
   PrimExpr MakeInitValue() const;
   PrimExpr MakeReduce(const PrimExpr &a, const PrimExpr &b) const;
   std::string MakeCodegenReducer() const;

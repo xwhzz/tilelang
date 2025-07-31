@@ -904,11 +904,12 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(builtin::ptx_cp_async_barrier())) {
     print_extern_call_stmt("tl::mbarrier_cp_async_arrive");
   } else if (op->op.same_as(tl::mbarrier_expect_tx())) {
-    print_extern_call_stmt("tl::mbarrier_expect_tx");
+    print_extern_call_stmt("tl::mbarrier_arrive_expect_tx");
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
     print_extern_call_stmt("tl::mbarrier_wait");
   } else if (op->op.same_as(tl::sync_thread_partial())) {
-    print_extern_call_stmt("tl::syncthreads_partial");
+    // print_extern_call_stmt("tl::syncthreads_partial");
+    print_extern_call_stmt("cutlass::arch::NamedBarrier::sync");
   } else if (op->op.same_as(tl::tma_load())) {
     this->PrintIndent();
     ICHECK_GE(op->args.size(), 2);
@@ -1382,6 +1383,42 @@ void CodeGenTileLangCUDA::VisitStmt_(const AttrStmtNode *op) {
     ICHECK(pattern);
     this->stream << "const dim3 blockIdx = " << pattern->value << "();\n";
     this->VisitStmt(op->body);
+    return;
+  } else if (op->attr_key == "shuffle_and_elect") {
+    int value = op->value.as<IntImmNode>()->value;
+    auto if_then_else = op->body.as<IfThenElseNode>();
+    if (op->body.as<SeqStmtNode>()) {
+      for (const auto &stmt : op->body.as<SeqStmtNode>()->seq) {
+        if (stmt.as<IfThenElseNode>()) {
+          if_then_else = stmt.as<IfThenElseNode>();
+          break;
+        } else {
+          this->VisitStmt(stmt);
+        }
+      }
+    }
+    ICHECK(if_then_else);
+    this->PrintIndent();
+    if (value != 0)
+      this->stream << "if (__shfl_sync(0xffffffff, (threadIdx.x / 32) % ("
+                   << value << " / 32), 0) == 0 && cute::elect_one_sync()) {\n";
+    else
+      this->stream << "if (cutlass::canonical_warp_idx_sync() == 0 && "
+                      "cute::elect_one_sync()) {\n";
+    int then_scope = BeginScope();
+    this->VisitStmt(if_then_else->then_case);
+    EndScope(then_scope);
+    this->PrintIndent();
+    this->stream << "}\n";
+    if (if_then_else->else_case) {
+      this->PrintIndent();
+      this->stream << "else {\n";
+      int else_scope = BeginScope();
+      this->VisitStmt(if_then_else->else_case.value());
+      EndScope(else_scope);
+      this->PrintIndent();
+      this->stream << "}\n";
+    }
     return;
   }
   CodeGenC::VisitStmt_(op);

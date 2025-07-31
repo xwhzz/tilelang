@@ -183,5 +183,4 @@ def OptimizeForTarget(mod: IRModule, target: Target) -> IRModule:
     mod = tir.transform.LowerDeviceKernelLaunch()(mod)
     # Transform threadblock to persistent threadblock
     mod = tilelang.transform.PersistThreadblock()(mod)
-
     return mod
