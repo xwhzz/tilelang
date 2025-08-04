@@ -908,7 +908,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
   } else if (op->op.same_as(tl::mbarrier_wait_parity())) {
     print_extern_call_stmt("tl::mbarrier_wait");
   } else if (op->op.same_as(tl::sync_thread_partial())) {
-    print_extern_call_stmt("tl::syncthreads_partial");
+    print_extern_call_stmt("cutlass::arch::NamedBarrier::sync");
   } else if (op->op.same_as(tl::tma_load())) {
     this->PrintIndent();
     ICHECK_GE(op->args.size(), 2);
