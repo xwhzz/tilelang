@@ -79,8 +79,8 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
         @T.macro
         def MMA0_(
             Q_shared: T.SharedBuffer([block_M, dim], dtype),
-            K_local: T.FragmentBuffer([block_N, dim], dtype),
-            # K_shared: T.SharedBuffer([block_M, dim], dtype),
+            # K_local: T.FragmentBuffer([block_N, dim], dtype),
+            K_shared: T.SharedBuffer([block_M, dim], dtype),
             acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
             k: T.int32,
             num_cols: T.int32,
@@ -89,20 +89,23 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
             by: T.int32,
             K: T.Tensor(shape, dtype),
         ):
+            # for x, y in T.Parallel(block_N, dim):  
+            #   K_local[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)
             for x, y in T.Parallel(block_N, dim):  
-              K_local[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)
+              K_shared[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)            
             if is_causal:
                 for i, j in T.Parallel(block_M, block_N):
                     acc_s[i, j] = T.if_then_else(k + j < num_cols , 0,
                                                  -T.infinity(acc_s.dtype))
             else:
                 T.clear(acc_s)
-            T.gemm(Q_shared, K_local, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+            # T.gemm(Q_shared, K_local, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
         @T.macro
         def MMA1_(
-            V_local: T.FragmentBuffer([block_N, dim], dtype),
-            # V_shared: T.SharedBuffer([block_N, dim], dtype),
+            # V_local: T.FragmentBuffer([block_N, dim], dtype),
+            V_shared: T.SharedBuffer([block_N, dim], dtype),
             acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
             acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
             k: T.int32,
@@ -112,12 +115,12 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
             by: T.int32,
             column_index: T.LocalBuffer([vertical_size], int_dtype)
         ):
-            for x, y in T.Parallel(block_N, dim):  
-              V_local[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
             # for x, y in T.Parallel(block_N, dim):  
-            #   V_shared[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
-            T.gemm(acc_s_cast, V_local, acc_o, policy=T.GemmWarpPolicy.FullRow)
-            # T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+            #   V_local[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
+            for x, y in T.Parallel(block_N, dim):  
+              V_shared[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
+            # T.gemm(acc_s_cast, V_local, acc_o, policy=T.GemmWarpPolicy.FullRow)
+            T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
 
         @T.macro
@@ -154,8 +157,8 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
         @T.macro
         def Softmax_(
                 acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
-                # acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
-                acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
+                acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
+                # acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
                 scores_max: T.FragmentBuffer([block_M], accum_dtype),
                 scores_max_prev: T.FragmentBuffer([block_M], accum_dtype),
                 scores_scale: T.FragmentBuffer([block_M], accum_dtype),
@@ -209,7 +212,6 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
                 O_shared = T.alloc_shared([block_M, dim], dtype)
                 acc_s = T.alloc_fragment([block_M, block_N], accum_dtype)
                 acc_s_cast = T.alloc_fragment([block_M, block_N], dtype)
-                acc_s_cast_ = T.alloc_shared([block_M, block_N], dtype)
                 acc_o = T.alloc_fragment([block_M, dim], accum_dtype)
                 scores_max = T.alloc_fragment([block_M], accum_dtype)
                 scores_max_prev = T.alloc_fragment([block_M], accum_dtype)
@@ -221,8 +223,8 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
                 column_count = T.alloc_local([1], int_dtype)
                 column_index = T.alloc_local([vertical_size], int_dtype)
 
-                K_local = T.alloc_fragment([block_N, dim], dtype)
-                V_local = T.alloc_fragment([block_N, dim], dtype)
+                K_shared_1 = T.alloc_shared([block_N, dim], dtype)
+                V_shared_1 = T.alloc_shared([block_N, dim], dtype)
 
                 T.copy(Q[bz, by, bx * block_M:(bx + 1) * block_M, :], Q_shared)
                 T.fill(acc_o, 0)
@@ -247,17 +249,13 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
                     Rescale(acc_o, scores_scale)
                     MMA1(V, V_shared, acc_s_cast, acc_o, real_index, by, bz)      
 
-                for bi in T.Pipelined(T.ceildiv(column_count[0], block_N), num_stages=num_stages): 
+                for bi in T.serial(T.ceildiv(column_count[0], block_N)): 
                     real_index = bi * block_N
-                    MMA0_(Q_shared, K_local, acc_s, real_index, column_count[0], column_index, bz, by, K)
-                    # MMA0_(Q_shared, K_shared, acc_s, real_index, column_count[0], column_index, bz, by, K)
-                    Softmax_(acc_s, acc_s_cast_, scores_max, scores_max_prev, scores_scale,
+                    MMA0_(Q_shared, K_shared_1, acc_s, real_index, column_count[0], column_index, bz, by, K)
+                    Softmax_(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
                             scores_sum, logsum)
-                    # Softmax_(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
-                    #         scores_sum, logsum)
                     Rescale(acc_o, scores_scale)
-                    MMA1_(V_local, acc_s_cast_, acc_o, real_index, column_count[0], V, bz, by, column_index) 
-                    # MMA1_(V_shared, acc_s_cast, acc_o, real_index, column_count[0], V, bz, by, column_index)    
+                    MMA1_(V_shared_1, acc_s_cast, acc_o, real_index, column_count[0], V, bz, by, column_index)    
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] /= logsum[i]
                 T.copy(acc_o, O_shared)
@@ -348,28 +346,28 @@ def _triton_mixed_sparse_attn_fwd_kernel(
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_i_new
 
-    # for start_n in range(0, num_cols, BLOCK_N): # 
-    #     # bi * BLOCK_N: bi * BLOCK_N + BLOCK_N
-    #     n_mask = start_n + offs_n < num_cols
-    #     cols = tl.load(cols_ptr + start_n + offs_n, mask=n_mask, other=0)
-    #     # -- load k, v --
-    #     k = tl.load(k_ptrs + cols[None, :] * stride_kn, mask=n_mask[None, :], other=0.0)
-    #     v = tl.load(v_ptrs + cols[:, None] * stride_vn, mask=n_mask[:, None], other=0.0)
-    #     # -- compute qk --
-    #     qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-    #     qk = tl.where(m_mask & n_mask, qk, float("-inf"))
-    #     qk += tl.dot(q, k)
-    #     # -- compute scaling constant --
-    #     m_i_new = tl.maximum(m_i, tl.max(qk, 1))
-    #     alpha = tl.math.exp2(m_i - m_i_new)
-    #     p = tl.math.exp2(qk - m_i_new[:, None])
-    #     # -- scale and update acc --
-    #     acc_scale = l_i * 0 + alpha  # workaround some compiler bug
-    #     acc *= acc_scale[:, None]
-    #     acc += tl.dot(p.to(dtype), v)
-    #     # -- update m_i and l_i --
-    #     l_i = l_i * alpha + tl.sum(p, 1)
-    #     m_i = m_i_new
+    for start_n in range(0, num_cols, BLOCK_N): # 
+        # bi * BLOCK_N: bi * BLOCK_N + BLOCK_N
+        n_mask = start_n + offs_n < num_cols
+        cols = tl.load(cols_ptr + start_n + offs_n, mask=n_mask, other=0)
+        # -- load k, v --
+        k = tl.load(k_ptrs + cols[None, :] * stride_kn, mask=n_mask[None, :], other=0.0)
+        v = tl.load(v_ptrs + cols[:, None] * stride_vn, mask=n_mask[:, None], other=0.0)
+        # -- compute qk --
+        qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+        qk = tl.where(m_mask & n_mask, qk, float("-inf"))
+        qk += tl.dot(q, k)
+        # -- compute scaling constant --
+        m_i_new = tl.maximum(m_i, tl.max(qk, 1))
+        alpha = tl.math.exp2(m_i - m_i_new)
+        p = tl.math.exp2(qk - m_i_new[:, None])
+        # -- scale and update acc --
+        acc_scale = l_i * 0 + alpha  # workaround some compiler bug
+        acc *= acc_scale[:, None]
+        acc += tl.dot(p.to(dtype), v)
+        # -- update m_i and l_i --
+        l_i = l_i * alpha + tl.sum(p, 1)
+        m_i = m_i_new
 
     # write back O
     acc /= l_i[:, None]
@@ -449,6 +447,7 @@ def vertical_slash_sparse_attention(
     )
 
     tl_kernel = _tl_vs_sparse_flashattn(batch_size, num_heads, context_size, head_dim, True, v_idx.shape[2], s_idx.shape[2])
+    print(tl_kernel.get_kernel_source())
     def run(is_triton: bool = True):
         if is_triton:
             out = _triton_mixed_sparse_attention(
