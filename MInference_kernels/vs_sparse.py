@@ -89,24 +89,14 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
             by: T.int32,
             K: T.Tensor(shape, dtype),
         ):
-            # for x, y in T.Parallel(block_N, dim):  
-            #   K_local[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)
-            # T.copy(K_local, K_shared)
             for x, y in T.Parallel(block_N, dim):  
               K_shared[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0) 
-            # for x in T.serial(block_N):  
-            #   # K_shared[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)
-            #   if k + x < num_cols:  
-            #     T.copy(K[bz, by, column_index[k + x], :], K_shared[x : x + 1, :])
-                # [1, 1, 16384, 64]
-                # T.ptx_cp_async("float16", K_shared, x * 64, K, column_index[k + x] * 64 + (by + bz) * 16384 * 64, 64 * 2)
             if is_causal:
                 for i, j in T.Parallel(block_M, block_N):
                     acc_s[i, j] = T.if_then_else(k + j < num_cols , 0,
                                                  -T.infinity(acc_s.dtype))
             else:
                 T.clear(acc_s)
-            # T.gemm(Q_shared, K_local, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
             T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
         @T.macro
@@ -122,17 +112,8 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
             by: T.int32,
             column_index: T.LocalBuffer([vertical_size], int_dtype)
         ):
-            # for x, y in T.Parallel(block_N, dim):  
-            #   V_local[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
-            # T.copy(V_local, V_shared)
             for x, y in T.Parallel(block_N, dim):  
-              V_shared[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)            
-            # for x in T.serial(block_N):  
-            # for x in T.serial(block_N):
-            #   if k + x < num_cols:
-            #     T.copy(V[bz, by, column_index[k + x], :], V_shared[x : x + 1, :])
-                # T.ptx_cp_async("float16", V_shared, x * 64, V, column_index[k + x] * 64 + (by + bz) * 16384 * 64, 64 * 2)
-            # T.gemm(acc_s_cast, V_local, acc_o, policy=T.GemmWarpPolicy.FullRow)
+              V_shared[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
             T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
 
 
@@ -194,8 +175,6 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
             T.reduce_sum(acc_s, scores_sum, dim=1)
             for i in T.Parallel(block_M):
                 logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-            # for i, j in T.Parallel(block_M, block_N):
-            #   acc_s_cast[i, j] = T.Cast(dtype, acc_s[i, j])
             T.copy(acc_s, acc_s_cast)
 
         @T.macro
