@@ -7,10 +7,21 @@ from tilelang.profiler import do_bench
 import triton
 import triton.language as tl
 
-tilelang.disable_cache()
 
-@tilelang.jit(out_idx=[4])
-def _tl_blocksparse_flashattn(batch, heads, seq_len, dim, is_causal, top_k=10):
+# ncu --set full --target-processes all --kernel-name blocksparse_flashattn_kernel -o block_sparse  python block_sparse.py 
+
+# tilelang.disable_cache()
+
+@tilelang.jit(out_idx=[4], 
+    compile_flags=["--use_fast_math", 
+                "--resource-usage",
+                "-O3",],
+    pass_configs={
+        "tl.disable_tma_lower": True,
+        "tl.disable_warp_specialized": True,
+    }, 
+)
+def _tl_blocksparse_flashattn(batch, heads, seq_len, dim, is_causal, top_k=10, dtype="float16"):
     block_M = 64
     block_N = 64
     num_stages = 2
@@ -20,7 +31,7 @@ def _tl_blocksparse_flashattn(batch, heads, seq_len, dim, is_causal, top_k=10):
     top_k = min(top_k, seq_len // block_N)
     block_index_shape = [batch, heads, seq_len // block_M, top_k]
 
-    dtype = "float16"
+    # dtype = "float16"
     accum_dtype = "float"
     block_index_dtype = "int32"
 
@@ -133,12 +144,11 @@ def _tl_blocksparse_flashattn(batch, heads, seq_len, dim, is_causal, top_k=10):
 
                 for bi in T.Pipelined(block_count, num_stages=num_stages):
                     k = block_index[bi]
-                    if k < T.ceildiv(seq_len, block_N):
-                        MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
-                        Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
-                                scores_sum, logsum)
-                        Rescale(acc_o, scores_scale)
-                        MMA1(V, V_shared, acc_s_cast, acc_o, k, by, bz)
+                    MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
+                    Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
+                            scores_sum, logsum)
+                    Rescale(acc_o, scores_scale)
+                    MMA1(V, V_shared, acc_s_cast, acc_o, k, by, bz)
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] /= logsum[i]
                 T.copy(acc_o, O_shared)
@@ -201,6 +211,9 @@ def _triton_block_sparse_attn_fwd_kernel(
     # loop over k, v and update accumulator
     m_mask = offs_m[:, None] < seqlen
     block_count = tl.minimum((start_m + 1) * BLOCK_M // BLOCK_N, MAX_BLOCKS_PRE_ROW)
+
+
+    # (1 + 2 + 3 + ... )
 
     for sparse_block_idx in range(block_count):
         real_block_idx = tl.load(blocks_ptr + sparse_block_idx)
@@ -327,20 +340,26 @@ def test_correctness():
 
     run = block_sparse_attention(q, k, v, TOPK)
 
+    total_flops = 2.0 * BATCH * N_HEADS * TOPK * 64 * 64 * TOPK * D_HEAD 
 
     triton_out = run(True)
     tilelang_out = run(False)
 
+    torch.cuda.synchronize()
+
     torch.testing.assert_close(tilelang_out, triton_out, atol=1e-2, rtol=1e-2)
     print("Pass topk sparse attention test with qlen == klen")
 
+    triton_time = do_bench(lambda: run(True))
     tilelang_time = do_bench(lambda: run(False))
 
-    triton_time = do_bench(lambda: run(True))
-
-    print(triton_time, tilelang_time)
-
+    print("triton_time: ", triton_time, "  tflops: ", total_flops / triton_time * 1e-9)
+    print("tilelang_time: ", tilelang_time, "  tflops: ", total_flops / tilelang_time * 1e-9)
 
 
+"""
+triton_time:  0.09987550973892212
+tilelang_time:  0.12866270542144775
+"""
 
 test_correctness()
