@@ -7,6 +7,8 @@ from tilelang.profiler import do_bench
 import triton
 import triton.language as tl
 
+tilelang.disable_cache()
+
 @tilelang.jit(out_idx=[4])
 def _tl_blocksparse_flashattn(batch, heads, seq_len, dim, is_causal, top_k=10):
     block_M = 64
@@ -127,13 +129,11 @@ def _tl_blocksparse_flashattn(batch, heads, seq_len, dim, is_causal, top_k=10):
                 for vj in T.serial(top_k):
                     block_index[vj] = BlockIndex[bz, by, bx, vj]
 
-                loop_range = (
-                    T.min(T.ceildiv(seq_len, block_N), T.ceildiv(
-                        (bx + 1) * block_M, block_N)) if is_causal else T.ceildiv(seq_len, block_N))
+                block_count = T.min(T.ceildiv((bx + 1) * block_M, block_N), top_k)
 
-                for bi in T.Pipelined(T.min(loop_range, top_k), num_stages=num_stages):
+                for bi in T.Pipelined(block_count, num_stages=num_stages):
                     k = block_index[bi]
-                    if k < loop_range:
+                    if k < T.ceildiv(seq_len, block_N):
                         MMA0(K, Q_shared, K_shared, acc_s, k, bx, by, bz)
                         Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
                                 scores_sum, logsum)

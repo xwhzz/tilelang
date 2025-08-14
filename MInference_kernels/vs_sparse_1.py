@@ -21,10 +21,7 @@ from tilelang.testing import torch_assert_close
 
 tilelang.disable_cache()
 
-@tilelang.jit(out_idx=[3], pass_configs={
-    # "tl.disable_tma_lower": True,
-    # "tl.disable_warp_specialized": True
-})
+@tilelang.jit(out_idx=[3])
 def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size, slash_size):
     block_M = 64
     block_N = 64
@@ -264,7 +261,7 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
                     Rescale(acc_o, scores_scale)
                     MMA1(V, V_shared, acc_s_cast, acc_o, real_index, by, bz)      
 
-                for bi in T.serial(T.ceildiv(column_count[0], block_N)): 
+                for bi in T.Pipelined(T.ceildiv(column_count[0], block_N), num_stages=num_stages): 
                     real_index = bi * block_N
                     MMA0_(Q_shared, K_local, K_shared_1, acc_s, real_index, column_count[0], column_index, bz, by, K)
                     Softmax_(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
@@ -539,5 +536,3 @@ if __name__ == "__main__":
   args = parser.parse_args()
 
   main(args)
-
-  
