@@ -57,7 +57,7 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_siz
     def kernel_func(block_M, block_N, num_stages, threads):
 
         @T.macro
-        def Prologue(
+        def Prefetch(
             K: T.Tensor(shape, dtype),
             V: T.Tensor(shape, dtype),
             K_shared: T.SharedBuffer([block_N, dim], dtype),
@@ -81,7 +81,7 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_siz
             T.ptx_commit_group()
 
         @T.macro
-        def Epilogue(
+        def Compute(
                 acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
                 acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
                 acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
@@ -205,17 +205,17 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_siz
                     for i in T.Parallel(block_M):
                         logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
 
-                Prologue(K, V, K_shared_1, V_shared_1, column_index, column_count[0], 0, bz, by)
+                Prefetch(K, V, K_shared_1, V_shared_1, column_index, column_count[0], 0, bz, by)
                 for bi in T.serial(T.ceildiv(column_count[0], block_N) - 1):
                     k = bi * block_N
-                    Prologue(K, V, K_shared_1, V_shared_1, column_index, column_count[0],
+                    Prefetch(K, V, K_shared_1, V_shared_1, column_index, column_count[0],
                              k + block_N, bz, by)
-                    Epilogue(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k,
-                             column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale,
-                             scores_sum, logsum)
-                Epilogue(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev,
-                         T.ceildiv(column_count[0], block_N) * block_N - block_N, column_count[0],
-                         Q_shared, K_shared_1, V_shared_1, scores_scale, scores_sum, logsum)
+                    Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k,
+                            column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale,
+                            scores_sum, logsum)
+                Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev,
+                        T.ceildiv(column_count[0], block_N) * block_N - block_N, column_count[0],
+                        Q_shared, K_shared_1, V_shared_1, scores_scale, scores_sum, logsum)
 
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] /= logsum[i]
