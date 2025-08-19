@@ -9,7 +9,6 @@ from tilelang import tvm as tvm
 from tvm import DataType
 from tilelang.intrinsics.mma_layout import (
     make_mma_swizzle_layout as make_swizzle_layout,)
-from tilelang.intrinsics.utils import index_to_coordinates
 import numpy as np
 
 from tilelang.intrinsics.mma_macro_generator import (
@@ -200,7 +199,7 @@ def bitnet_158_int8xint2_prefill(
                         index = (
                             i * threads * local_size_compressed +
                             thread_bindings * local_size_compressed + v)
-                        vi, vj = index_to_coordinates(index, B_shared_shape)
+                        vi, vj = T.index_to_coordinates(index, B_shared_shape)
                         B_local[v] = B_shared[vi, vj]
 
                     T.call_extern(
@@ -212,7 +211,7 @@ def bitnet_158_int8xint2_prefill(
 
                     for v in T.vectorized(0, local_size):
                         index = (i * threads * local_size + thread_bindings * local_size + v)
-                        vi, vj = index_to_coordinates(index, B_dequantize_shared_shape)
+                        vi, vj = T.index_to_coordinates(index, B_dequantize_shared_shape)
                         B_dequantize_shared[vi, vj] = B_dequantize_local[v]
 
                 for ki in T.serial(0, (block_K // micro_size_k)):

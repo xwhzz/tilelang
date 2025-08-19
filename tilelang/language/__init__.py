@@ -69,6 +69,7 @@ from .logical import any_of, all_of  # noqa: F401
 from .builtin import *  # noqa: F401
 
 from .memscope import *  # noqa: F401
+from .utils import index_to_coordinates  # noqa: F401
 
 
 def symbolic(name: str, dtype: str = "int32"):

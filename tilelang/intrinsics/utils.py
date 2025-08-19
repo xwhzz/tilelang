@@ -81,24 +81,3 @@ def get_mma_micro_size(dtype: Literal["float16", "int8"]):
     if dtype in {"float8_e4m3", "float8_e5m2", "int8"}:
         micro_size_k = 32
     return micro_size_x, micro_size_y, micro_size_k
-
-
-def index_to_coordinates(index, shape):
-    '''
-    General Implementation of:
-        vjj = index % (micro_size_k // num_elems_per_byte)
-        coordinates[-1] = index % shape[-1]; 
-        vii = index // (micro_size_k // num_elems_per_byte) % micro_size_y
-        index = index // shape[-1]; coordinates[-2] = index % shape[-2];
-        vj = index // (micro_size_k // num_elems_per_byte * micro_size_y) % block_K // (micro_size_k // num_elems_per_byte)
-        index = index // shape[-2]; coordinates[-3] = index % shape[-3];
-        vi = index // (micro_size_k // num_elems_per_byte * micro_size_y * (block_K // (micro_size_k // num_elems_per_byte))) % block_N // micro_size_y
-        index = index // shape[-3]; coordinates[-4] = index % shape[-4];
-    '''
-    coordinates = []
-    dims = len(shape)
-    for i in range(dims):
-        coordinates.append(index % shape[dims - i - 1])
-        index = index // shape[dims - i - 1]
-    coordinates.reverse()
-    return coordinates
