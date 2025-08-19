@@ -10,14 +10,6 @@
 
 #include <cuda.h>
 
-// __device__ int min(int x, int y) {
-//     return x < y ? x : y;
-// }
-
-// __device__ int max(int x, int y) {
-//     return x > y ? x : y;
-// }
-
 __device__ void save_blocks(int* block_offset, int range_start, int range_end, int block_size, int& block_count) {
     for (int idx = range_start; idx < range_end; idx += block_size) {
         block_offset[block_count++] = idx;

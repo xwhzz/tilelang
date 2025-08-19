@@ -9,9 +9,25 @@ import torch
 import triton
 import triton.language as tl
 
-from ops import convert_vertical_slash_indexes
+import os
 
-import torch
+from torch.utils.cpp_extension import load
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+
+sources = [
+    os.path.join(current_dir, 'ops','kernels.cpp'),
+    os.path.join(current_dir, 'ops','vertical_slash_index.cu')
+]
+
+ops = load(
+    name='convert',
+    sources=sources,
+    verbose=False
+)
+
+convert_vertical_slash_indexes = ops.convert_vertical_slash_indexes
+
 
 import tilelang
 import tilelang.language as T
@@ -22,7 +38,8 @@ from tilelang.testing import torch_assert_close
 tilelang.disable_cache()
 
 @tilelang.jit(out_idx=[3])
-def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size, slash_size):
+def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_size):
+
     block_M = 64
     block_N = 64
     num_stages = 2
@@ -31,8 +48,11 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
     shape = [batch, heads, seq_len, dim]
 
     count_shape = [batch, heads, (seq_len + block_M - 1) // block_M]
+
     offset_shape = count_shape + [slash_size]
     index_shape = count_shape + [vertical_size]
+
+    vertical_size_round, slash_size_round = tilelang.next_power_of_2(vertical_size), tilelang.next_power_of_2(slash_size)
 
     dtype = "float16"
     accum_dtype = "float"
@@ -41,167 +61,67 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
     def kernel_func(block_M, block_N, num_stages, threads):
 
         @T.macro
-        def MMA0(
-            K: T.Tensor(shape, dtype),
-            Q_shared: T.SharedBuffer([block_M, dim], dtype),
-            K_shared: T.SharedBuffer([block_N, dim], dtype),
-            acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
-            k: T.int32,
-            bx: T.int32,
-            by: T.int32,
-            bz: T.int32,
+        def Prologue(
+          K: T.Tensor(shape, dtype),
+          V: T.Tensor(shape, dtype),
+          K_shared: T.SharedBuffer([block_N, dim], dtype),
+          V_shared: T.SharedBuffer([block_N, dim], dtype),
+          column_index: T.SharedBuffer([vertical_size], int_dtype),
+          column_count: T.int32,
+          k: T.int32,
+          bz: T.int32,
+          by: T.int32,
         ):
-            T.copy(K[bz, by, k : k + block_N, :], K_shared)
-            if is_causal:
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.if_then_else(bx * block_M + i >= k + j and k + j < seq_len, 0,
-                                                 -T.infinity(acc_s.dtype))
-            else:
-                T.clear(acc_s)
-            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+          with T.attr("default", "async_scope", 1):
+            for i, j in T.Parallel(block_N, dim):
+              K_shared[i, j] = T.if_then_else(k + i < column_count, K[bz, by, column_index[k + i], j], 0)
+          
+          with T.attr("default", "async_scope", 1):
+            for i, j in T.Parallel(block_N, dim):
+              V_shared[i, j] = T.if_then_else(k + i < column_count, V[bz, by, column_index[k + i], j], 0)
+          
+          T.ptx_commit_group()
 
         @T.macro
-        def MMA1(
-            V: T.Tensor(shape, dtype),
-            V_shared: T.SharedBuffer([block_M, dim], dtype),
-            acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
-            acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
-            k: T.int32,
-            by: T.int32,
-            bz: T.int32,
+        def Epilogue(
+          acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
+          acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
+          acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
+          scores_max: T.FragmentBuffer([block_M], accum_dtype),
+          scores_max_prev: T.FragmentBuffer([block_M], accum_dtype),
+          k: T.int32,
+          column_count: T.int32,
+          Q_shared: T.SharedBuffer([block_M, dim], dtype),
+          K_shared_1: T.SharedBuffer([block_N, dim], dtype),
+          V_shared_1: T.SharedBuffer([block_N, dim], dtype),
+          scores_scale: T.FragmentBuffer([block_M], accum_dtype),
+          scores_sum: T.FragmentBuffer([block_M], accum_dtype),
+          logsum: T.FragmentBuffer([block_M], accum_dtype),
         ):
-            T.copy(V[bz, by, k : k + block_N, :], V_shared)
-            T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+          T.ptx_wait_group(1)
+          for i, j in T.Parallel(block_M, block_N):
+            acc_s[i, j] = T.if_then_else(k + j < column_count, 0,
+                                -T.infinity(acc_s.dtype))
+          T.gemm(Q_shared, K_shared_1, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
 
-        @T.macro
-        def MMA0_(
-            Q_shared: T.SharedBuffer([block_M, dim], dtype),
-            K_local: T.FragmentBuffer([block_N, dim], dtype),
-            K_shared: T.SharedBuffer([block_M, dim], dtype),
-            acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
-            k: T.int32,
-            num_cols: T.int32,
-            column_index: T.LocalBuffer([vertical_size], int_dtype),
-            bz: T.int32,
-            by: T.int32,
-            K: T.Tensor(shape, dtype),
-        ):
-            # for x, y in T.Parallel(block_N, dim):  
-            #   K_local[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)
-            # T.copy(K_local, K_shared)
-            for x, y in T.Parallel(block_N, dim):  
-              K_shared[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0) 
-            # for x in T.serial(block_N):  
-            #   # K_shared[x, y] = T.if_then_else(k + x < num_cols, K[bz, by, column_index[k + x], y], 0)
-            #   if k + x < num_cols:  
-            #     T.copy(K[bz, by, column_index[k + x], :], K_shared[x : x + 1, :])
-                # [1, 1, 16384, 64]
-                # T.ptx_cp_async("float16", K_shared, x * 64, K, column_index[k + x] * 64 + (by + bz) * 16384 * 64, 64 * 2)
-            if is_causal:
-                for i, j in T.Parallel(block_M, block_N):
-                    acc_s[i, j] = T.if_then_else(k + j < num_cols , 0,
-                                                 -T.infinity(acc_s.dtype))
-            else:
-                T.clear(acc_s)
-            # T.gemm(Q_shared, K_local, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-            T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+          T.copy(scores_max, scores_max_prev)
+          T.reduce_max(acc_s, scores_max, dim=1, clear=False)
 
-        @T.macro
-        def MMA1_(
-            V_local: T.FragmentBuffer([block_N, dim], dtype),
-            V_shared: T.SharedBuffer([block_N, dim], dtype),
-            acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
-            acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
-            k: T.int32,
-            num_cols: T.int32,
-            V: T.Tensor(shape, dtype),
-            bz: T.int32,
-            by: T.int32,
-            column_index: T.LocalBuffer([vertical_size], int_dtype)
-        ):
-            # for x, y in T.Parallel(block_N, dim):  
-            #   V_local[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)
-            # T.copy(V_local, V_shared)
-            for x, y in T.Parallel(block_N, dim):  
-              V_shared[x, y] = T.if_then_else(k + x < num_cols, V[bz, by, column_index[k + x], y], 0)            
-            # for x in T.serial(block_N):  
-            # for x in T.serial(block_N):
-            #   if k + x < num_cols:
-            #     T.copy(V[bz, by, column_index[k + x], :], V_shared[x : x + 1, :])
-                # T.ptx_cp_async("float16", V_shared, x * 64, V, column_index[k + x] * 64 + (by + bz) * 16384 * 64, 64 * 2)
-            # T.gemm(acc_s_cast, V_local, acc_o, policy=T.GemmWarpPolicy.FullRow)
-            T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-
-
-        @T.macro
-        def Softmax(
-                acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
-                acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
-                scores_max: T.FragmentBuffer([block_M], accum_dtype),
-                scores_max_prev: T.FragmentBuffer([block_M], accum_dtype),
-                scores_scale: T.FragmentBuffer([block_M], accum_dtype),
-                scores_sum: T.FragmentBuffer([block_M], accum_dtype),
-                logsum: T.FragmentBuffer([block_M], accum_dtype),
-        ):
-            T.copy(scores_max, scores_max_prev)
-            T.fill(scores_max, -T.infinity(accum_dtype))
-            T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-            # To do causal softmax, we need to set the scores_max to 0 if it is -inf
-            # This process is called Check_inf in FlashAttention3 code, and it only need to be done
-            # in the first ceil_div(kBlockM, kBlockN) steps.
-            for i in T.Parallel(block_M):
-                scores_max[i] = T.if_then_else(scores_max[i] == -T.infinity(accum_dtype), 0, scores_max[i])
-            for i in T.Parallel(block_M):
-                scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-            for i, j in T.Parallel(block_M, block_N):
-                # Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
-                # max * log_2(e)) This allows the compiler to use the ffma
-                # instruction instead of fadd and fmul separately.
-                acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-            T.reduce_sum(acc_s, scores_sum, dim=1)
-            for i in T.Parallel(block_M):
-                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-            T.copy(acc_s, acc_s_cast)
-
-
-        @T.macro
-        def Softmax_(
-                acc_s: T.FragmentBuffer([block_M, block_N], accum_dtype),
-                acc_s_cast: T.FragmentBuffer([block_M, block_N], dtype),
-                # acc_s_cast: T.SharedBuffer([block_M, block_N], dtype),
-                scores_max: T.FragmentBuffer([block_M], accum_dtype),
-                scores_max_prev: T.FragmentBuffer([block_M], accum_dtype),
-                scores_scale: T.FragmentBuffer([block_M], accum_dtype),
-                scores_sum: T.FragmentBuffer([block_M], accum_dtype),
-                logsum: T.FragmentBuffer([block_M], accum_dtype),
-        ):
-            T.copy(scores_max, scores_max_prev)
-            T.fill(scores_max, -T.infinity(accum_dtype))
-            T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-            # To do causal softmax, we need to set the scores_max to 0 if it is -inf
-            # This process is called Check_inf in FlashAttention3 code, and it only need to be done
-            # in the first ceil_div(kBlockM, kBlockN) steps.
-            for i in T.Parallel(block_M):
-                scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-            for i, j in T.Parallel(block_M, block_N):
-                # Instead of computing exp(x - max), we compute exp2(x * log_2(e) -
-                # max * log_2(e)) This allows the compiler to use the ffma
-                # instruction instead of fadd and fmul separately.
-                acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-            T.reduce_sum(acc_s, scores_sum, dim=1)
-            for i in T.Parallel(block_M):
-                logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-            # for i, j in T.Parallel(block_M, block_N):
-            #   acc_s_cast[i, j] = T.Cast(dtype, acc_s[i, j])
-            T.copy(acc_s, acc_s_cast)
-
-        @T.macro
-        def Rescale(
-                acc_o: T.FragmentBuffer([block_M, dim], accum_dtype),
-                scores_scale: T.FragmentBuffer([block_M], accum_dtype),
-        ):
+          for i in T.Parallel(block_M):
+            scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+          for i, j in T.Parallel(block_M, block_N):
+            acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
           for i, j in T.Parallel(block_M, dim):
-            acc_o[i, j] *= scores_scale[i]
+            acc_o[i, j] = acc_o[i, j] * scores_scale[i]
+
+          T.copy(acc_s, acc_s_cast)
+
+          T.gemm(acc_s_cast, V_shared_1, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+          T.reduce_sum(acc_s, scores_sum, dim=1)
+
+          for i in T.Parallel(block_M):
+            logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
 
         @T.prim_func
         def vs_sparse_flashattn(
@@ -229,45 +149,68 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, is_causal, vertical_size
                 scores_sum = T.alloc_fragment([block_M], accum_dtype)
                 logsum = T.alloc_fragment([block_M], accum_dtype)
                 block_count = T.alloc_local([1], int_dtype)
-                block_offset = T.alloc_local([slash_size], int_dtype)
+                block_offset = T.alloc_shared([slash_size_round], int_dtype, scope="shared")
                 column_count = T.alloc_local([1], int_dtype)
-                column_index = T.alloc_local([vertical_size], int_dtype)
+                column_index = T.alloc_shared([vertical_size_round], int_dtype, scope="shared")
 
                 K_shared_1 = T.alloc_shared([block_N, dim], dtype)
                 V_shared_1 = T.alloc_shared([block_N, dim], dtype)
-                K_local = T.alloc_fragment([block_N, dim], dtype)
-                V_local = T.alloc_fragment([block_N, dim], dtype)
 
-                T.copy(Q[bz, by, bx * block_M:(bx + 1) * block_M, :], Q_shared)
+                block_count[0] = BlockCount[bz, by, bx]
+                column_count[0] = ColumnCount[bz, by, bx]
+
+                for vi in T.Parallel(slash_size_round):
+                  if vi < slash_size:
+                    block_offset[vi] = BlockOffset[bz, by, bx, vi]
+
+                for vi in T.Parallel(vertical_size_round):
+                  if vi < vertical_size:
+                    column_index[vi] = ColumnIndex[bz, by, bx, vi]
+                
                 T.fill(acc_o, 0)
                 T.fill(logsum, 0)
                 T.fill(scores_max, -T.infinity(accum_dtype))
 
-                block_count[0] = BlockCount[bz, by, bx]
-
-                column_count[0] = ColumnCount[bz, by, bx]
-
-                for vj in T.serial(slash_size):
-                    block_offset[vj] = BlockOffset[bz, by, bx, vj]
-                
-                for vi in T.serial(vertical_size):
-                    column_index[vi] = ColumnIndex[bz, by, bx, vi]
+                T.copy(Q[bz, by, bx * block_M:(bx + 1) * block_M, :], Q_shared)
 
                 for bi in T.Pipelined(block_count[0], num_stages=num_stages):
-                    real_index = block_offset[bi]
-                    MMA0(K, Q_shared, K_shared, acc_s, real_index, bx, by, bz)
-                    Softmax(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
-                            scores_sum, logsum)
-                    Rescale(acc_o, scores_scale)
-                    MMA1(V, V_shared, acc_s_cast, acc_o, real_index, by, bz)      
+                    k = block_offset[bi]
+                    T.copy(K[bz, by, k : k + block_N, :], K_shared)
 
-                for bi in T.Pipelined(T.ceildiv(column_count[0], block_N), num_stages=num_stages): 
-                    real_index = bi * block_N
-                    MMA0_(Q_shared, K_local, K_shared_1, acc_s, real_index, column_count[0], column_index, bz, by, K)
-                    Softmax_(acc_s, acc_s_cast, scores_max, scores_max_prev, scores_scale,
-                            scores_sum, logsum)
-                    Rescale(acc_o, scores_scale)
-                    MMA1_(V_local, V_shared_1, acc_s_cast, acc_o, real_index, column_count[0], V, bz, by, column_index)    
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = T.if_then_else(bx * block_M + i >= k + j, 0,
+                                                 -T.infinity(acc_s.dtype))
+                    
+                    T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
+
+                    T.copy(scores_max, scores_max_prev)
+
+                    T.reduce_max(acc_s, scores_max, dim=1, clear=False)
+
+                    for i in T.Parallel(block_M):
+                        scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
+                    for i, j in T.Parallel(block_M, block_N):
+                        acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
+                    for i, j in T.Parallel(block_M, dim):
+                        acc_o[i, j] = acc_o[i, j] * scores_scale[i]
+
+                    T.copy(acc_s, acc_s_cast)
+                    T.copy(V[bz, by, k : k + block_N, :], V_shared)
+                    T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
+
+                    T.reduce_sum(acc_s, scores_sum, dim=1)
+
+                    for i in T.Parallel(block_M):
+                        logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
+
+                Prologue(K, V, K_shared_1, V_shared_1, column_index, column_count[0], 0, bz, by)
+                for bi in T.serial(T.ceildiv(column_count[0], block_N) - 1):
+                  k = bi * block_N
+                  Prologue(K, V, K_shared_1, V_shared_1, column_index, column_count[0], k + block_N, bz, by)
+                  Epilogue(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k, column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale, scores_sum, logsum)
+                Epilogue(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, T.ceildiv(column_count[0], block_N) * block_N - block_N, column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale, scores_sum, logsum)
+                
+                
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] /= logsum[i]
                 T.copy(acc_o, O_shared)
@@ -458,8 +401,8 @@ def vertical_slash_sparse_attention(
         seqlens, v_idx, s_idx, context_size, block_size_M, block_size_N,
     )
 
-    tl_kernel = _tl_vs_sparse_flashattn(batch_size, num_heads, context_size, head_dim, True, v_idx.shape[2], s_idx.shape[2])
-    print(tl_kernel.get_kernel_source())
+    tl_kernel = _tl_vs_sparse_flashattn(batch_size, num_heads, context_size, head_dim, v_idx.shape[2], s_idx.shape[2])
+
     def run(is_triton: bool = True):
         if is_triton:
             out = _triton_mixed_sparse_attention(
@@ -481,13 +424,11 @@ def sum_all_diagonal_matrix(mat: torch.tensor):
     return sum_diags[:,:,1:]
 
 def main(args):
-    index = args.index
-    vs_list = [[1000, 200], [1000, 600], [800, 600]]
-    vs = vs_list[index]
-    vertical_ = vs[0]
-    slash_ = vs[1]
+    # vs_list = [[1000, 200], [1000, 600], [800, 600]]
 
-    BATCH, N_HEADS, SEQ_LEN, D_HEAD = 1, 1, 16384, 64
+    BATCH, N_HEADS, SEQ_LEN, D_HEAD = args.batch, args.heads, args.seq_len, args.head_dim
+
+    vertical_size, slash_size  = args.vertical_size, args.slash_size
 
     torch.manual_seed(0)
     q = torch.randn(BATCH, N_HEADS, SEQ_LEN, D_HEAD, device='cuda', dtype=torch.float16)
@@ -496,7 +437,7 @@ def main(args):
 
     q_len = SEQ_LEN
 
-    vertical_size, slash_size  = min(q_len, vertical_), min(q_len, slash_)
+    vertical_size, slash_size  = min(q_len, vertical_size), min(q_len, slash_size)
     last_q = 64
     qk = torch.einsum(f'bhmk, bhnk -> bhmn', q[:,:,-last_q:,:], k)
     arange = torch.arange(last_q, device="cuda")
@@ -516,6 +457,7 @@ def main(args):
 
     triton_out = _attn(True)
     tilelang_out = _attn(False)
+    torch.cuda.synchronize()
 
     torch_assert_close(triton_out, tilelang_out, atol=1e-2, rtol=1e-2, max_mismatched_ratio=0.05)
 
@@ -527,12 +469,18 @@ def main(args):
 
     print("triton_time: ", triton_time)
     print("tilelang_time: ", tilelang_time)
+    print(f"speedup: {triton_time / tilelang_time:.2f}x")
 
 if __name__ == "__main__":
-  parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser()
 
-  parser.add_argument("--index", type=int, default=0)  
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--heads", type=int, default=1)
+    parser.add_argument("--seq_len", type=int, default=16384)
+    parser.add_argument("--head_dim", type=int, default=64)
+    parser.add_argument("--vertical_size", type=int, default=1000)
+    parser.add_argument("--slash_size", type=int, default=200)
 
-  args = parser.parse_args()
+    args = parser.parse_args()
 
-  main(args)
+    main(args)
