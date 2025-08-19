@@ -8,21 +8,6 @@ import torch
 import triton
 import triton.language as tl
 
-import os
-
-from torch.utils.cpp_extension import load
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-
-sources = [
-    os.path.join(current_dir, 'ops', 'kernels.cpp'),
-    os.path.join(current_dir, 'ops', 'vertical_slash_index.cu')
-]
-
-ops = load(name='convert', sources=sources, verbose=False)
-
-convert_vertical_slash_indexes = ops.convert_vertical_slash_indexes
-
 import tilelang
 import tilelang.language as T
 
@@ -432,6 +417,16 @@ def vertical_slash_sparse_attention(
     block_size_M: int = 64,
     block_size_N: int = 64,
 ):
+    from torch.utils.cpp_extension import load
+    import os
+
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    sources = [
+        os.path.join(current_dir, 'ops', 'kernels.cpp'),
+        os.path.join(current_dir, 'ops', 'vertical_slash_index.cu')
+    ]
+    ops = load(name='convert', sources=sources, verbose=False)
+    convert_vertical_slash_indexes = ops.convert_vertical_slash_indexes
     batch_size, num_heads, context_size, head_dim = query.shape
     pad = (block_size_M - context_size) & (block_size_M - 1)
     if pad == block_size_M:
@@ -498,7 +493,17 @@ def sum_all_diagonal_matrix(mat: torch.tensor):
     return sum_diags[:, :, 1:]
 
 
-def main(args):
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument("--batch", type=int, default=1)
+    parser.add_argument("--heads", type=int, default=1)
+    parser.add_argument("--seq_len", type=int, default=16384)
+    parser.add_argument("--head_dim", type=int, default=64)
+    parser.add_argument("--vertical_size", type=int, default=1000)
+    parser.add_argument("--slash_size", type=int, default=200)
+
+    args = parser.parse_args(argv)
     # vs_list = [[1000, 200], [1000, 600], [800, 600]]
 
     BATCH, N_HEADS, SEQ_LEN, D_HEAD = args.batch, args.heads, args.seq_len, args.head_dim
@@ -548,15 +553,4 @@ def main(args):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-
-    parser.add_argument("--batch", type=int, default=1)
-    parser.add_argument("--heads", type=int, default=1)
-    parser.add_argument("--seq_len", type=int, default=16384)
-    parser.add_argument("--head_dim", type=int, default=64)
-    parser.add_argument("--vertical_size", type=int, default=1000)
-    parser.add_argument("--slash_size", type=int, default=200)
-
-    args = parser.parse_args()
-
-    main(args)
+    main()
