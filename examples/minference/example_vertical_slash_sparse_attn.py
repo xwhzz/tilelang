@@ -16,6 +16,7 @@ from tilelang.testing import torch_assert_close
 
 tilelang.disable_cache()
 
+
 @tilelang.jit(out_idx=[3])
 def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_size):
 
@@ -197,27 +198,29 @@ def _tl_vs_sparse_flashattn(batch, heads, seq_len, dim, vertical_size, slash_siz
                     for bi in T.serial(T.ceildiv(column_count[0], block_N) - 1):
                         k = bi * block_N
                         if bi % 2 == 0:
-                          Prefetch(K, V, K_shared_2, V_shared_2, column_index, column_count[0],
-                                 k + block_N, bz, by)
+                            Prefetch(K, V, K_shared_2, V_shared_2, column_index, column_count[0],
+                                     k + block_N, bz, by)
 
-                          Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k,
-                                column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale,
-                                scores_sum, logsum)
+                            Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k,
+                                    column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale,
+                                    scores_sum, logsum)
                         else:
-                          Prefetch(K, V, K_shared_1, V_shared_1, column_index, column_count[0],
-                                 k + block_N, bz, by)
+                            Prefetch(K, V, K_shared_1, V_shared_1, column_index, column_count[0],
+                                     k + block_N, bz, by)
 
-                          Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k,
+                            Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev, k,
+                                    column_count[0], Q_shared, K_shared_2, V_shared_2, scores_scale,
+                                    scores_sum, logsum)
+                    if T.ceildiv(column_count[0], block_N) % 2 == 0:
+                        Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev,
+                                T.ceildiv(column_count[0], block_N) * block_N - block_N,
                                 column_count[0], Q_shared, K_shared_2, V_shared_2, scores_scale,
                                 scores_sum, logsum)
-                    if T.ceildiv(column_count[0], block_N) % 2 == 0:
-                      Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev,
-                            T.ceildiv(column_count[0], block_N) * block_N - block_N, column_count[0],
-                            Q_shared, K_shared_2, V_shared_2, scores_scale, scores_sum, logsum)
                     else:
-                      Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev,
-                            T.ceildiv(column_count[0], block_N) * block_N - block_N, column_count[0],
-                            Q_shared, K_shared_1, V_shared_1, scores_scale, scores_sum, logsum)
+                        Compute(acc_s, acc_s_cast, acc_o, scores_max, scores_max_prev,
+                                T.ceildiv(column_count[0], block_N) * block_N - block_N,
+                                column_count[0], Q_shared, K_shared_1, V_shared_1, scores_scale,
+                                scores_sum, logsum)
 
                 for i, j in T.Parallel(block_M, dim):
                     acc_o[i, j] /= logsum[i]
@@ -561,7 +564,6 @@ def main(argv=None):
 
     triton_time = do_bench(lambda: _attn(True))
     tilelang_time = do_bench(lambda: _attn(False))
-
 
     print(f"triton_time: {triton_time:.3f}ms")
     print(f"tilelang_time: {tilelang_time:.3f}ms")
