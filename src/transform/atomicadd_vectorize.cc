@@ -170,10 +170,10 @@ private:
         ICHECK(tx_var.defined()) << "Failed to find tx var";
         Var outer_var = Var(old_var->name_hint + "_outer");
         Map<Var, PrimExpr> vmap;
-        vmap.Set(tx_var,
-                 truncmod(tx_var, extent / vector_size_) * vector_size_);
-        vmap.Set(fnode->loop_var, outer_var * vector_size_ +
-                                      truncdiv(tx_var, extent / vector_size_));
+        // Scale thread index (tx) and loop variable by vector_size to map each
+        // new iteration to a vectorized chunk
+        vmap.Set(tx_var, tx_var * vector_size_);
+        vmap.Set(fnode->loop_var, outer_var * vector_size_);
         Stmt body = Substitute(fnode->body, vmap);
         return For(outer_var, 0, extent / vector_size_, fnode->kind, body,
                    fnode->thread_binding, fnode->annotations, fnode->span);
