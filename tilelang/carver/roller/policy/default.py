@@ -103,7 +103,7 @@ class DefaultPolicy:
         return results
 
     def dfs_smem_tile(self, init_tile, rstep_map) -> Iterable[TileDict]:
-        _steps = [get_all_factors(n) for n in self.output_nodes[0].get_space_dim()]
+        _steps = [get_all_factors(n) for n in self.output_nodes[0].get_space_dim]
         steps = [step[step.index(t):] for step, t in zip(_steps, init_tile)]
         for i in range(len(steps)):
             added = list(
@@ -151,12 +151,12 @@ class DefaultPolicy:
             The base tile configuration, which is a list of 1s equal in length to the space dimensions
             of the primary function node.
         """
-        if len(set([len(node.get_space_dim()) for node in self.output_nodes])) > 1:
+        if len(set([len(node.get_space_dim) for node in self.output_nodes])) > 1:
             # If output dim sizes are not same, don't know how to handle them
             return None
 
         out_node = self.output_nodes[0]
-        shape = out_node.get_space_dim()
+        shape = out_node.get_space_dim
         base_tile = [1 for _ in shape]
         wpi = self.compute_workload_per_item(base_tile)
         for dim, n in enumerate(shape):
@@ -193,7 +193,7 @@ class DefaultPolicy:
         tile_map = {}
         for node in self.output_nodes:
             tile_map[node] = [
-                tile[i] * node.get_space_dim()[i] // self.output_nodes[0].get_space_dim()[i]
+                tile[i] * node.get_space_dim[i] // self.output_nodes[0].get_space_dim[i]
                 for i in range(len(tile))
             ]
         return tile_map
@@ -295,7 +295,7 @@ class DefaultPolicy:
             return {}
 
         raxis = node.raxis
-        tile = [1] * len(node.get_space_dim())
+        tile = [1] * len(node.get_space_dim)
         all_steps = self.get_node_reduce_step_candidates(node)
 
         def sim(a: int, b: int):
@@ -581,7 +581,7 @@ class DefaultPolicy:
         if td.smem_cost > self.arch.smem_cap:
             td.valid = False
             return td
-        output_shape = self.output_nodes[0].get_space_dim()
+        output_shape = self.output_nodes[0].get_space_dim
         td.grid_size = int(np.prod([(y + x - 1) // x for x, y in zip(output_tile, output_shape)]))
         # estimated reg usage
         reg_usage = int(2 * max([
@@ -612,7 +612,7 @@ class DefaultPolicy:
             if np.prod(td.get_tile(node)) == 0:
                 return False
             node_grid_size = np.prod([
-                (y + x - 1) // x for x, y in zip(td.get_tile(node), node.get_space_dim())
+                (y + x - 1) // x for x, y in zip(td.get_tile(node), node.get_space_dim)
             ])
             if node_grid_size != td.grid_size:
                 return False

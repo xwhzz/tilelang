@@ -62,7 +62,7 @@ class TensorCorePolicy(DefaultPolicy):
         shapes = node.propagate_reduction_inputs(tile, rstep)
         AS_shape, BS_shape = shapes.values()
         CS_shape = tile
-        A_ax_m, A_ax_k, B_ax_k, B_ax_n, C_ax_m, C_ax_n = node.infer_tensorcore_axis()
+        A_ax_m, A_ax_k, B_ax_k, B_ax_n, C_ax_m, C_ax_n = node.infer_tensorcore_axis
 
         # applying strides
         # TODO(leiwang1999): offset should be dynamically set. we can use tag -> enable_offset to control this option..
@@ -227,7 +227,7 @@ class TensorCorePolicy(DefaultPolicy):
                 ]
                 if all(wmma_invalid):
                     return False
-                if any([y % x for x, y in zip(td.tile_map[node], node.get_space_dim())]):
+                if any([y % x for x, y in zip(td.tile_map[node], node.get_space_dim)]):
                     return False
         return super().check_tile_shape_isvalid(td)
 

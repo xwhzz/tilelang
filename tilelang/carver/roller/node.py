@@ -301,7 +301,7 @@ class PrimFuncNode(Node):
         else:
             return value
 
-    @functools.lru_cache()
+    @functools.cached_property
     def get_space_dim(self) -> List[int]:
         dim_size = []
         if self.reduction_block:
@@ -418,7 +418,7 @@ class PrimFuncNode(Node):
             for b in self.block_analyzer.get_input_buffers(self.reduction_block)
         }
 
-    @functools.lru_cache()
+    @functools.cached_property
     def infer_tensorcore_axis(self) -> Tuple[int]:
         # axis is fixed for one expression, so only inference and cached
         assert self.get_tag("tensorcore_config")
@@ -438,7 +438,7 @@ class PrimFuncNode(Node):
         self.set_tag("num_nvalid_regions", num_nvalid_regions)
 
         def get_cl_shapes(c_ax_m, c_ax_n, num_nvalid_regions):
-            spatial_dim = self.get_space_dim()
+            spatial_dim = self.get_space_dim
             assert len(valid_region) == len(
                 spatial_dim), f" {valid_region} mismatch with {spatial_dim}"
             cl_shapes = [1] * len(spatial_dim)
@@ -453,7 +453,7 @@ class PrimFuncNode(Node):
         A_ax_m = A_deps.index(wmma_m)
         B_ax_n = B_deps.index(wmma_n)
 
-        CL_shape = [1] * len(self.get_space_dim())
+        CL_shape = [1] * len(self.get_space_dim)
         shapes = self.propagate_reduction_inputs(CL_shape, {x.var.name: wmma_k for x in self.raxis})
         A_deps, B_deps = shapes.values()
         A_ax_k = len(A_deps) - 1 - A_deps[::-1].index(wmma_k)
