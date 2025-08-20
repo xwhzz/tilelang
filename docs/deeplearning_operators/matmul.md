@@ -256,4 +256,4 @@ For more advanced usage—including partial lowering, explicitly controlling thr
 * [BitBLAS](https://github.com/tile-ai/bitblas)
 * [Triton](https://github.com/openai/triton)
 * [Cutlass](https://github.com/NVIDIA/cutlass)
-* [PyCUDA](https://documen.tician.de/pycuda/)
+* [PyCUDA](https://document.tician.de/pycuda/)

@@ -2990,7 +2990,7 @@ inline HALF_CONSTEXPR_NOERR bool operator>=(half x, half y) {
 }
 
 /// \}
-/// \anchor arithmetics
+/// \anchor arithmetic
 /// \name Arithmetic operators
 /// \{
 

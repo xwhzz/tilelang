@@ -116,7 +116,7 @@ The result object contains optimized kernel implementation which can be used by 
 
 Carver is a lightweight framework for generating and ranking tile configurations (also known as tiling strategies, blocking schemes, or scheduling hints) for common GPU, CPU, and accelerator backends. It helps you explore efficient mappings of loops for operations such as matrix multiplication, elementwise transforms, and other reduction-oriented kernels.
 
-or common operators, Carver provides pre-built templates (e.g., `MatmulTemplate`):
+For common operators, Carver provides pre-built templates (e.g., `MatmulTemplate`):
 
 ```python
 # Configure Matmul template
