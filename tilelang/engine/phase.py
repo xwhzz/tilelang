@@ -87,6 +87,8 @@ def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
 
     # Legalize the frontend IR to make it compatible with TVM
     mod = tilelang.transform.FrontendLegalize()(mod)
+    # Inject assumes to speedup tvm prover
+    mod = tilelang.transform.InjectAssumes()(mod)
     # Simplify the IR expressions
     mod = tir.transform.Simplify()(mod)
     # Set layouts for reducers
