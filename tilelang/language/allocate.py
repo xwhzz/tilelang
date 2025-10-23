@@ -19,7 +19,6 @@ from tilelang import tvm as tvm
 from tvm.script import tir as T
 from tvm.tir import PrimExpr
 from tvm.script.parser.tir import block_attr
-from typing import Union
 
 
 def alloc_shared(shape, dtype, scope="shared.dyn"):
