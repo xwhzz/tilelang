@@ -68,7 +68,7 @@ def alloc_fragment(shape, dtype, scope="local.fragment"):
     return T.alloc_buffer(shape, dtype, scope=scope)
 
 
-def alloc_var(dtype, *args, scope="local.var", init: Union[PrimExpr] = None):
+def alloc_var(dtype, *args, scope="local.var", init: PrimExpr | None = None):
     """Allocate a single-element variable buffer.
 
     Args:
