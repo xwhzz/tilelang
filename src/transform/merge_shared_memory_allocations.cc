@@ -162,7 +162,7 @@ public:
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.alloc) {
       ICHECK_LT(it->second.level, scope_.size());
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         // set into scope_.size() - 1 for aggressive memory reuse
         auto enable_aggressive_merge = enable_aggressive_merge_;
         if (enable_aggressive_merge) {
@@ -209,7 +209,7 @@ public:
       // the merged allocator can reason about their lifetime correctly.
       ICHECK_LE(it->second.level, scope_.size())
           << "Load memory in places other than store.";
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         auto enable_aggressive_merge = enable_aggressive_merge_;
         if (enable_aggressive_merge) {
           scope_[scope_.size() - 1].touched.push_back(buf);
@@ -233,7 +233,7 @@ public:
       // emitted at the allocation level after flattening, so accept them and
       // record the touch for liveness planning.
       ICHECK_LE(it->second.level, scope_.size());
-      if (IsAppropriateSharedMemory(GetRef<Var>(buf))) {
+      if (IsAppropriateSharedMemory(tvm::ffi::GetRef<Var>(buf))) {
         auto enable_aggressive_merge = enable_aggressive_merge_;
         if (enable_aggressive_merge) {
           scope_[scope_.size() - 1].touched.push_back(buf);
@@ -372,7 +372,7 @@ private:
   void VisitExpr_(const VarNode *op) {
     auto ptr_type = op->type_annotation.as<PointerTypeNode>();
     if (ptr_type && under_alignment_scope_) {
-      auto scope = GetPtrStorageScope(GetRef<Var>(op));
+      auto scope = GetPtrStorageScope(tvm::ffi::GetRef<Var>(op));
       if (scope == "shared" || scope == "shared.dyn") {
         auto target = Target::Current();
         ICHECK(target.defined()) << "Target is not defined";
@@ -1343,11 +1343,11 @@ Pass MergeSharedMemoryAllocations(bool enable_aggressive_merge = false,
                             {});
 }
 
-TVM_FFI_STATIC_INIT_BLOCK({
+TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.MergeSharedMemoryAllocations",
                         MergeSharedMemoryAllocations);
-});
+}
 
 } // namespace transform
 } // namespace tl

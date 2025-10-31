@@ -22,10 +22,12 @@ env:
   PYTHONDEVMODE: "1"
   PYTHONUNBUFFERED: "1"
   PYTHONPATH: "" # explicit cleanup
+  PIP_USER: "" # explicit cleanup
   COLUMNS: "100"
   FORCE_COLOR: "1"
   CLICOLOR_FORCE: "1"
   UV_INDEX_STRATEGY: "unsafe-best-match"
+  UV_HTTP_TIMEOUT: "600"
   XDG_CACHE_HOME: "${{ github.workspace }}/.cache" # to be updated
   PIP_CACHE_DIR: "${{ github.workspace }}/.cache/pip" # to be updated
   UV_CACHE_DIR: "${{ github.workspace }}/.cache/uv" # to be updated
@@ -44,7 +46,7 @@ jobs:
           submodules: recursive
 
       - name: Setup Python 3.8
-        id: setup-py38
+        id: setup-pylowest
         uses: actions/setup-python@v6
         with:
           python-version: "3.8" # use lowest supported version for linting
@@ -52,7 +54,7 @@ jobs:
 
       - name: Check AST with Python 3.8
         run: |
-          "${{ steps.setup-py38.outputs.python-path }}" -m compileall -q -f tilelang
+          "${{ steps.setup-pylowest.outputs.python-path }}" -m compileall -q -f tilelang
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v6

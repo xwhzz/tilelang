@@ -80,6 +80,9 @@ elif [[ "${#FILES[@]}" -gt 0 ]]; then
     echo "Checking specified files: ${FILES[*]}..." >&2
 fi
 
+# Some systems set pip's default to --user, which breaks isolated virtualenvs.
+export PIP_USER=0
+
 # If pre-commit is not installed, install it.
 if ! python3 -m pre_commit --version &>/dev/null; then
     python3 -m pip install pre-commit
