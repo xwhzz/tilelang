@@ -1749,10 +1749,19 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
         "reinterpret_cast<const (ARegType)*>((A_ptr) + (A_offset)), "
         "reinterpret_cast<const (BRegType)*>((B_ptr) + (B_offset)));\n";
     tl::codegen::Replacer replacer;
+    std::string AType = tl::codegen::ptx::DTypeEnumToString(dtype_a_enum);
+    if (AType == "tl::DataType::kFloat32") {
+      AType = "tl::DataType::kTensorFloat32";
+    }
+    std::string BType = tl::codegen::ptx::DTypeEnumToString(dtype_b_enum);
+    if (BType == "tl::DataType::kFloat32") {
+      BType = "tl::DataType::kTensorFloat32";
+    }
+
     replacer.register_rule("(AType)",
-                           tl::codegen::ptx::DTypeEnumToString(dtype_a_enum));
+                           tl::codegen::ptx::DTypeEnumToString(AType));
     replacer.register_rule("(BType)",
-                           tl::codegen::ptx::DTypeEnumToString(dtype_b_enum));
+                           tl::codegen::ptx::DTypeEnumToString(BType));
     replacer.register_rule("(CType)",
                            tl::codegen::ptx::DTypeEnumToString(dtype_c_enum));
     replacer.register_rule("(M)", std::to_string(m));
@@ -1838,16 +1847,12 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string B_offset = this->PrintExpr(op->args[9]);
     std::string c_ref = this->PrintExpr(op->args[10]);
     std::string c_offset = this->PrintExpr(op->args[11]);
-    bool scale_out = Downcast<Bool>(op->args[12])->value;
+    std::string scale_out = this->PrintExpr(op->args[12]);
     bool scale_in_a = Downcast<Bool>(op->args[13])->value;
     bool scale_in_b = Downcast<Bool>(op->args[14])->value;
 
     const bool a_is_shared = true;
     this->PrintIndent();
-    std::string asm_code = PrintWGMMAAssembly(
-        shape, a_is_k_major, b_is_k_major, A_dtype, B_dtype, C_dtype, a_desc,
-        A_offset, b_desc, B_offset, c_ref, c_offset, scale_out, scale_in_a,
-        scale_in_b, a_is_shared, "", "", "", false);
     auto [m, n, k] = tl::codegen::ptx::ParseMMAShape(shape);
     need_wgmma_instruction_h_ = true;
     std::string wgmma_asm_code =
@@ -1856,10 +1861,18 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
         "uint64_t((desc_b) + (B_offset)), ((uint32_t*)((C))), (scale_out));\n";
     // replace patterns
     tl::codegen::Replacer replacer;
-    replacer.register_rule("(AType)",
-                           tl::codegen::ptx::DTypeEnumToString(A_dtype));
-    replacer.register_rule("(BType)",
-                           tl::codegen::ptx::DTypeEnumToString(B_dtype));
+
+    std::string AType = tl::codegen::ptx::DTypeEnumToString(A_dtype);
+    if (AType == "tl::DataType::kFloat32") {
+      AType = "tl::DataType::kTensorFloat32";
+    }
+    std::string BType = tl::codegen::ptx::DTypeEnumToString(B_dtype);
+    if (BType == "tl::DataType::kFloat32") {
+      BType = "tl::DataType::kTensorFloat32";
+    }
+
+    replacer.register_rule("(AType)", AType);
+    replacer.register_rule("(BType)", BType);
     replacer.register_rule("(CType)",
                            tl::codegen::ptx::DTypeEnumToString(C_dtype));
     replacer.register_rule("(M)", std::to_string(m));
@@ -1874,7 +1887,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("(desc_b)", b_desc);
     replacer.register_rule("(B_offset)", B_offset);
     replacer.register_rule("(C)", c_ref + " + " + c_offset);
-    replacer.register_rule("(scale_out)", scale_out ? "true" : "false");
+    replacer.register_rule("(scale_out)", scale_out);
     wgmma_asm_code = replacer.rewrite(wgmma_asm_code);
     this->stream << wgmma_asm_code;
   } else if (op->op.same_as(tl::ptx_wgmma_rs())) {
@@ -1904,7 +1917,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     std::string B_offset = this->PrintExpr(op->args[8]);
     std::string c_ref = this->PrintExpr(op->args[9]);
     std::string c_offset = this->PrintExpr(op->args[10]);
-    bool scale_out = Downcast<Bool>(op->args[11])->value;
+    std::string scale_out = this->PrintExpr(op->args[11]);
     bool scale_in_a = Downcast<Bool>(op->args[12])->value;
     bool scale_in_b = Downcast<Bool>(op->args[13])->value;
 
@@ -1924,10 +1937,17 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
         "(scale_out));\n";
 
     tl::codegen::Replacer replacer;
-    replacer.register_rule("(AType)",
-                           tl::codegen::ptx::DTypeEnumToString(dtype_a_enum));
-    replacer.register_rule("(BType)",
-                           tl::codegen::ptx::DTypeEnumToString(dtype_b_enum));
+    std::string AType = tl::codegen::ptx::DTypeEnumToString(A_dtype);
+    if (AType == "tl::DataType::kFloat32") {
+      AType = "tl::DataType::kTensorFloat32";
+    }
+    std::string BType = tl::codegen::ptx::DTypeEnumToString(B_dtype);
+    if (BType == "tl::DataType::kFloat32") {
+      BType = "tl::DataType::kTensorFloat32";
+    }
+
+    replacer.register_rule("(AType)", AType);
+    replacer.register_rule("(BType)", BType);
     replacer.register_rule("(CType)",
                            tl::codegen::ptx::DTypeEnumToString(dtype_c_enum));
     replacer.register_rule("(M)", std::to_string(m));
@@ -1943,7 +1963,7 @@ void CodeGenTileLangCUDA::VisitExpr_(const CallNode *op, std::ostream &os) {
     replacer.register_rule("(B_offset)", B_offset);
     replacer.register_rule("(C_ptr)", c_ref);
     replacer.register_rule("(C_offset)", c_offset);
-    replacer.register_rule("(scale_out)", scale_out ? "true" : "false");
+    replacer.register_rule("(scale_out)", scale_out);
     wgmma_call = replacer.rewrite(wgmma_call);
     this->stream << wgmma_call;
   } else if (op->op.same_as(tl::ptx_tcgen05_mma_ss())) {
