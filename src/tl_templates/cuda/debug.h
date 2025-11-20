@@ -1,6 +1,9 @@
 #pragma once
 
+#if __CUDA_ARCH_LIST__ >= 890
 #include "./cuda_fp8.h"
+#endif
+
 #include "common.h"
 
 #ifndef __CUDACC_RTC__
@@ -117,6 +120,7 @@ __device__ void debug_print_var<double>(const char *msg, double var) {
          threadIdx.z, var);
 }
 
+#if __CUDA_ARCH_LIST__ >= 890
 // Specialization for fp8_e4_t type
 template <>
 __device__ void debug_print_var<fp8_e4_t>(const char *msg, fp8_e4_t var) {
@@ -136,6 +140,8 @@ __device__ void debug_print_var<fp8_e5_t>(const char *msg, fp8_e5_t var) {
       msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
       threadIdx.z, (float)var);
 }
+
+#endif
 
 // Template declaration for device-side debug printing (buffer only)
 template <typename T>
@@ -242,6 +248,7 @@ __device__ void debug_print_buffer_value<double>(const char *msg,
 }
 
 // Specialization for fp8_e4_t type
+#if __CUDA_ARCH_LIST__ >= 890
 template <>
 __device__ void debug_print_buffer_value<fp8_e4_t>(const char *msg,
                                                    const char *buf_name,
@@ -262,6 +269,8 @@ __device__ void debug_print_buffer_value<fp8_e5_t>(const char *msg,
          msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
          threadIdx.z, buf_name, index, (float)var);
 }
+
+#endif
 
 // Specialization for int16 type
 template <>
