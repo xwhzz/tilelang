@@ -335,7 +335,7 @@ class Builder(BaseBuilder):
             assert frame is not None, f"Variable `{name}` is not defined inside any control flow."
             if name in self.name_inside_frame and self.name_inside_frame[name] in self.frames:
                 logger.warning(
-                    f'Variable `{name}` shadows another declared value, Are you forgetting to allocate it as a var?',
+                    f'Variable `{name}` is declared twice, are you looking for a T.alloc_var?',
                     stack_info=True,
                     stacklevel=2,
                 )
@@ -475,7 +475,11 @@ class Builder(BaseBuilder):
         return self.unwrap_value(value)
 
     def macro_arg(self, name, value):
-        if self.arg_annotations.get(name, None) is Var:
+        from tilelang.language.proxy import Ref
+        annot_value = self.arg_annotations.get(name, None)
+        if annot_value is Var or annot_value is Ref:
+            if annot_value is Var:
+                logger.warning('Use `T.Var` as macro annotations is deprecated, please use `T.Ref`')
             is_var = isinstance(value, tvm.tir.BufferLoad) and value.buffer.scope() == 'local.var'
             if not is_var:
                 raise ValueError(
