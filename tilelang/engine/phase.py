@@ -74,6 +74,9 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     Note: This is a validation-only pipeline of passes and does not modify or return the module.
     """
 
+    # Debug
+    # tilelang.analysis.ASTPrinter()(mod)
+
     # Check if there are any invalid nested loops.
     tilelang.analysis.NestedLoopChecker()(mod)
 
