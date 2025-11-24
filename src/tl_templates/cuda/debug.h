@@ -11,16 +11,37 @@
 #endif
 
 template <typename T> struct PrintTraits {
-  static __device__ const char *type_name() { return "unknown"; }
-  static __device__ const char *fmt() { return "%p"; }
-  static __device__ const void *cast(T val) { return (const void *)&val; }
+  static __device__ void print_var(const char *msg, T val) {
+    printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): "
+           "dtype=unknown value=%p\n",
+           msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+           threadIdx.z, (const void *)&val);
+  }
+
+  static __device__ void print_buffer(const char *msg, const char *buf_name,
+                                      int index, T val) {
+    printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): buffer=%s, "
+           "index=%d, dtype=unknown value=%p\n",
+           msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+           threadIdx.z, buf_name, index, (const void *)&val);
+  }
 };
 
 #define DEFINE_PRINT_TRAIT(TYPE, NAME, FORMAT, CAST_TYPE)                      \
   template <> struct PrintTraits<TYPE> {                                       \
-    static __device__ const char *type_name() { return NAME; }                 \
-    static __device__ const char *fmt() { return FORMAT; }                     \
-    static __device__ CAST_TYPE cast(TYPE val) { return (CAST_TYPE)val; }      \
+    static __device__ void print_var(const char *msg, TYPE val) {              \
+      printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): "        \
+             "dtype=" NAME " value=" FORMAT "\n",                              \
+             msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,             \
+             threadIdx.y, threadIdx.z, (CAST_TYPE)val);                        \
+    }                                                                          \
+    static __device__ void print_buffer(const char *msg, const char *buf_name, \
+                                        int index, TYPE val) {                 \
+      printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): "        \
+             "buffer=%s, index=%d, dtype=" NAME " value=" FORMAT "\n",         \
+             msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,             \
+             threadIdx.y, threadIdx.z, buf_name, index, (CAST_TYPE)val);       \
+    }                                                                          \
   }
 
 DEFINE_PRINT_TRAIT(char, "char", "%d", int);
@@ -46,60 +67,45 @@ DEFINE_PRINT_TRAIT(fp8_e5_t, "fp8_e5_t", "%f", float);
 #endif
 
 template <> struct PrintTraits<bool> {
-  static __device__ const char *type_name() { return "bool"; }
-  static __device__ const char *fmt() { return "%s"; }
-  static __device__ const char *cast(bool val) {
-    return val ? "true" : "false";
+  static __device__ void print_var(const char *msg, bool val) {
+    printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): dtype=bool "
+           "value=%s\n",
+           msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+           threadIdx.z, val ? "true" : "false");
+  }
+  static __device__ void print_buffer(const char *msg, const char *buf_name,
+                                      int index, bool val) {
+    printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): buffer=%s, "
+           "index=%d, dtype=bool value=%s\n",
+           msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+           threadIdx.z, buf_name, index, val ? "true" : "false");
   }
 };
 
 template <typename T> struct PrintTraits<T *> {
-  static __device__ const char *type_name() { return "pointer"; }
-  static __device__ const char *fmt() { return "%p"; }
-  static __device__ const void *cast(T *val) { return (const void *)val; }
+  static __device__ void print_var(const char *msg, T *val) {
+    printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): "
+           "dtype=pointer value=%p\n",
+           msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+           threadIdx.z, (void *)val);
+  }
+  static __device__ void print_buffer(const char *msg, const char *buf_name,
+                                      int index, T *val) {
+    printf("msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): buffer=%s, "
+           "index=%d, dtype=pointer value=%p\n",
+           msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x, threadIdx.y,
+           threadIdx.z, buf_name, index, (void *)val);
+  }
 };
 
-__device__ inline void build_fmt(char *dst, const char *part1,
-                                 const char *part2, const char *part3) {
-  int i = 0;
-  for (int j = 0; part1[j] != '\0'; ++j)
-    dst[i++] = part1[j];
-  for (int j = 0; part2[j] != '\0'; ++j)
-    dst[i++] = part2[j];
-  for (int j = 0; part3[j] != '\0'; ++j)
-    dst[i++] = part3[j];
-  dst[i] = '\0';
-}
-
 template <typename T> __device__ void debug_print_var(const char *msg, T var) {
-  using Traits = PrintTraits<T>;
-
-  const char *prefix =
-      "msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, %d): dtype=%s value=";
-  const char *suffix = "\n";
-
-  char fmt_buffer[256];
-  build_fmt(fmt_buffer, prefix, Traits::fmt(), suffix);
-
-  printf(fmt_buffer, msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
-         threadIdx.y, threadIdx.z, Traits::type_name(), Traits::cast(var));
+  PrintTraits<T>::print_var(msg, var);
 }
 
 template <typename T>
 __device__ void debug_print_buffer_value(const char *msg, const char *buf_name,
                                          int index, T var) {
-  using Traits = PrintTraits<T>;
-
-  const char *prefix = "msg='%s' BlockIdx=(%d, %d, %d), ThreadIdx=(%d, %d, "
-                       "%d): buffer=%s, index=%d, dtype=%s value=";
-  const char *suffix = "\n";
-
-  char fmt_buffer[256];
-  build_fmt(fmt_buffer, prefix, Traits::fmt(), suffix);
-
-  printf(fmt_buffer, msg, blockIdx.x, blockIdx.y, blockIdx.z, threadIdx.x,
-         threadIdx.y, threadIdx.z, buf_name, index, Traits::type_name(),
-         Traits::cast(var));
+  PrintTraits<T>::print_buffer(msg, buf_name, index, var);
 }
 
 TL_DEVICE void device_assert(bool cond) { assert(cond); }
