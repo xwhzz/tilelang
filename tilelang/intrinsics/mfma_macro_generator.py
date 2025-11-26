@@ -2,14 +2,15 @@ from __future__ import annotations
 from tilelang import tvm as tvm
 import tilelang.language as T
 from tvm import DataType
-from tvm.tir import PrimExpr, IndexMap, Buffer, Var, BufferRegion
+from tvm import tir
+from tvm.ir import Range
+from tvm.tir import PrimExpr, IndexMap, Buffer, Var, BufferRegion, BufferLoad
 from tvm.runtime import convert
-from .utils import (
-    mfma_store_index_map,)
+from .utils import (mfma_store_index_map)
 from typing import Literal, Callable
 
 from tilelang.utils import is_fragment
-from tilelang.utils.language import to_buffer_region
+from tilelang.utils.language import get_buffer_region_from_load
 from .mfma_layout import (
     shared_16x4_to_local_64x1_layout_A,
     shared_4x16_to_local_64x1_layout_B,
@@ -268,7 +269,7 @@ class MatrixCoreIntrinEmitter:
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=False)
 
         # legalize shared buffer to region
-        A_region = to_buffer_region(A_shared_buf)
+        A_region = self._legalize_to_buffer_region(A_shared_buf)
         A_buf = A_region.buffer
         A_base0 = A_region.region[-2].min
         A_base1 = A_region.region[-1].min
@@ -314,7 +315,7 @@ class MatrixCoreIntrinEmitter:
         _, reverse_index_map = self.get_ldmatrix_index_map(is_b=True)
 
         # legalize shared buffer to region
-        B_region = to_buffer_region(B_shared_buf)
+        B_region = self._legalize_to_buffer_region(B_shared_buf)
         B_buf = B_region.buffer
         B_base0 = B_region.region[-2].min
         B_base1 = B_region.region[-1].min
@@ -654,6 +655,33 @@ class MatrixCoreIntrinEmitter:
             forward_thread_fn=forward_thread,
             forward_index_fn=forward_index,
         )
+
+    @staticmethod
+    def _legalize_to_buffer_region(obj: Buffer | BufferLoad | BufferRegion) -> BufferRegion:
+        """
+        Convert Buffer/BufferRegion/BufferLoad to a BufferRegion.
+
+        - Buffer -> full-region BufferRegion covering entire shape
+        - BufferRegion -> returned as-is
+        - BufferLoad -> best-effort convert via get_buffer_region_from_load;
+        if scalar, fall back to 1-sized ranges at given indices
+        """
+        if isinstance(obj, BufferRegion):
+            return obj
+        if isinstance(obj, Buffer):
+            mins = [tir.IntImm("int32", 0) for _ in obj.shape]
+            ranges = [Range.from_min_extent(m, e) for m, e in zip(mins, obj.shape)]
+            return BufferRegion(obj, ranges)
+        if isinstance(obj, BufferLoad):
+            region = get_buffer_region_from_load(obj)
+            if region is not None:
+                return region
+            # Fallback: scalar load -> 1-sized ranges at indices
+            mins = [idx for idx in obj.indices]
+            ones = [tir.IntImm("int32", 1) for _ in obj.indices]
+            ranges = [Range.from_min_extent(m, e) for m, e in zip(mins, ones)]
+            return BufferRegion(obj.buffer, ranges)
+        raise ValueError(f"Unsupported argument type for BufferRegion: {type(obj)}")
 
 
 class MatrixCorePreshuffleIntrinEmitter(MatrixCoreIntrinEmitter):

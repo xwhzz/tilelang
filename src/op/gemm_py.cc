@@ -12,7 +12,6 @@
 #include <tvm/tir/transform.h>
 
 #include "../target/utils.h"
-#include "region.h"
 #include "tcgen5_meta.h"
 #include "utils.h"
 
@@ -46,19 +45,17 @@ using namespace tir;
  *      M (Int), N (Int), K (Int), policy (Int), clear_accum (Bool),
  *      stride_A (Int), stride_B (Int), offset_A (Int), offset_B (Int),
  *      (optional) kPack (Int), (optional) wg_wait (Int)]
- * @param vmap Mapping from access pointer vars to Buffer objects used to
- *   resolve the Buffer corresponding to each pointer argument.
  *
  * @note If `kPack` is provided it must be 1 or 2; otherwise the constructor
  *       fails with an ICHECK (runtime assertion). No other validation is
  *       performed here.
  */
-GemmPy::GemmPy(Array<PrimExpr> args, BufferMap vmap) {
+GemmPy::GemmPy(Array<PrimExpr> args) {
   ObjectPtr<GemmPyNode> node = tvm::ffi::make_object<GemmPyNode>();
 
-  node->aRegion_ = NormalizeToBufferRegion(args[0], vmap);
-  node->bRegion_ = NormalizeToBufferRegion(args[1], vmap);
-  node->cRegion_ = NormalizeToBufferRegion(args[2], vmap);
+  node->aRegion_ = NormalizeToBufferRegion(args[0]);
+  node->bRegion_ = NormalizeToBufferRegion(args[1]);
+  node->cRegion_ = NormalizeToBufferRegion(args[2]);
 
   node->a_ = node->aRegion_->buffer;
   node->b_ = node->bRegion_->buffer;
@@ -83,11 +80,12 @@ GemmPy::GemmPy(Array<PrimExpr> args, BufferMap vmap) {
   if (args.size() > 15) {
     node->wgWait_ = args[15].as<IntImm>().value()->value;
   }
-  node->mbarPtr_ = args[16];
-  if (node->mbarPtr_.as<CallNode>()) {
-    node->mbar_ = vmap[GetVarFromAccessPtr(node->mbarPtr_)];
-  } else {
-    node->mbar_ = std::nullopt;
+  if (args.size() > 16) {
+    if (const auto *load = args[16].as<BufferLoadNode>()) {
+      node->mbarRegion_ =
+          NormalizeToBufferRegion(Downcast<BufferLoad>(args[16]));
+      node->mbar_ = node->mbarRegion_->buffer;
+    }
   }
   node->cCoords_ = Array<PrimExpr>(
       {args[17].as<PrimExpr>().value(), args[18].as<PrimExpr>().value()});
