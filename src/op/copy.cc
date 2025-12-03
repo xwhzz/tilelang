@@ -57,7 +57,7 @@ static int to_CUtensorMapDataType(DataType dtype) {
     }
   } else if (dtype.is_bfloat16()) {
     tp = CU_TENSOR_MAP_DATA_TYPE_BFLOAT16;
-  } else if (dtype.is_float8_e4m3() || dtype.is_float8_e5m2()) {
+  } else if (dtype.is_float8()) {
     tp = CU_TENSOR_MAP_DATA_TYPE_UINT8;
   } else if (dtype.is_int()) {
     switch (dtype.bits()) {
