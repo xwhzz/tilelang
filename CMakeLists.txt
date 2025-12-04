@@ -137,6 +137,7 @@ file(GLOB TILE_LANG_SRCS
   src/layout/*.cc
   src/transform/*.cc
   src/op/*.cc
+  src/analysis/*.cc
   src/target/utils.cc
   src/target/codegen_c_host.cc
   src/target/codegen_cpp.cc

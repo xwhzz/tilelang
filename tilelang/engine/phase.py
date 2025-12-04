@@ -73,7 +73,6 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     in Python side instead of letting the error dive into the complicated TVM/C++ stack.
     Note: This is a validation-only pipeline of passes and does not modify or return the module.
     """
-
     # Debug
     # tilelang.analysis.ASTPrinter()(mod)
 
@@ -82,7 +81,9 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
 
     # Check if there are any invalid symbolic T.Parallel + fragment access.
     tilelang.analysis.FragmentLoopChecker()(mod)
-
+    is_static = tilelang.analysis.CheckStatic(mod)
+    if is_static:
+        tilelang.analysis.ComputeIOCollector(mod)
 
 def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Bind the target device information to the module
