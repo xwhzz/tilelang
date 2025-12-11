@@ -1,11 +1,23 @@
 from __future__ import annotations
 from collections import defaultdict
 from enum import IntEnum, auto
+import math
 import tabulate
-from tvm import tir, DataType, IRModule
-from tvm.tir import (PyStmtExprVisitor, BufferStore, For, Buffer, PrimFunc, BufferLoad, IntImm, Call, AttrStmt)
+from tvm import tir, DataType, IRModule, arith
+from tvm.tir import (PyStmtExprVisitor, BufferStore, For, Buffer, PrimFunc, BufferLoad, IntImm, Call, AttrStmt, Var)
 from tilelang.arch import get_arch_config
-from .L2_hit_rate_flow_sim_reuse_distance import L2_hit_rate_flow_sim_reuse_distance
+from ._predict_l2 import analyze_l2, WorkUnit
+
+
+"""
+Estimation of L2 cache hit rate:
+
+assume 
+
+1. collect every access for tensor on global memory, w
+
+
+"""
 
 class _StatisticType(IntEnum):
     TC_1 = auto() # 8bit
@@ -37,9 +49,12 @@ class _ComputeIOCollector(PyStmtExprVisitor):
         self._extent = 1
 
         self._arch = get_arch_config("H100_PCIE", profile="microbench")
-        self._l2_hit_rate = L2_hit_rate_flow_sim_reuse_distance(1024, 1024, 1024, 128, 128, 128, self._arch.l2_capacity, self._arch.sm_count, {'in1': [1,1,1,2], 'in2': [1,1,1,2], 'out1': [1,1,1,4]}, row_panel=1)
+        self._work_list = list[WorkUnit]()
+        self._block_num = dict[Var, int]()
 
-        self._block_num = 1
+        self._scope = []
+
+        self._cur_list = list[WorkUnit]()
 
     @staticmethod
     def _get_extent(region: Call) -> int:
@@ -76,13 +91,22 @@ class _ComputeIOCollector(PyStmtExprVisitor):
     def visit_attr_stmt_(self, op: AttrStmt) -> None:
         if op.attr_key == "thread_extent":
             if "blockIdx" in op.node.thread_tag:
-                self._block_num *= int(op.value)
+                _n = int(op.value)
+                self._block_num[op.node.var] = _n
         self.visit_stmt(op.body)
         
     def visit_for_(self, op: For) -> None:
         if isinstance(op.extent, IntImm):
             self._extent *= op.extent.value
+            self._cur_list.clear()
             self.visit_stmt(op.body)
+            _var = op.loop_var
+            for i in range(op.extent.value):
+                ana = arith.Analyzer()
+                ana.bind(_var, i)
+                for item in self._cur_list:
+                    new_indices = (int(ana.simplify(index)) for index in item.coord)
+                    self._work_list.append(WorkUnit(item.name, tuple(new_indices), item.size))
             self._extent //= op.extent.value
         else:
             self.visit_stmt(op.body)
@@ -100,19 +124,43 @@ class _ComputeIOCollector(PyStmtExprVisitor):
             dst_scope = self._get_scope(dst_region)
 
             src_dtype = src_region.args[0].buffer.dtype
-
             # self._info[max(src_scope, dst_scope)] += src_extent * self._extent * src_region.args[0].buffer.dtype.bits // 8
-            io = int(src_extent * self._extent * src_dtype.bits // 8)
-            if src_scope == _StatisticType.L3:
-                # load L2 two partition:
-                self._info[_StatisticType.L2] += io * self._l2_hit_rate + io * (1 - self._l2_hit_rate) * 2
-                self._info[_StatisticType.L3] += io * (1 - self._l2_hit_rate)
-            elif dst_scope == _StatisticType.L3:
-                # store
-                self._info[_StatisticType.L2] += io * 2
-                self._info[_StatisticType.L3] += io
+            io = int(src_extent * src_dtype.bits // 8)
 
-                self._info[_StatisticType.L1] += io
+            if src_scope == _StatisticType.L3:
+                _range = list(self._block_num.values())
+                _var = list(self._block_num.keys())
+
+                for i in range(_range[0]):
+                    for j in range(_range[1]):
+                        ana = arith.Analyzer()
+                        ana.bind(_var[0], i)
+                        ana.bind(_var[1], j)
+                        indices = src_region.args[0].indices
+                        new_indices = (ana.simplify(index) for index in indices)
+                        self._cur_list.append(WorkUnit(src_region.args[0].buffer.name, tuple(new_indices), io))
+
+            elif dst_scope == _StatisticType.L3:
+                _range = list(self._block_num.values())
+                _var = list(self._block_num.keys())
+                for i in range(_range[0]):
+                    for j in range(_range[1]):
+                        ana = arith.Analyzer()
+                        ana.bind(_var[0], i)
+                        ana.bind(_var[1], j)
+                        indices = dst_region.args[0].indices
+                        new_indices = (int(ana.simplify(index)) for index in indices)
+                        self._work_list.append(WorkUnit(dst_region.args[0].buffer.name, tuple(new_indices), io))
+            # if src_scope == _StatisticType.L3:
+            #     # load L2 two partition:
+            #     self._info[_StatisticType.L2] += io * self._l2_hit_rate + io * (1 - self._l2_hit_rate) * 2
+            #     self._info[_StatisticType.L3] += io * (1 - self._l2_hit_rate)
+            # elif dst_scope == _StatisticType.L3:
+            #     # store
+            #     self._info[_StatisticType.L2] += io * 2
+            #     self._info[_StatisticType.L3] += io
+
+            #     self._info[_StatisticType.L1] += io
             # TODO: consider the overhead of dtype conversion
             # if src_dtype != dst_dtype:
             #     self._info[max(src_dtype, dst_dtype)] += src_extent * self._extent
@@ -137,7 +185,7 @@ class _ComputeIOCollector(PyStmtExprVisitor):
             dtype = op.args[0].args[0].buffer.dtype
             _type = self._get_core(dtype)
             self._info[_type] += int(self._get_extent(op.args[0]) * self._extent)
-            
+        # 
         elif op.op == tir.op.Op.get("tir.exp2"): # sfu
             self._info[_StatisticType.SFU] += int(1 * self._extent)
         return super().visit_call_(op)
@@ -160,12 +208,16 @@ class _ComputeIOCollector(PyStmtExprVisitor):
         return self._info
     
     def post_data(self) -> None:
-        norm = (self._block_num + self._arch.sm_count - 1) // self._arch.sm_count * self._arch.sm_count
+        _block_num = math.prod(self._block_num.values()) if self._block_num else 1
+        norm = math.ceil(_block_num / self._arch.sm_count) * self._arch.sm_count
 
-
-        ## memory time
-        l3_time = self._info[_StatisticType.L3] / self._arch.ddr_bandwidth * norm
-        l2_time = self._info[_StatisticType.L2] / self._arch.l2_bandwidth * norm
+        l2_io, l3_io = analyze_l2(self._work_list, self._arch.l2_capacity, sm_count=self._arch.sm_count)
+        self._info[_StatisticType.L2] += l2_io
+        self._info[_StatisticType.L3] += l3_io
+        ## memory time (all CTAs view)
+        l3_time = self._info[_StatisticType.L3] / self._arch.ddr_bandwidth / _block_num * norm 
+        l2_time = self._info[_StatisticType.L2] / self._arch.l2_bandwidth / _block_num * norm
+        ## (single CTA view)
         l1_time = self._info[_StatisticType.L1] / self._arch.smem_bandwidth * norm
 
         ## compute time
