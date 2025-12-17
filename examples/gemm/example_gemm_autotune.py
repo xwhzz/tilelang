@@ -232,7 +232,7 @@ def run_regression_perf(M: int = 4096, N: int = 4096, K: int = 4096):
     config = get_heuristic_config()
     kernel = matmul(M, N, K, **config)
     profiler = kernel.get_profiler(tensor_supply_type=tl.TensorSupplyType.Auto)
-    return profiler.do_bench(, backend="cupti")
+    return profiler.do_bench(backend="cupti")
 
 
 if __name__ == "__main__":

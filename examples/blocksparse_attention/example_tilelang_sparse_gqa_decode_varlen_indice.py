@@ -423,6 +423,8 @@ def main(batch=8, heads=32, heads_kv=8, max_cache_seqlen=8192, dim=128, dim_v=12
 
 
 def run_regression_perf(batch=8, heads=32, heads_kv=8, max_cache_seqlen=8192, dim=128, dim_v=128, sparse_ratio=0.8, block_size=32):
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     batch, heads, heads_kv, max_cache_seqlen, dim, dim_v = batch, heads, heads_kv, max_cache_seqlen, dim, dim_v
     sparse_ratio = sparse_ratio
     block_size = block_size

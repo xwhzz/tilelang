@@ -129,7 +129,7 @@ def run_regression_perf(argv=None):
     threads = 256
     kernel = convolution(N, C, H, W, F, K, S, D, P, block_m, block_n, block_k, num_stages, threads)
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
-    return profiler.do_bench(, backend="cupti")
+    return profiler.do_bench(backend="cupti")
 
 
 if __name__ == "__main__":

@@ -177,7 +177,7 @@ def run_regression_perf(
     config = get_heuristic_config()
     kernel = convolution(N, C, H, W, F, K, S, D, P, **config)
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
-    return profiler.do_bench(, backend="cupti")
+    return profiler.do_bench(backend="cupti")
 
 
 if __name__ == "__main__":
