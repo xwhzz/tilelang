@@ -529,7 +529,7 @@ def run_regression_perf(
         def run_kernel_only():
             k_bwd(q, k, v, do, lse, Delta, dq, dk, dv)
 
-        latency_ms = do_bench(run_kernel_only, warmup=500, rep=10000)
+        latency_ms = do_bench(run_kernel_only, warmup=500, rep=10000, backend="cupti")
         return latency_ms
 
 

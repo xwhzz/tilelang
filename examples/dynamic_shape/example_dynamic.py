@@ -125,7 +125,7 @@ def run_regression_perf(M, N, K):
         B = torch.rand(K, N, device="cuda", dtype=getattr(torch, in_dtype))
     C = torch.zeros(M, N, device="cuda", dtype=getattr(torch, out_dtype))
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
-    return profiler.do_bench(input_tensors=[A, B, C])
+    return profiler.do_bench(input_tensors=[A, B, C], backend="cupti")
 
 
 if __name__ == "__main__":

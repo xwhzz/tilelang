@@ -677,7 +677,7 @@ def run_regression_perf(argv=None):
 
     tl_kernel = _tl_vs_sparse_flashattn(batch_size, num_heads, context_size, head_dim, vertical_topk.shape[2], slash.shape[2])
 
-    return do_bench(lambda: tl_kernel)
+    return do_bench(lambda: tl_kernel, backend="cupti")
 
 
 if __name__ == "__main__":

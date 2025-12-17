@@ -149,7 +149,7 @@ def run_regression_perf():
     def run_kernel_only():
         kernel(A_sparse, E, B)
 
-    return do_bench(run_kernel_only)
+    return do_bench(run_kernel_only, backend="cupti")
 
 
 if __name__ == "__main__":

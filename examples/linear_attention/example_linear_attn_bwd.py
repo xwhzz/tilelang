@@ -204,7 +204,7 @@ def run_regression_perf(B=1, S=1024, H=16, D=128):
     dK = torch.zeros_like(k, dtype=torch.float32)
     dV = torch.zeros_like(v, dtype=torch.float32)
     kernel(q, k, v, do, dQ, dK, dV)
-    return do_bench(lambda: kernel(q, k, v, do, dQ, dK, dV), backend="cupti")
+    return do_bench(lambda: kernel(q, k, v, do, dQ, dK, dV), backend="cupti", backend="cupti")
 
 
 if __name__ == "__main__":
