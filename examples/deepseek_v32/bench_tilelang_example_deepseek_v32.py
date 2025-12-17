@@ -25,9 +25,7 @@ def bench_sparse_mla_fwd_pipelined():
 
 
 def bench_sparse_mla_bwd():
-    tilelang.testing.benchmark.process_func(
-        sparse_mla_bwd.run_regression_perf, S=256, SKV=512, H=64, HKV=1, DQKV=576, DV=512, topk=256
-    )
+    tilelang.testing.benchmark.process_func(sparse_mla_bwd.run_regression_perf, S=256, SKV=512, H=64, HKV=1, DQKV=576, DV=512, topk=256)
 
 
 if globals().get("__name__") == "__main__":
