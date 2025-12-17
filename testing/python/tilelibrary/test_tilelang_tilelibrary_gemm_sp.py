@@ -216,6 +216,8 @@ def run_gemm_sp(
     print("pass")
 
 
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version(9, 0)
 def run_gemm_sp_sm90(
     M,
     N,
@@ -228,8 +230,8 @@ def run_gemm_sp_sm90(
     block_K,
     num_stages,
     num_threads,
-    trans_A=False,
-    trans_B=False,
+    trans_A,
+    trans_B,
 ):
     kernel = matmul_sp_sm90(
         M,
@@ -259,6 +261,9 @@ def run_gemm_sp_sm90(
     )
 
 
+@tilelang.testing.requires_cuda
+@tilelang.testing.requires_cuda_compute_version_ge(8, 0)
+@tilelang.testing.requires_cuda_compute_version_le(8, 9)
 def run_gemm_sp_sm80(
     M,
     N,
@@ -271,8 +276,8 @@ def run_gemm_sp_sm80(
     block_K,
     num_stages,
     num_threads,
-    trans_A=False,
-    trans_B=False,
+    trans_A,
+    trans_B,
 ):
     kernel = matmul_sp_sm80(
         M,
