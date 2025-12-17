@@ -201,7 +201,7 @@ def run_regression_perf(batch: int = 8, heads: int = 32, seq_len: int = 4096, di
 
     kernel = flashattn(batch, heads, seq_len, dim, is_causal, block_M=128, block_N=128, num_stages=1, threads=128)
     profiler = kernel.get_profiler()
-    return profiler.do_bench(warmup=500)
+    return profiler.do_bench(warmup=500, backend="cupti")
 
 
 if __name__ == "__main__":

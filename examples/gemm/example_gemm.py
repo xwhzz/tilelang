@@ -60,7 +60,7 @@ def main():
 def run_regression_perf():
     kernel = matmul(1024, 1024, 1024, 128, 128, 32)
     profiler = kernel.get_profiler()
-    return profiler.do_bench(backend="cupti")
+    return profiler.do_bench(backend="cupti", backend="cupti")
 
 
 if __name__ == "__main__":

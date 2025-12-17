@@ -93,7 +93,7 @@ def run_regression_perf(M=1024, N=1024, K=1024):
 
     profiler = jit_kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Normal)
 
-    return profiler.do_bench()
+    return profiler.do_bench(, backend="cupti")
 
 
 if __name__ == "__main__":

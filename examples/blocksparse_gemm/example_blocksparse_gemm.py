@@ -198,7 +198,7 @@ def run_regression_perf():
     def run_kernel_only():
         kernel(a, b, block_mask)
 
-    return do_bench(run_kernel_only, warmup=10, rep=100)
+    return do_bench(run_kernel_only, warmup=10, rep=100, backend="cupti")
 
 
 if __name__ == "__main__":

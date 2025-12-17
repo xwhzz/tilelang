@@ -317,7 +317,7 @@ def run_regression_perf(batch: int = 8, heads: int = 64, seq_len: int = 2048, di
     def run_kernel_only():
         kernel(q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, max_seqlen_q)
 
-    return do_bench(run_kernel_only, warmup=10, rep=100)
+    return do_bench(run_kernel_only, warmup=10, rep=100, backend="cupti")
 
 
 if __name__ == "__main__":

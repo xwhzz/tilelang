@@ -232,7 +232,7 @@ def run_regression_perf(M=8192, N=8192, BG=2, blk_m=8, batch_sizes=None):
     def run_tilelang():
         kernel(x, batch_sizes)
 
-    return do_bench(run_tilelang)
+    return do_bench(run_tilelang, backend="cupti")
 
 
 if __name__ == "__main__":

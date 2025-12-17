@@ -347,7 +347,7 @@ def run_regression_perf(
         dtype=dtype,
     )
     Q, K, V, sinks = gen_inputs(batch, heads, seq_q, seq_kv, dim, groups, dtype=torch_dtype)
-    latency = do_bench(lambda: kernel(Q, K, V, sinks), warmup=500, rep=10000)
+    latency = do_bench(lambda: kernel(Q, K, V, sinks), warmup=500, rep=10000, backend="cupti")
     return latency
 
 

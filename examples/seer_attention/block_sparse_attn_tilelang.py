@@ -272,7 +272,7 @@ def run_regression_perf():
     def run_kernel_only():
         kernel(q, k, v, block_mask.to(torch.int8))
 
-    latency_1 = do_bench(run_kernel_only)
+    latency_1 = do_bench(run_kernel_only, backend="cupti")
 
     BATCH, N_HEADS = 1, 1
     Q_LEN, K_LEN, D_HEAD = 128, 256, 64
@@ -296,7 +296,7 @@ def run_regression_perf():
     def run_kernel_only2():
         kernel(q, k, v, block_mask.to(torch.int8))
 
-    latency_2 = do_bench(run_kernel_only2)
+    latency_2 = do_bench(run_kernel_only2, backend="cupti")
 
     return (latency_1 + latency_2) / 2
 
