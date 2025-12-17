@@ -110,7 +110,7 @@ def run_regression_perf(argv=None):
     torch.testing.assert_close(tl_indices, torch_indices)
 
     profiler = kernel.get_profiler(tensor_supply_type=tilelang.TensorSupplyType.Auto)
-    return profiler.do_bench(, backend="cupti")
+    return profiler.do_bench(backend="cupti")
 
 
 if __name__ == "__main__":

@@ -177,6 +177,8 @@ def main():
 
 
 def run_regression_perf():
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     a = torch.randn(M, K).cuda().half()
     b = torch.randn(K, N).cuda().half()
 

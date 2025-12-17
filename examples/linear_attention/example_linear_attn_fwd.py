@@ -147,7 +147,7 @@ def run_regression_perf(B=1, S=512, H=16, D=128):
     B, S, H, D = q.shape
     kernel = tl_fused_chunk_fwd_kernel(B, S, H, D, D)
     o = torch.zeros((B, S, H, D), device="cuda", dtype=torch.float32)
-    return do_bench(lambda: kernel(q, k, v, o), backend="cupti", backend="cupti")
+    return do_bench(lambda: kernel(q, k, v, o), backend="cupti")
 
 
 if __name__ == "__main__":

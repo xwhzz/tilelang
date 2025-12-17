@@ -337,7 +337,9 @@ def test_sparse_mla_bwd(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, to
     print(f"bwd tflops = ", per_token_flop * S / (ms * 1e-3) / 1e12)
 
 
-def run_regression_perf(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16, check_correctness=True):
+def run_regression_perf(B=1, S=4096, SKV=8192, H=64, HKV=1, DQKV=576, DV=512, topk=2048, dtype=torch.bfloat16):
+    torch.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
     q = torch.randn((B, S, H, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
     kv = torch.randn((B, SKV, HKV, DQKV), dtype=dtype, device="cuda").requires_grad_(True)
     do = torch.randn((B, S, H, DV), dtype=dtype, device="cuda")
