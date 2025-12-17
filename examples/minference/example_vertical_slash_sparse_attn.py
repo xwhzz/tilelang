@@ -656,6 +656,7 @@ def run_regression_perf(argv=None):
     s_idx = s_idx.to(torch.int32).reshape((batch_size, num_heads, -1)).sort(dim=-1, descending=True)[0]
     from torch.utils.cpp_extension import load
     import os
+
     current_dir = os.path.dirname(os.path.abspath(__file__))
     sources = [os.path.join(current_dir, "ops", "kernels.cpp"), os.path.join(current_dir, "ops", "vertical_slash_index.cu")]
     ops = load(name="convert", sources=sources, verbose=False)
@@ -684,8 +685,10 @@ def run_regression_perf(argv=None):
         block_size_N,
     )
     tl_kernel = _tl_vs_sparse_flashattn(batch_size, num_heads, context_size, head_dim, vertical_topk.shape[-1], slash.shape[-1])
+
     def run_kernel_only():
         tl_kernel(query, key, value, block_count, block_offset, column_count, column_index)
+
     return do_bench(run_kernel_only, backend="cupti")
 
 
