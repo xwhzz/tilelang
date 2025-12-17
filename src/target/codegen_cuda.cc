@@ -3418,6 +3418,12 @@ void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
   CodeGenC::PrintType(func->ret_type, os);
   CodeGenC::PrintExtraAttrs(func, os);
   bool no_alias = func->HasNonzeroAttr(tir::attr::kNoAlias);
+  std::unordered_set<const VarNode *> non_restrict;
+  if (auto opt =
+          func->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tir::Var &v : opt.value())
+      non_restrict.insert(v.get());
+  }
   // Read-only param indices attribute, if present.
   std::unordered_set<int> ro_param_indices;
   if (auto opt =
@@ -3461,7 +3467,7 @@ void CodeGenTileLangCUDA::PrintFunctionSignature(const String &function_name,
         }
       }
 
-      if (no_alias) {
+      if (no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, os);
       }
     } else {
@@ -3497,6 +3503,12 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
   ICHECK(global_symbol)
       << "CodeGenC: Expect PrimFunc to have the global_symbol attribute";
   bool no_alias = f->HasNonzeroAttr(tir::attr::kNoAlias);
+  std::unordered_set<const VarNode *> non_restrict;
+  if (auto opt =
+          f->GetAttr<ffi::Array<tir::Var>>(tl::attr::kNonRestrictParams)) {
+    for (const tir::Var &v : opt.value())
+      non_restrict.insert(v.get());
+  }
   // Read-only param indices attribute, if present.
   std::unordered_set<int> ro_param_indices;
   if (auto opt = f->GetAttr<ffi::Array<Integer>>("tl.readonly_param_indices")) {
@@ -3542,7 +3554,7 @@ void CodeGenTileLangCUDA::AddFunction(const GlobalVar &gvar,
         }
       }
 
-      if (no_alias) {
+      if (no_alias && !non_restrict.count(v.get())) {
         PrintRestrict(v, stream);
       }
     } else {
