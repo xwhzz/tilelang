@@ -15,26 +15,25 @@ import example_mha_bwd_bshd_wgmma_pipelined
 
 
 def regression_example_gqa_bwd_tma_reduce_varlen():
-    tilelang.testing.process_func(example_gqa_bwd_tma_reduce_varlen.run_regression_perf, name="example_gqa_bwd_tma_reduce_varlen")
+    tilelang.testing.process_func(example_gqa_bwd_tma_reduce_varlen.run_regression_perf)
 
 
 def regression_example_gqa_bwd():
-    tilelang.testing.process_func(example_gqa_bwd.run_regression_perf, name="example_gqa_bwd")
+    tilelang.testing.process_func(example_gqa_bwd.run_regression_perf)
 
 
 def regression_example_gqa_bwd_wgmma_pipelined():
-    tilelang.testing.process_func(example_gqa_bwd_wgmma_pipelined.run_regression_perf, name="example_gqa_bwd_wgmma_pipelined")
+    tilelang.testing.process_func(example_gqa_bwd_wgmma_pipelined.run_regression_perf)
 
 def regression_example_mha_bwd_bshd():
-    tilelang.testing.process_func(example_mha_bwd_bshd.run_regression_perf, name="example_mha_bwd_bshd")
+    tilelang.testing.process_func(example_mha_bwd_bshd.run_regression_perf)
 
 def regression_example_mha_bwd_bhsd():
-    tilelang.testing.process_func(example_mha_bwd_bhsd.run_regression_perf, name="example_mha_bwd_bhsd")
-
+    tilelang.testing.process_func(example_mha_bwd_bhsd.run_regression_perf)
 
 def regression_example_mha_bwd_bshd_wgmma_pipelined():
     tilelang.testing.process_func(
-        example_mha_bwd_bshd_wgmma_pipelined.run_regression_perf, name="example_mha_bwd_bshd_wgmma_pipelined"
+        example_mha_bwd_bshd_wgmma_pipelined.run_regression_perf
     )
 
 
