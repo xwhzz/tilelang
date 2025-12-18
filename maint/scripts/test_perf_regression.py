@@ -1,12 +1,20 @@
 import subprocess
 import re
+import os
 from tabulate import tabulate
-import tilelang
 import pandas as pd
 
+try:
+    import tilelang
 
-tilelang.disable_cache()
+    tilelang.disable_cache()
+except Exception:
+    tilelang = None
 
+OLD_PYTHON = os.environ.get("OLD_PYTHON", "./old/bin/python")
+NEW_PYTHON = os.environ.get("NEW_PYTHON", "./new/bin/python")
+OUT_MD = os.environ.get("PERF_REGRESSION_MD", "regression_result.md")
+OUT_PNG = os.environ.get("PERF_REGRESSION_PNG", "regression_result.png")
 
 def parse_output(output):
     data = {}
@@ -45,18 +53,18 @@ def draw(df):
     plt.ylim(0, max(df["Speedup"]) * 1.2)
     sns.despine()
     plt.tight_layout()
-    plt.savefig("bench.png", dpi=300)
+    plt.savefig(OUT_PNG, dpi=300)
 
 
-output_v1 = run_cmd(["./tl/bin/python", "-c", "import tilelang.testing.benchmark as b; b.bench_all()"])
-output_v2 = run_cmd(["./tll/bin/python", "-c", "import tilelang.testing.benchmark as b; b.bench_all()"])
+output_v1 = run_cmd([OLD_PYTHON, "-c", "import tilelang.testing.perf_regression as pr; pr.regression_all()"])
+output_v2 = run_cmd([NEW_PYTHON, "-c", "import tilelang.testing.perf_regression as pr; pr.regression_all()"])
 
 data_v1 = parse_output(output_v1)
 data_v2 = parse_output(output_v2)
 
 common_keys = sorted(set(data_v1) & set(data_v2))
 if not common_keys:
-    raise RuntimeError("No common benchmark entries between tl and tll")
+    raise RuntimeError("No common entries between old and new versions")
 
 table = []
 for key in data_v1.keys():
@@ -64,13 +72,13 @@ for key in data_v1.keys():
     table.append([key, data_v1[key], data_v2[key], speedup])
 
 if not table:
-    raise RuntimeError("All benchmark results are invalid (<= 0)")
+    raise RuntimeError("All results are invalid (<= 0)")
 
 table.sort(key=lambda x: x[-1])
 
 headers = ["File", "Original Latency", "Current Latency", "Speedup"]
 
-with open("bench.md", "w") as f:
+with open(OUT_MD, "w") as f:
     f.write(tabulate(table, headers=headers, tablefmt="github", stralign="left", numalign="decimal"))
     f.write("\n")
 

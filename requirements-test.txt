@@ -30,3 +30,5 @@ scipy
 tabulate
 tornado
 wheel
+matplotlib
+seaborn
