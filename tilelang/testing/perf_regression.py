@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import importlib.util
+import hashlib
 import inspect
 import json
 import os
@@ -54,6 +55,7 @@ def _reset_results() -> None:
 
 @contextlib.contextmanager
 def _pushd(path: Path) -> Iterable[None]:
+	"""Temporarily change working directory (process-wide; avoid in concurrent contexts)."""
 	cwd = Path.cwd()
 	os.chdir(path)
 	try:
@@ -86,16 +88,26 @@ def _run_bench_file(bench_file: Path, *, prefixes: Sequence[str] = ("regression_
 		raise FileNotFoundError(f"Benchmark driver not found: {bench_file}")
 
 	with _pushd(bench_file.parent), _prepend_sys_path(bench_file.parent):
-		module_name = bench_file.stem + "_perf_regression"
+		module_tag = hashlib.sha256(str(bench_file).encode("utf-8")).hexdigest()[:12]
+		parent_stem = bench_file.parent.name.replace("-", "_") or "root"
+		stem = bench_file.stem.replace("-", "_")
+		module_name = f"tilelang.testing.perf_regression.bench_{parent_stem}_{stem}_{module_tag}"
 		spec = importlib.util.spec_from_file_location(module_name, bench_file)
 		if spec is None or spec.loader is None:
 			raise ImportError(f"Cannot import benchmark driver: {bench_file}")
 		module = importlib.util.module_from_spec(spec)
-		sys.modules.setdefault(module_name, module)
-		spec.loader.exec_module(module)
+		prev = sys.modules.get(module_name)
+		sys.modules[module_name] = module
+		try:
+			spec.loader.exec_module(module)
 
-		for _, fn in sorted(_iter_regression_functions(module.__dict__, prefixes), key=lambda kv: kv[0]):
-			fn()
+			for _, fn in sorted(_iter_regression_functions(module.__dict__, prefixes), key=lambda kv: kv[0]):
+				fn()
+		finally:
+			if prev is None:
+				sys.modules.pop(module_name, None)
+			else:
+				sys.modules[module_name] = prev
 
 
 def _build_pytest_wrapper(bench_files: Sequence[Path]) -> str:
@@ -201,10 +213,11 @@ def _discover_bench_files(examples_root: Path) -> list[Path]:
 	return sorted({p for p in files if p.is_file() and p.name != "__init__.py"})
 
 
-def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
+def regression_all(examples_root: str | os.PathLike[str] | None = None, *, pytest_args: Sequence[str] | None = None) -> None:
 	"""Run all example benchmark drivers and print a consolidated table.
 
 	Intended usage (CI): `python -c "import tilelang.testing.perf_regression as pr; pr.regression_all()"`
+	Additional pytest arguments can be passed via `pytest_args`.
 	"""
 
 	root = Path(examples_root) if examples_root is not None else _examples_root()
@@ -217,6 +230,7 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
 
 	_reset_results()
 	wrapper_source = _build_pytest_wrapper(bench_files)
+	merged: dict[str, float] = {}
 	with tempfile.TemporaryDirectory() as td:
 		wrapper = Path(td) / "test_perf_regression_wrapper.py"
 		wrapper.write_text(wrapper_source, encoding="utf-8")
@@ -224,22 +238,26 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
 		try:
 			import pytest  # type: ignore
 		except ImportError as exc:  # pragma: no cover - tested via stubbed import
-			raise RuntimeError("pytest is required to run perf regression suite") from exc
+			raise RuntimeError("pytest is required to run perf regression suite. Install with: pip install pytest") from exc
 
-		exit_code = pytest.main([str(wrapper), "-s"])
+		# Disable output capturing so benchmark progress remains visible.
+		args = [str(wrapper), "-s"]
+		if pytest_args:
+			args.extend(pytest_args)
 
-	merged: dict[str, float] = {}
-	for res in _RESULTS:
-		if res.name not in merged:
-			merged[res.name] = res.latency
+		exit_code = pytest.main(args)
 
-	if exit_code != 0 and not merged:
-		raise RuntimeError("All benchmark drivers failed")
-	if exit_code != 0:
-		# Don't hard-fail if we have some results; pytest already reported details.
-		print("# Some benchmark drivers failed (partial results)")
-	if not merged:
-		raise RuntimeError("No benchmark results collected")
+		for res in _RESULTS:
+			if res.name not in merged:
+				merged[res.name] = res.latency
+
+		if not merged:
+			if exit_code != 0:
+				raise RuntimeError("All benchmark drivers failed")
+			raise RuntimeError("No benchmark results collected")
+		if exit_code != 0:
+			# Don't hard-fail if we have some results; pytest already reported details.
+			print("# Some benchmark drivers failed (partial results)")
 
 	rows = [[k, merged[k]] for k in sorted(merged.keys())]
 	headers = ["File", "Latency"]

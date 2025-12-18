@@ -8,6 +8,7 @@ from pathlib import Path
 
 
 def _load_perf_module(monkeypatch):
+	"""Load perf_regression directly while stubbing the tilelang package to avoid heavy test dependencies."""
 	module_path = Path(__file__).resolve().parents[1] / "tilelang/testing/perf_regression.py"
 	spec = importlib.util.spec_from_file_location("tilelang.testing.perf_regression", module_path)
 	assert spec is not None and spec.loader is not None
@@ -16,9 +17,7 @@ def _load_perf_module(monkeypatch):
 	spec.loader.exec_module(module)
 
 	tilelang_pkg = types.ModuleType("tilelang")
-	tilelang_pkg.__path__ = []  # type: ignore[attr-defined]
 	testing_pkg = types.ModuleType("tilelang.testing")
-	testing_pkg.__path__ = []  # type: ignore[attr-defined]
 	testing_pkg.process_func = module.process_func  # type: ignore[attr-defined]
 	testing_pkg.regression = module.regression  # type: ignore[attr-defined]
 	testing_pkg.perf_regression = module  # type: ignore[attr-defined]
@@ -61,7 +60,8 @@ def test_regression_all_uses_pytest_wrapper(monkeypatch, tmp_path):
 
 	calls: dict[str, list[str]] = {}
 
-	def fake_pytest_main(args, plugins=None):
+	def fake_pytest_main(args, _plugins=None):
+		# _plugins unused in mock; kept for signature compatibility with pytest.main
 		calls["args"] = args
 		module_vars = runpy.run_path(args[0])
 		for name, fn in module_vars.items():
