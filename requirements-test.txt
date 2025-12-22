@@ -32,3 +32,4 @@ tornado
 wheel
 matplotlib
 seaborn
+pandas

@@ -14,6 +14,12 @@ try:
 except Exception:  # pragma: no cover
 	tabulate = None  # type: ignore
 
+try:
+	from tqdm import tqdm
+except ImportError:
+	def tqdm(iterable, **kwargs):  # type: ignore
+		return iterable
+
 @dataclass(frozen=True)
 class PerfResult:
 	name: str
@@ -145,13 +151,13 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
 
 	bench_files = _discover_bench_files(root)
 	if not bench_files:
-		raise RuntimeError(f"No benchmark drivers found under: {root}")
+		raise RuntimeError(f"No drivers found under: {root}")
 
 	_reset_results()
 	merged: dict[str, float] = {}
 	failures: list[str] = []
 
-	for bench_file in bench_files:
+	for bench_file in tqdm(bench_files, desc="Running regression tests ..."):
 		proc = subprocess.run(
 			[sys.executable, str(bench_file)],
 			cwd=str(bench_file.parent),
@@ -187,6 +193,11 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
 			print("# ---")
 			for line in msg.splitlines():
 				print(f"# {line}")
+
+	fmt = os.environ.get("TL_PERF_REGRESSION_FORMAT", "text").strip().lower()
+	if fmt == "json":
+		print(_RESULTS_JSON_PREFIX + json.dumps(merged, separators=(",", ":")))
+		return
 
 	rows = [[k, merged[k]] for k in sorted(merged.keys())]
 	headers = ["File", "Latency"]
