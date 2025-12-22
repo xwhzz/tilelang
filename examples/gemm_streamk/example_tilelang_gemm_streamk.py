@@ -217,13 +217,11 @@ def run_regression_perf():
         64,
     )
     b_c = torch.zeros((m, n), device="cuda", dtype=torch.float16)
-    kernel(A, B, b_c)
+    torch.cuda.synchronize()
+
     from tilelang.profiler import do_bench
 
-    def run_kernel_only():
-        kernel(A, B, b_c)
-
-    return do_bench(run_kernel_only, warmup=10, rep=100, backend="cupti")
+    return do_bench(lambda: kernel(A, B, b_c), warmup=10, rep=100, backend="cupti")
 
 
 if __name__ == "__main__":
