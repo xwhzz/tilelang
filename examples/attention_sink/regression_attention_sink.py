@@ -22,7 +22,9 @@ def regression_example_mha_sink_fwd_bhsd_wgmma_pipelined():
 
 def regression_example_mha_sink_fwd_bhsd_wgmma_pipelined_sliding_window():
     tilelang.testing.process_func(
-        example_mha_sink_fwd_bhsd_wgmma_pipelined.run_regression_perf, "regression_example_mha_sink_fwd_bhsd_wgmma_pipelined_sliding_window", window_size=128
+        example_mha_sink_fwd_bhsd_wgmma_pipelined.run_regression_perf,
+        "regression_example_mha_sink_fwd_bhsd_wgmma_pipelined_sliding_window",
+        window_size=128,
     )
 
 
@@ -32,7 +34,9 @@ def regression_example_gqa_sink_fwd_bhsd_wgmma_pipelined():
 
 def regression_example_gqa_sink_fwd_bhsd_wgmma_pipelined_sliding_window():
     tilelang.testing.process_func(
-        example_gqa_sink_fwd_bhsd_wgmma_pipelined.run_regression_perf, "regression_example_gqa_sink_fwd_bhsd_wgmma_pipelined_sliding_window", window_size=128
+        example_gqa_sink_fwd_bhsd_wgmma_pipelined.run_regression_perf,
+        "regression_example_gqa_sink_fwd_bhsd_wgmma_pipelined_sliding_window",
+        window_size=128,
     )
 
 

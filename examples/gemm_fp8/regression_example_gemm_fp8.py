@@ -15,5 +15,6 @@ def regression_example_tilelang_gemm_fp8_intrinsic():
 def regression_example_tilelang_gemm_fp8():
     tilelang.testing.process_func(example_tilelang_gemm_fp8.run_regression_perf)
 
+
 if __name__ == "__main__":
     tilelang.testing.regression()

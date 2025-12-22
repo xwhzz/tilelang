@@ -1,3 +1,4 @@
+import contextlib
 import subprocess
 import re
 import os
@@ -19,21 +20,20 @@ OUT_MD = os.environ.get("PERF_REGRESSION_MD", "regression_result.md")
 OUT_PNG = os.environ.get("PERF_REGRESSION_PNG", "regression_result.png")
 _RESULTS_JSON_PREFIX = "__TILELANG_PERF_RESULTS_JSON__="
 
+
 def parse_output(output):
     for line in output.splitlines():
         if line.startswith(_RESULTS_JSON_PREFIX):
-            return json.loads(line[len(_RESULTS_JSON_PREFIX):])
-    
+            return json.loads(line[len(_RESULTS_JSON_PREFIX) :])
+
     # Fallback to regex parsing
     data = {}
     for line in output.split("\n"):
         line = line.strip()
         m = re.match(r"\|\s*([^\|]+)\s*\|\s*([0-9\.]+)\s*\|", line)
         if m is not None:
-            try:
+            with contextlib.suppress(ValueError):
                 data[m.group(1)] = float(m.group(2))
-            except ValueError:
-                pass
     return data
 
 

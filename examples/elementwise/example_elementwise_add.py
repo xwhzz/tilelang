@@ -63,11 +63,9 @@ def run_regression_perf():
     b = torch.randn(M, N, dtype=torch.float32, device="cuda")
     config = {"block_M": 32, "block_N": 32, "threads": 128}
     kernel = elementwise_add(M, N, **config, in_dtype="float32", out_dtype="float32")
+    from tilelang.profiler import do_bench
 
-    def run_kernel_only():
-        kernel(a, b)
-
-    return do_bench(run_kernel_only, warmup=10, rep=100, backend="cupti")
+    return do_bench(lambda: kernel(a, b), warmup=10, rep=100, backend="cupti")
 
 
 if __name__ == "__main__":

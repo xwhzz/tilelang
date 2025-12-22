@@ -18,6 +18,9 @@ __all__ = [
     "requires_llvm",
     "main",
     "requires_cuda_compute_version",
+    "regression_all",
+    "process_func",
+    "regression",
 ] + [f"requires_cuda_compute_version_{op}" for op in ("ge", "gt", "le", "lt", "eq")]
 
 

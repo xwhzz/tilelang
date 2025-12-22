@@ -17,10 +17,9 @@ def regression_fp8_lighting_indexer():
 def regression_sparse_mla_fwd():
     tilelang.testing.process_func(sparse_mla_fwd.run_regression_perf, S=256, SKV=1024, H=64, HKV=1, DQK=576, DV=512, topk=256)
 
+
 def regression_sparse_mla_fwd_pipelined():
-    tilelang.testing.process_func(
-        sparse_mla_fwd_pipelined.run_regression_perf, S=256, SKV=512, H=64, HKV=1, DQK=576, DV=512, topk=256
-    )
+    tilelang.testing.process_func(sparse_mla_fwd_pipelined.run_regression_perf, S=256, SKV=512, H=64, HKV=1, DQK=576, DV=512, topk=256)
 
 
 def regression_sparse_mla_bwd():

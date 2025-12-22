@@ -9,15 +9,11 @@ def regression_example_tilelang_block_sparse_attn():
 
 
 def regression_example_tilelang_sparse_gqa_decode_varlen_indice():
-    tilelang.testing.process_func(
-        example_tilelang_sparse_gqa_decode_varlen_indice.run_regression_perf, batch=1, max_cache_seqlen=2048
-    )
+    tilelang.testing.process_func(example_tilelang_sparse_gqa_decode_varlen_indice.run_regression_perf, batch=1, max_cache_seqlen=2048)
 
 
 def regression_example_tilelang_sparse_gqa_decode_varlen_mask():
-    tilelang.testing.process_func(
-        example_tilelang_sparse_gqa_decode_varlen_mask.run_regression_perf, batch=1, max_cache_seqlen=2048
-    )
+    tilelang.testing.process_func(example_tilelang_sparse_gqa_decode_varlen_mask.run_regression_perf, batch=1, max_cache_seqlen=2048)
 
 
 if __name__ == "__main__":
