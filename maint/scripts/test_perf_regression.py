@@ -48,7 +48,6 @@ def run_cmd(cmd, env=None):
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=None, text=True, env=full_env)
     if p.returncode != 0:
         raise RuntimeError(f"Command failed: {' '.join(cmd)}\nSTDOUT:\n{p.stdout}")
-    print(p.stdout)
     return p.stdout
 
 
