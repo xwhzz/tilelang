@@ -250,7 +250,7 @@ jobs:
             const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
 
             const body =
-              'Performance Benchmark Report\n' +
+              'Performance Regression Test Report\n' +
               '============================\n\n' +
               `Triggered by: @${context.payload.comment.user.login}\n` +
               `Workflow run: ${runUrl}\n\n` +
