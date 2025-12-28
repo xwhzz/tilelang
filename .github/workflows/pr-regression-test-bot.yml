@@ -31,24 +31,9 @@ env:
   PRE_COMMIT_HOME: "${{ github.workspace }}/.cache/pip/.pre-commit" # to be updated
 
 jobs:
-  pr-regression:
-    name: Performance regression test between PR and main
-    if: |
-      github.repository_owner == 'tile-ai' &&
-      github.event.issue.pull_request &&
-      (contains(github.event.comment.body, '@regression-perf'))
-    runs-on: ${{ matrix.runner.tags }}
-    strategy:
-      matrix:
-        runner:
-          - tags: [self-hosted, nvidia]
-            name: self-hosted-nvidia
-            toolkit: CUDA-12.8
-        python-version:
-          - "3.12"
-      fail-fast: false
-    timeout-minutes: 120
-
+  permissions-check:
+    name: Check bot permissions
+    runs-on: ubuntu-latest
     steps:
       - name: Get commenter permission
         id: perm
@@ -66,6 +51,25 @@ jobs:
           echo "Not authorized: permission=${{ steps.perm.outputs.permission }}"
           exit 1
 
+  pr-regression:
+    name: Performance regression test between PR and main
+    if: |
+      github.repository_owner == 'tile-ai' &&
+      github.event.issue.pull_request &&
+      (contains(github.event.comment.body, '@regression-perf'))
+    needs: [permissions-check]
+    runs-on: ${{ matrix.runner.tags }}
+    strategy:
+      matrix:
+        runner:
+          - tags: [self-hosted, nvidia]
+            name: self-hosted-nvidia
+            toolkit: CUDA-12.8
+        python-version:
+          - "3.12"
+      fail-fast: false
+    timeout-minutes: 120
+    steps:
       - name: Checkout repository
         uses: actions/checkout@v6
         with:
@@ -185,6 +189,7 @@ jobs:
 
           uv pip install -v -r requirements-test.txt
           uv pip install -v .
+          rm -rf tilelang build
 
       - name: Clear uv cache for self-hosted runners (if setup failed)
         if: >-
