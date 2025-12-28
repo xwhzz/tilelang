@@ -111,7 +111,7 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
         if proc.returncode != 0:
             failures.append(f"{bench_file.relative_to(root)}\nSTDOUT:\n{proc.stdout}\nSTDERR:\n{proc.stderr}")
             continue
-        
+
         parsed = _parse_table(proc.stdout)
         for k, v in parsed.items():
             # First writer wins to keep stable behavior if duplicates happen.
@@ -143,6 +143,7 @@ def regression_all(examples_root: str | os.PathLike[str] | None = None) -> None:
             print(f"| {name} | {latency} |")
     else:
         print(tabulate(rows, headers=headers, tablefmt="github", stralign="left", numalign="decimal"))
+
 
 if __name__ == "__main__":
     regression_all()

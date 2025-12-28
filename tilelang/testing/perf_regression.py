@@ -8,6 +8,7 @@ from typing import Any, Callable
 from collections.abc import Sequence
 import warnings
 
+
 @dataclass(frozen=True)
 class PerfResult:
     name: str
