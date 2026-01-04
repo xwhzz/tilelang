@@ -1,267 +1,395 @@
 from __future__ import annotations
-from tvm import tir, IRModule
-from tvm.tir import (PyStmtExprMutator, PyStmtExprVisitor, For, PrimFunc, BufferLoad, Var, Evaluate)
-from tvm.tir.stmt_functor import pre_order_visit
-import math
+
+import itertools
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
+
 from numpy.random import permutation
+from tvm import tir, IRModule
+from tvm.tir import (
+    PyStmtExprMutator,
+    PyStmtExprVisitor,
+    For,
+    PrimFunc,
+    BufferLoad,
+    Var,
+    Evaluate,
+)
+from tvm.tir.stmt_functor import pre_order_visit
+
 from .trace import TraceEvent, GeneralizedL2Simulator
 
 _OP_TILEOP_COPY = tir.op.Op.get("tl.copy")
 
-_TEMPLATE = """
+
+@dataclass
+class SimulatorConfig:
+    """Configuration for the L2 cache simulator."""
+
+    sm_count: int = 114
+    panel_width: int = 1
+    l2_cap_bytes: int = 50 * 1024 * 1024
+    num_partitions: int = 2
+    assoc: int = 8
+    line_bytes: int = 128
+
+
+_TEMPLATE = """\
 def _generate_trace(coords_list):
     trace = []
-    Stride_M = {sm_count} // {pannel}
-    Stride_N = {pannel}
-            
-    chunk_size = Stride_M * Stride_N
+    stride_major = {sm_count} // {panel_width}
+    stride_minor = {panel_width}
+
+    chunk_size = stride_major * stride_minor
     total_blocks = len(coords_list)
-    
+
     for i in range(0, total_blocks, chunk_size):
         chunk = coords_list[i : min(i + chunk_size, total_blocks)]
-        
+
         permuted_indices = permutation(len(chunk))
-        
+
 {code}
     return trace
 
 trace = _generate_trace(coords_list)
 
 simulator = GeneralizedL2Simulator(
-    l2_cap_bytes=50*1024*1024,
-    num_partitions=2, 
-    assoc=8, 
-    line_bytes=128
+    l2_cap_bytes={l2_cap_bytes},
+    num_partitions={num_partitions},
+    assoc={assoc},
+    line_bytes={line_bytes}
 )
 
 simulator.run(trace)
 hit_rate, l2_io, ddr_io = simulator.get_io_metrics()
-print(hit_rate)
+_result = (hit_rate, l2_io, ddr_io)
 """
 
+
+def _collect_global_tensors(buffer_map: dict) -> set[Var]:
+    """Extract global tensor data pointers from a buffer map."""
+    global_tensors = set()
+    for buf in buffer_map.values():
+        if buf.scope() == "global":
+            global_tensors.add(buf.data)
+    return global_tensors
+
+
 class CoordinateGenerator:
-    def __init__(self, sm_count, swizzle_config=None):
-        """
-        sm_count: Total number of SMs (used for stride calculation)
-        swizzle_config: Dict defining which dims are swizzled.
-                        e.g., {'major': 'by', 'minor': 'bx', 'panel_width': 1}
-                        If None, returns simple linear rasterization.
+    """Generates coordinates for block execution with optional swizzling.
+
+    Supports both linear rasterization and swizzled patterns that mimic
+    GPU hardware execution order.
+    """
+
+    def __init__(
+        self,
+        sm_count: int,
+        swizzle_config: dict[str, Any] | None = None,
+    ) -> None:
+        """Initialize the coordinate generator.
+
+        Args:
+            sm_count: Total number of SMs (used for stride calculation).
+            swizzle_config: Dict defining which dims are swizzled.
+                e.g., {'major': 'by', 'minor': 'bx', 'panel_width': 1}
+                If None, returns simple linear rasterization.
         """
         self.sm_count = sm_count
         self.swizzle_config = swizzle_config
 
-    def generate(self, dims_config):
+    def generate(self, dims_config: dict[str, int]) -> list[dict[str, int]]:
+        """Generate coordinates based on dimension configuration.
+
+        Args:
+            dims_config: Dict defining the grid size for each dimension.
+                e.g., {'bx': 16, 'by': 8, 'bz': 1}
+
+        Returns:
+            List of coordinate dictionaries.
         """
-        dims_config: Dict defining the grid size for each dimension.
-                     e.g., {'bx': 16, 'by': 8, 'bz': 1}
-                     Keys can be any string identifier.
-        """
-        # 1. Identify Swizzle Dimensions vs. Outer Dimensions
-        if self.swizzle_config:
-            major_name = self.swizzle_config['major']
-            minor_name = self.swizzle_config['minor']
-            panel_width = self.swizzle_config.get('panel_width', 1)
-            
-            # Calculate Strides for the swizzled dims
-            stride_major = self.sm_count // panel_width
-            stride_minor = panel_width
-            
-            # Extract grid limits for swizzled dims
-            grid_major = dims_config[major_name]
-            grid_minor = dims_config[minor_name]
-        else:
-            # Fallback if no swizzling needed
+        if not self.swizzle_config:
             return self._linear_rasterization(dims_config)
 
-        # 2. Generate Swizzled 2D Plane
-        # We generate the list of (major, minor) tuples first
+        major_name = self.swizzle_config["major"]
+        minor_name = self.swizzle_config["minor"]
+        panel_width = self.swizzle_config.get("panel_width", 1)
+
+        stride_major = self.sm_count // panel_width
+        stride_minor = panel_width
+
+        grid_major = dims_config[major_name]
+        grid_minor = dims_config[minor_name]
+
+        swizzled_plane = self._generate_swizzled_plane(
+            grid_major, grid_minor, stride_major, stride_minor
+        )
+
+        other_dims = [k for k in dims_config if k not in (major_name, minor_name)]
+
+        return self._combine_with_outer_dims(
+            swizzled_plane, major_name, minor_name, other_dims, dims_config
+        )
+
+    def _generate_swizzled_plane(
+        self,
+        grid_major: int,
+        grid_minor: int,
+        stride_major: int,
+        stride_minor: int,
+    ) -> list[tuple[int, int]]:
+        """Generate swizzled 2D coordinates."""
         swizzled_plane = []
         major_start, minor_start = 0, 0
-        
-        # Note: Using 0-based indexing internally
+
         while major_start < grid_major and minor_start < grid_minor:
             major_end = min(major_start + stride_major, grid_major)
             minor_end = min(minor_start + stride_minor, grid_minor)
-            
+
             for maj in range(major_start, major_end):
                 for min_ in range(minor_start, minor_end):
                     swizzled_plane.append((maj, min_))
-            
+
             major_start = major_end
             if major_start >= grid_major:
                 major_start = 0
                 minor_start = minor_end
 
-        # 3. Handle Remaining Dimensions (Cartesian Product)
-        # Identify dims that are NOT involved in swizzling (e.g., 'bz', 'batch')
-        other_dims = [k for k in dims_config if k not in [major_name, minor_name]]
-        
+        return swizzled_plane
+
+    def _combine_with_outer_dims(
+        self,
+        swizzled_plane: list[tuple[int, int]],
+        major_name: str,
+        minor_name: str,
+        other_dims: list[str],
+        dims_config: dict[str, int],
+    ) -> list[dict[str, int]]:
+        """Combine swizzled 2D plane with remaining dimensions via Cartesian product."""
+        if not other_dims:
+            return [
+                {major_name: maj, minor_name: min_} for maj, min_ in swizzled_plane
+            ]
+
         final_coords = []
-        
-        # Recursive function to combine swizzled 2D plane with other dimensions
-        def recurse_dims(current_dict, remaining_dims):
-            if not remaining_dims:
-                # Base case: All outer dims set, now iterate the swizzled plane
-                for (maj_val, min_val) in swizzled_plane:
-                    # Create the final point dictionary
-                    point = current_dict.copy()
-                    point[major_name] = maj_val
-                    point[minor_name] = min_val
-                    final_coords.append(point)
-                return
+        other_ranges = [range(dims_config[dim]) for dim in other_dims]
 
-            # Recursive step: Iterate next outer dimension
-            dim_key = remaining_dims[0]
-            dim_size = dims_config[dim_key]
-            for i in range(dim_size):
-                current_dict[dim_key] = i
-                recurse_dims(current_dict, remaining_dims[1:])
+        for combination in itertools.product(*other_ranges):
+            outer_dict = dict(zip(other_dims, combination))
+            for maj_val, min_val in swizzled_plane:
+                point = outer_dict.copy()
+                point[major_name] = maj_val
+                point[minor_name] = min_val
+                final_coords.append(point)
 
-        recurse_dims({}, other_dims)
-        
         return final_coords
 
-    def _linear_rasterization(self, dims_config):
-        """Helper for non-swizzled simple iteration"""
-        import itertools
+    def _linear_rasterization(
+        self, dims_config: dict[str, int]
+    ) -> list[dict[str, int]]:
+        """Generate coordinates via simple linear iteration."""
         keys = list(dims_config.keys())
         ranges = [range(dims_config[k]) for k in keys]
-        
-        final_coords = []
-        for combination in itertools.product(*ranges):
-            point = {k: v for k, v in zip(keys, combination)}
-            final_coords.append(point)
-        return final_coords
+
+        return [
+            dict(zip(keys, combination))
+            for combination in itertools.product(*ranges)
+        ]
+
+
+class _CodeBuilder:
+    """Helper for building indented Python code strings."""
+
+    def __init__(self, base_indent: int = 2) -> None:
+        self._lines: list[str] = []
+        self._indent = base_indent
+
+    @contextmanager
+    def indented(self):
+        """Context manager for indented code blocks."""
+        self._indent += 1
+        try:
+            yield
+        finally:
+            self._indent -= 1
+
+    def add_line(self, line: str) -> None:
+        """Add a line with current indentation."""
+        self._lines.append(" " * self._indent * 4 + line)
+
+    def get_code(self) -> str:
+        """Return the generated code."""
+        return "\n".join(self._lines) + "\n" if self._lines else ""
+
 
 @tir.functor.mutator
 class _TIREmitter(PyStmtExprMutator):
+    """TIR mutator that filters operations involving global memory."""
+
     global_tensor: set[Var]
 
-    def __init__(self, buffer_map) -> None:
+    def __init__(self, buffer_map: dict) -> None:
         super().__init__()
-        self.global_tensor = set()
-        for _, buf in buffer_map.items():
-            if buf.scope() == "global":
-                self.global_tensor.add(buf.data)
-    
+        self.global_tensor = _collect_global_tensors(buffer_map)
+
     def visit_call_(self, op):
-        if op.op == _OP_TILEOP_COPY:
-            is_in_global = False
-            def in_global(node):
-                nonlocal is_in_global
-                if isinstance(node, BufferLoad):
-                    if node.buffer.data in self.global_tensor:
-                        is_in_global = True
-                        return False
-                return True
-            pre_order_visit(Evaluate(op), in_global)
-            if is_in_global:
-                return op
+        if op.op != _OP_TILEOP_COPY:
             return 0
-        return 0
-    
+
+        is_in_global = False
+
+        def check_global(node):
+            nonlocal is_in_global
+            if isinstance(node, BufferLoad):
+                if node.buffer.data in self.global_tensor:
+                    is_in_global = True
+                    return False
+            return True
+
+        pre_order_visit(Evaluate(op), check_global)
+        return op if is_in_global else 0
+
+
 @tir.functor.visitor
 class _PyPrinter(PyStmtExprVisitor):
+    """TIR visitor that generates Python trace code."""
+
     code: str
     var_thread_mapping: dict[Var, int]
     global_tensor: set[Var]
 
-    def __init__(self, buffer_map) -> None:
+    def __init__(self, buffer_map: dict) -> None:
         super().__init__()
-        self.code = ""
+        self._builder = _CodeBuilder(base_indent=2)
         self.var_thread_mapping = {}
-        self.global_tensor = set()
-        for _, buf in buffer_map.items():
-            if buf.scope() == "global":
-                self.global_tensor.add(buf.data)
-        self.indent = 2
-    
-    def print_indent(self):
-        self.code += " " * self.indent * 4
-    
-    def begin_scope(self):
-        self.indent += 1
-    
-    def end_scope(self):
-        self.indent -= 1
-    
-    def visit_attr_stmt_(self, op):
+        self.global_tensor = _collect_global_tensors(buffer_map)
+
+    @property
+    def code(self) -> str:
+        return self._builder.get_code()
+
+    def visit_attr_stmt_(self, op) -> None:
         if op.attr_key == "thread_extent":
             if "blockIdx" in op.node.thread_tag:
-                _n = int(op.value)
-                self.var_thread_mapping[op.node.var] = _n
+                self.var_thread_mapping[op.node.var] = int(op.value)
         self.visit_stmt(op.body)
-    
-    def visit_for_(self, op: For):
-        self.print_indent()
-        self.code += f"for {op.loop_var} in range({op.min}, {op.min + op.extent}):\n"
-        self.begin_scope()
-        self.visit_stmt(op.body)
-        self.end_scope()
-    
-    def visit_call_(self, op):
+
+    def visit_for_(self, op: For) -> None:
+        self._builder.add_line(
+            f"for {op.loop_var} in range({op.min}, {op.min + op.extent}):"
+        )
+        with self._builder.indented():
+            self.visit_stmt(op.body)
+
+    def visit_call_(self, op) -> None:
         src_scope = op.args[0].args[0].buffer.scope()
         dst_scope = op.args[1].args[0].buffer.scope()
+
         if src_scope == "global":
             global_region = op.args[0]
         elif dst_scope == "global":
             global_region = op.args[1]
         else:
             return
+
         buf_load = global_region.args[0]
         buf = buf_load.buffer
-        index = tuple(buf_load.indices)
+        indices = tuple(buf_load.indices)
         dtype_bytes = buf.dtype.bits // 8
-        index_str = str(index)
 
-        for k in self.var_thread_mapping:
-            index_str = index_str.replace(str(k), f"pt['{k}']")
-        extent = 1
+        index_str = str(indices)
+        for var in self.var_thread_mapping:
+            index_str = index_str.replace(str(var), f"pt['{var}']")
+
+        extent = dtype_bytes
         for dim in global_region.args[2:]:
             extent *= dim
 
-        extent *= dtype_bytes
-        self.print_indent()
-        self.code += f"for idx in permuted_indices:\n"
-        self.begin_scope()
-        self.print_indent()
-        self.code += f"pt = chunk[idx]\n"
-        self.print_indent()
-        self.code += f"trace.append(TraceEvent('{buf}', {index_str}, {extent}, is_write={bool(global_region.args[1] == 2)}))\n"
+        is_write = bool(global_region.args[1] == 2)
 
-        self.end_scope()
+        self._builder.add_line("for idx in permuted_indices:")
+        with self._builder.indented():
+            self._builder.add_line("pt = chunk[idx]")
+            self._builder.add_line(
+                f"trace.append(TraceEvent('{buf}', {index_str}, {extent}, "
+                f"is_write={is_write}))"
+            )
 
 
-def TraceEmitter(func: IRModule | PrimFunc) -> None:
+def trace_emitter(
+    func: IRModule | PrimFunc,
+    config: SimulatorConfig | None = None,
+) -> tuple[float, float, float]:
+    """Emit and execute a trace generation function for hardware simulation.
+
+    Given a TIR PrimFunc or IRModule, this function generates and executes
+    Python code that simulates the hardware execution order with swizzling,
+    running the trace through an L2 cache simulator.
+
+    Args:
+        func: The TIR function or module to analyze.
+        config: Simulator configuration. Uses defaults if not provided.
+
+    Returns:
+        A tuple of (hit_rate, l2_io, ddr_io) metrics from the simulation.
     """
-    Given a TIR PrimFunc or IRModule, emit and execute a trace generation
-    function that mimics the hardware execution order with swizzling.
-    The emitted code is printed out for inspection.
-    """
+    if config is None:
+        config = SimulatorConfig()
+
     if isinstance(func, IRModule):
         items = func.functions_items()
-        assert len(items) == 1, "Temporarily only support single function module"
+        if len(items) != 1:
+            raise ValueError(
+                f"Expected single function module, got {len(items)} functions"
+            )
         func = items[0][1]
+
     emitter = _TIREmitter(func.buffer_map)
     tir_code = emitter.visit_stmt(func.body)
 
     printer = _PyPrinter(func.buffer_map)
     printer.visit_stmt(tir_code)
-    dims = {}
-    for k, v in printer.var_thread_mapping.items():
-        dims[str(k)] = int(v)
 
+    dims = {str(k): int(v) for k, v in printer.var_thread_mapping.items()}
+
+    if len(dims) < 2:
+        raise ValueError(
+            f"Expected at least 2 block dimensions, got {len(dims)}: {list(dims.keys())}"
+        )
+
+    dim_keys = list(dims.keys())
     gen = CoordinateGenerator(
-        sm_count=114,
+        sm_count=config.sm_count,
         swizzle_config={
-            'major': list(dims.keys())[0],
-            'minor': list(dims.keys())[1],
-            'panel_width': 1})
+            "major": dim_keys[0],
+            "minor": dim_keys[1],
+            "panel_width": config.panel_width,
+        },
+    )
 
     coords_list = gen.generate(dims)
+
     code = _TEMPLATE.format(
-        sm_count = 114,
-        pannel = 1,
-        code = printer.code,
+        sm_count=config.sm_count,
+        panel_width=config.panel_width,
+        l2_cap_bytes=config.l2_cap_bytes,
+        num_partitions=config.num_partitions,
+        assoc=config.assoc,
+        line_bytes=config.line_bytes,
+        code=printer.code,
     )
-    exec(code)
+
+    exec_globals = {
+        "coords_list": coords_list,
+        "permutation": permutation,
+        "TraceEvent": TraceEvent,
+        "GeneralizedL2Simulator": GeneralizedL2Simulator,
+    }
+    exec(code, exec_globals)
+
+    print(exec_globals["_result"])
+
+
+# Backward compatibility alias
+TraceEmitter = trace_emitter
