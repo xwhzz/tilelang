@@ -145,7 +145,6 @@ class _ComputeIOCollector(PyStmtExprVisitor):
         l2_time = self._info[_StatisticType.L2] / self._arch.l2_bandwidth / _block_num * norm
         ## (single CTA view)
         l1_time = self._info[_StatisticType.L1] / self._arch.smem_bandwidth * norm
-        print(self._info[_StatisticType.TC_2])
         ## compute time
         tc_1_time = self._info[_StatisticType.TC_1] / self._arch.int8_flops * norm
         tc_2_time = self._info[_StatisticType.TC_2] / self._arch.fp16_tensor_flops * norm
@@ -195,15 +194,16 @@ class _ComputeIOCollector(PyStmtExprVisitor):
             pct = _safe_div(t, bound_time) * 100.0 if bound_time > 0 else 0.0
             raw = self._info.get(key, 0) * norm
             if kind == "mem":
-                data_str = _fmt_bytes(raw)
-                bw = _safe_div(raw, bound_time) / 1e9 if t > 0 else 0.0
-                bw_str = f"{bw:,.3f} GB/s" if bw else "-"
+                raw /= _block_num
+                data_str = _fmt_bytes(raw / _block_num)
+                bw = _safe_div(raw, bound_time) / 1e12 if t > 0 else 0.0
+                bw_str = f"{bw:,.3f} TB/s" if bw else "-"
             else:
             # compute: raw represents operation counts (ops)
                 ops = int(raw)
                 data_str = f"{ops:,} ops"
-                tp = _safe_div(ops, bound_time) / 1e9 if t > 0 else 0.0
-                bw_str = f"{tp:,.3f} GOP/s" if tp else "-"
+                tp = _safe_div(ops, bound_time) / 1e12 if t > 0 else 0.0
+                bw_str = f"{tp:,.3f} TOP/s" if tp else "-"
 
             enhanced.append([name, _fmt_time_s(t), f"{pct:5.1f}%", data_str, bw_str])
 
@@ -217,7 +217,6 @@ class _ComputeIOCollector(PyStmtExprVisitor):
 
 def ComputeIOCollector(func: IRModule | PrimFunc) -> None:
     result = l2_predict(func)
-    print(f"L2 Hit Rate Prediction: {result[0]:.6f}, l2 io: {(result[1])}, ddr io: {(result[2])}")
     if isinstance(func, IRModule):
         items = func.functions_items()
         assert len(items) == 1, "Temporarily only support single function module"
