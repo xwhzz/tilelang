@@ -1,11 +1,12 @@
 from __future__ import annotations
 from collections import defaultdict
 from enum import IntEnum, auto
+import math
 import tabulate
-from tvm import tir, DataType, IRModule
-from tvm.tir import (PyStmtExprVisitor, BufferStore, For, Buffer, PrimFunc, BufferLoad, IntImm, Call, AttrStmt)
+from tvm import tir, DataType, IRModule, arith
+from tvm.tir import (PyStmtExprVisitor, BufferStore, For, Buffer, PrimFunc, BufferLoad, IntImm, Call, AttrStmt, Var)
 from tilelang.arch import get_arch_config
-from .L2_hit_rate_flow_sim_reuse_distance import L2_hit_rate_flow_sim_reuse_distance
+from .trace_emitter import l2_predict
 
 class _StatisticType(IntEnum):
     TC_1 = auto() # 8bit
@@ -29,17 +30,21 @@ _map = {
 
 @tir.functor.visitor
 class _ComputeIOCollector(PyStmtExprVisitor):
-
-    def __init__(self) -> None:
+    def __init__(self, l2_result) -> None:
         super().__init__()
         self._info = defaultdict(float)
         self._simt_op = 0
         self._extent = 1
 
         self._arch = get_arch_config("H100_PCIE", profile="microbench")
-        self._l2_hit_rate = L2_hit_rate_flow_sim_reuse_distance(1024, 1024, 1024, 128, 128, 128, self._arch.l2_capacity, self._arch.sm_count, {'in1': [1,1,1,2], 'in2': [1,1,1,2], 'out1': [1,1,1,4]}, row_panel=1)
+        self._block_num = dict[Var, int]()
 
-        self._block_num = 1
+        self._scope = []
+        
+        self._l2_hitrate = l2_result[0]
+        self._info[_StatisticType.L2] = l2_result[1]
+        self._info[_StatisticType.L3] = l2_result[2]
+
 
     @staticmethod
     def _get_extent(region: Call) -> int:
@@ -76,7 +81,8 @@ class _ComputeIOCollector(PyStmtExprVisitor):
     def visit_attr_stmt_(self, op: AttrStmt) -> None:
         if op.attr_key == "thread_extent":
             if "blockIdx" in op.node.thread_tag:
-                self._block_num *= int(op.value)
+                _n = int(op.value)
+                self._block_num[op.node.var] = _n
         self.visit_stmt(op.body)
         
     def visit_for_(self, op: For) -> None:
@@ -89,33 +95,7 @@ class _ComputeIOCollector(PyStmtExprVisitor):
     
     def visit_call_(self, op) -> None:
         if op.op == tir.op.Op.get("tl.copy"):
-            src_region = op.args[0]
-            dst_region = op.args[1]
-            # src_dtype = self._get_core(src_region.args[0].buffer.dtype)
-            # dst_dtype = self._get_core(dst_region.args[0].buffer.dtype)
-            src_extent = self._get_extent(src_region)
-            dst_extent = self._get_extent(dst_region)
-            assert src_extent == dst_extent, "Mismatched copy extents."
-            src_scope = self._get_scope(src_region)
-            dst_scope = self._get_scope(dst_region)
-
-            src_dtype = src_region.args[0].buffer.dtype
-
-            # self._info[max(src_scope, dst_scope)] += src_extent * self._extent * src_region.args[0].buffer.dtype.bits // 8
-            io = int(src_extent * self._extent * src_dtype.bits // 8)
-            if src_scope == _StatisticType.L3:
-                # load L2 two partition:
-                self._info[_StatisticType.L2] += io * self._l2_hit_rate + io * (1 - self._l2_hit_rate) * 2
-                self._info[_StatisticType.L3] += io * (1 - self._l2_hit_rate)
-            elif dst_scope == _StatisticType.L3:
-                # store
-                self._info[_StatisticType.L2] += io * 2
-                self._info[_StatisticType.L3] += io
-
-                self._info[_StatisticType.L1] += io
-            # TODO: consider the overhead of dtype conversion
-            # if src_dtype != dst_dtype:
-            #     self._info[max(src_dtype, dst_dtype)] += src_extent * self._extent
+            ...
 
         elif op.op == tir.op.Op.get("tl.gemm_py") or op.op == tir.op.Op.get("tl.gemm"):
             left_dtype = op.args[0].args[0].buffer.dtype
@@ -125,19 +105,17 @@ class _ComputeIOCollector(PyStmtExprVisitor):
 
             assert left_type == right_type, "Mismatched gemm types."
 
-            self._info[left_type] += int(op.args[5] * op.args[6] * op.args[7] * 2 * self._extent)
+            self._info[left_type] += int(op.args[5] * op.args[6] * op.args[7] * 2) * self._extent
             if self._get_scope(op.args[0]) == _StatisticType.L1:
                 self._info[_StatisticType.L1] += int(self._get_extent(op.args[0]) * self._extent * left_dtype.bits // 8 * 2)
             if self._get_scope(op.args[1]) == _StatisticType.L1:
                 self._info[_StatisticType.L1] += int(self._get_extent(op.args[1]) * self._extent * right_dtype.bits // 8 * 2)
             
-
-        
         elif op.op == tir.op.Op.get("tl.fill"):
             dtype = op.args[0].args[0].buffer.dtype
             _type = self._get_core(dtype)
             self._info[_type] += int(self._get_extent(op.args[0]) * self._extent)
-            
+        # 
         elif op.op == tir.op.Op.get("tir.exp2"): # sfu
             self._info[_StatisticType.SFU] += int(1 * self._extent)
         return super().visit_call_(op)
@@ -160,14 +138,14 @@ class _ComputeIOCollector(PyStmtExprVisitor):
         return self._info
     
     def post_data(self) -> None:
-        norm = (self._block_num + self._arch.sm_count - 1) // self._arch.sm_count * self._arch.sm_count
-
-
-        ## memory time
-        l3_time = self._info[_StatisticType.L3] / self._arch.ddr_bandwidth * norm
-        l2_time = self._info[_StatisticType.L2] / self._arch.l2_bandwidth * norm
+        _block_num = math.prod(self._block_num.values()) if self._block_num else 1
+        norm = math.ceil(_block_num / self._arch.sm_count) * self._arch.sm_count
+        ## memory time (all CTAs view)
+        l3_time = self._info[_StatisticType.L3] / self._arch.ddr_bandwidth / _block_num * norm 
+        l2_time = self._info[_StatisticType.L2] / self._arch.l2_bandwidth / _block_num * norm
+        ## (single CTA view)
         l1_time = self._info[_StatisticType.L1] / self._arch.smem_bandwidth * norm
-
+        print(self._info[_StatisticType.TC_2])
         ## compute time
         tc_1_time = self._info[_StatisticType.TC_1] / self._arch.int8_flops * norm
         tc_2_time = self._info[_StatisticType.TC_2] / self._arch.fp16_tensor_flops * norm
@@ -238,11 +216,12 @@ class _ComputeIOCollector(PyStmtExprVisitor):
 
 
 def ComputeIOCollector(func: IRModule | PrimFunc) -> None:
+    result = l2_predict(func)
+    print(f"L2 Hit Rate Prediction: {result[0]:.6f}, l2 io: {(result[1])}, ddr io: {(result[2])}")
     if isinstance(func, IRModule):
         items = func.functions_items()
         assert len(items) == 1, "Temporarily only support single function module"
         func = items[0][1]
-    collector = _ComputeIOCollector()
+    collector = _ComputeIOCollector(result)
     collector.visit_stmt(func.body)
-
     collector.post_data()
