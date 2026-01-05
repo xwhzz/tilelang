@@ -368,8 +368,8 @@ def l2_predict(
     gen = CoordinateGenerator(
         sm_count=config.sm_count,
         swizzle_config={
-            "major": dim_keys[0],
-            "minor": dim_keys[1],
+            "major": dim_keys[1],
+            "minor": dim_keys[0],
             "panel_width": config.panel_width,
         },
     )
