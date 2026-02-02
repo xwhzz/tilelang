@@ -183,6 +183,7 @@ file(GLOB TILE_LANG_SRCS
   src/target/rt_mod_cpp.cc
   # intrin_rule doesn't have system dependency
   src/target/intrin_rule*.cc
+  src/schedule/primitives/*.cc
 )
 
 # Always include CPU-safe runtime helpers
