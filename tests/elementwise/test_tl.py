@@ -20,7 +20,7 @@ loops = sch.get_loops(main_block)
 
 fused_loop = sch.fuse(*loops)
 
-outer, inner = sch.split(fused_loop, factors=[None, 16384])
+outer, inner = sch.split(fused_loop, factors=[None, 8192])
 
 sch.bind(outer, "blockIdx.x")
 
@@ -44,7 +44,7 @@ mod = tvm.tir.transform.ConvertBlocksToOpaque()(mod)
 mod = tvm.tir.transform.CompactBufferAllocation()(mod)
 mod = tvm.tir.transform.LowerOpaqueBlock()(mod)
 
-kernel = tilelang.compile(mod["main"], execution_backend="cython")
+kernel = tilelang.compile(mod["main"])
 
 # print(kernel.get_host_source())
 import torch
@@ -55,7 +55,11 @@ c = torch.empty(shape).cuda()
 
 kernel(a, b, scale, c)
 
-ref_c = a + b * scale
+@torch.compile()
+def fntorch(a, b, scale):
+    return a + b * scale
+
+ref_c = fntorch(a, b, scale)
 
 torch.testing.assert_close(c, ref_c)
 
@@ -67,15 +71,14 @@ tilelang_time = do_bench(lambda: kernel(a, b, scale, c))
 print(f"TileLang kernel time: {tilelang_time} ms")
 
 # Compare with Torch kernel
-torch_time = do_bench(lambda: a + b * scale)
+torch_time = do_bench(lambda: fntorch(a, b, scale))
 print(f"Torch kernel time: {torch_time} ms")
 
 print(f"Speedup: {torch_time / tilelang_time}x")
 
 """
-Loading tilelang libs from dev root: /data/xwh/imp/tilelang/build
 Test passed!
-TileLang kernel time: 0.0636356920003891 ms
-Torch kernel time: 0.08889956027269363 ms
-Speedup: 1.397007834410759x
+TileLang kernel time: 0.06295264512300491 ms
+Torch kernel time: 0.06328392028808594 ms
+Speedup: 1.0052622914324527x
 """
