@@ -4,14 +4,12 @@ import tilelang
 from tvm.tir.stmt_functor import ir_transform
 from tilelang.schedule import Schedule
 
-row = 1024
-col = 1024
+shape = (6, 1024, 1024)
 
-a = te.placeholder((row, col, ), name="a")
-b = te.placeholder((row, col, ), name="b")
-scale = te.placeholder((row, col, ), name="scale")
-
-c = te.compute(a.shape, lambda i, j: a[i, j] + b[i, j] * scale[i, j], name="c")
+a = te.placeholder(shape, name="a")
+b = te.placeholder(shape, name="b")
+scale = te.placeholder(shape, name="scale")
+c = te.compute(a.shape, lambda i, j, k: a[i, j, k] + b[i, j, k] * scale[i, j, k], name="c")
 func = te.create_prim_func([a, b, scale, c])
 
 sch = Schedule(func)
@@ -46,14 +44,14 @@ mod = tvm.tir.transform.ConvertBlocksToOpaque()(mod)
 mod = tvm.tir.transform.CompactBufferAllocation()(mod)
 mod = tvm.tir.transform.LowerOpaqueBlock()(mod)
 
-kernel = tilelang.compile(mod["main"])
+kernel = tilelang.compile(mod["main"], execution_backend="cython")
 
+# print(kernel.get_host_source())
 import torch
-a = torch.randn(row, col).cuda()
-b = torch.randn(row, col).cuda()
-scale = torch.randn(row, col).cuda()
-c = torch.empty(row, col).cuda()
-
+a = torch.randn(shape).cuda()
+b = torch.randn(shape).cuda()
+scale = torch.randn(shape).cuda()
+c = torch.empty(shape).cuda()
 
 kernel(a, b, scale, c)
 
@@ -62,3 +60,22 @@ ref_c = a + b * scale
 torch.testing.assert_close(c, ref_c)
 
 print("\033[92mTest passed!\033[0m")
+
+from tilelang.profiler import do_bench
+
+tilelang_time = do_bench(lambda: kernel(a, b, scale, c))
+print(f"TileLang kernel time: {tilelang_time} ms")
+
+# Compare with Torch kernel
+torch_time = do_bench(lambda: a + b * scale)
+print(f"Torch kernel time: {torch_time} ms")
+
+print(f"Speedup: {torch_time / tilelang_time}x")
+
+"""
+Loading tilelang libs from dev root: /data/xwh/imp/tilelang/build
+Test passed!
+TileLang kernel time: 0.0636356920003891 ms
+Torch kernel time: 0.08889956027269363 ms
+Speedup: 1.397007834410759x
+"""
