@@ -51,19 +51,12 @@ private:
   ThreadLauncher(int num_threads) : num_threads_(num_threads) {}
 
   Stmt VisitStmt_(const BlockNode *op) final {
-    auto extent = IntImm(DataType::Int(32), num_threads_);
-    IterVar iter_var(Range::FromMinExtent(0, extent),
-                     /*var=*/Var("tx"),
-                     /*iter_type=*/IterVarType::kThreadIndex,
-                     /*thread_tag=*/"threadIdx.x");
-    ffi::String attr_key = "thread_extent";
-    auto new_attr_stmt = AttrStmt(/*node=*/std::move(iter_var),
-                    /*attr_key=*/std::move(attr_key),
-                    /*value=*/extent,
-                    /*body=*/std::move(op->body));
-    ObjectPtr<BlockNode> n = CopyOnWrite(op);
-    n->body = std::move(new_attr_stmt);
-    return Stmt(n);
+    auto new_var = Var("tx");
+    IterVar thread_iter(Range(nullptr), Var("threadIdx.x"), kThreadIndex, "threadIdx.x");
+    Stmt body = For(new_var, 0, num_threads_,
+                     ForKind::kThreadBinding, op->body,
+                     thread_iter, {}, std::nullopt);
+    return Block(ffi::Array<IterVar>(), {}, {}, {}, std::move(body));
   }
 
   int num_threads_;
@@ -89,6 +82,6 @@ TVM_FFI_STATIC_INIT_BLOCK() {
                         [](Schedule self, int num_threads) {
                           return LaunchThread(self->state(), num_threads);
                         });
-                    }
+}
 }  // namespace tir
 }  // namespace tvm
