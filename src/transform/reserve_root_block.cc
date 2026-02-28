@@ -70,14 +70,15 @@ class RootBlockReserver : public StmtExprMutator {
     }
 
     if (block_level_ == 0) {
-      // 最外层的我们不想让其也lower
       auto p_block = new_block.CopyOnWrite();
       p_block->name_hint = "tilelang_root";
-      // 遍历 alloc_buffers_，把它们添加到 new_block 的 alloc_buffers 中
       p_block->alloc_buffers = ffi::Array<Buffer>(allocated_buffers_.begin(), allocated_buffers_.end());
       p_block->body = std::move(body);
       Stmt block_realize = BlockRealize(ffi::Array<PrimExpr>(), std::move(predicate), std::move(new_block));
       
+      std::sort(thread_bindings_.begin(), thread_bindings_.end(),
+                [](const auto& t1, const auto& t2) { return std::get<3>(t1) < std::get<3>(t2); });
+
       for (auto it = thread_bindings_.rbegin(); it != thread_bindings_.rend(); ++it) {
         block_realize = MakeLaunchThread(std::get<0>(*it), std::get<1>(*it), std::get<2>(*it),
                                         std::get<3>(*it), std::move(block_realize));
