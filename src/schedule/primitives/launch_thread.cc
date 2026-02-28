@@ -16,72 +16,56 @@
  * specific language governing permissions and limitations
  * under the License.
  */
-#include <tvm/arith/analyzer.h>
-#include <tvm/arith/int_set.h>
-#include <tvm/arith/iter_affine_map.h>
-#include <tvm/node/serialization.h>
-#include <tvm/tir/analysis.h>
-#include <tvm/tir/function.h>
 #include <tvm/tir/op.h>
-#include <tvm/tir/schedule/instruction.h>
 #include <tvm/tir/schedule/schedule.h>
 #include <tvm/tir/schedule/state.h>
-#include <tvm/tir/schedule/trace.h>
 #include <tvm/tir/stmt_functor.h>
-#include <tvm/tir/utils.h>
 
-#include <string>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
+#include "tir/schedule/utils.h"
 
 namespace tvm {
 namespace tl {
 using namespace tir;
 
-class ThreadLauncher : public StmtExprMutator {
-public:
-  static PrimFunc Substitute(PrimFunc &f, int num_threads) {
-    auto rewriter = ThreadLauncher(num_threads);
-    f.CopyOnWrite()->body = rewriter(f->body);
-    return f;
-  }
+// ---------------------------------------------------------------------------
+// LaunchThread:  wrap a block's body in a For(kThreadBinding) loop.
+//
+// Uses the sref-tree–aware Replace() method so that the schedule state
+// (stmt2ref, block_info, …) stays consistent for subsequent primitives.
+// ---------------------------------------------------------------------------
+static void LaunchThread(ScheduleState self, const StmtSRef& block_sref,
+                         int num_threads) {
+  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
 
-private:
-  ThreadLauncher(int num_threads) : num_threads_(num_threads) {}
+  // Build the thread-bound loop wrapping the block body.
+  Var tx("tx");
+  IterVar thread_iter(Range(nullptr), Var("threadIdx.x"),
+                      kThreadIndex, "threadIdx.x");
+  Stmt new_body = For(tx, 0, num_threads, ForKind::kThreadBinding,
+                      block->body, thread_iter, {}, std::nullopt);
 
-  Stmt VisitStmt_(const BlockNode *op) final {
-    auto new_var = Var("tx");
-    IterVar thread_iter(Range(nullptr), Var("threadIdx.x"), kThreadIndex, "threadIdx.x");
-    Stmt body = For(new_var, 0, num_threads_,
-                     ForKind::kThreadBinding, op->body,
-                     thread_iter, {}, std::nullopt);
-    return Block(ffi::Array<IterVar>(), {}, {}, {}, std::move(body));
-  }
+  // Copy the block, replace its body with the new loop.
+  ObjectPtr<BlockNode> new_block_node = ffi::make_object<BlockNode>(*block);
+  new_block_node->body = std::move(new_body);
+  Block new_block(new_block_node);
 
-  int num_threads_;
-};
-
-void LaunchThread(ScheduleState self, int num_threads) {
-  auto mod = self->mod;
-  for (const auto &[gvar, base_func] : mod->functions) {
-      if (auto opt = base_func.as<tir::PrimFunc>()) {
-        tir::PrimFunc func = opt.value();
-        func = ThreadLauncher::Substitute(func, num_threads);
-        mod.CopyOnWrite()->Update(gvar, func);
-        break;
-      }
-  }
-
-  self->mod = mod;
+  // Tell Replace to keep the sref for this block.
+  ffi::Map<Block, Block> block_sref_reuse;
+  block_sref_reuse.Set(ffi::GetRef<Block>(block), new_block);
+  self->Replace(block_sref, new_block, block_sref_reuse);
 }
 
+// ---------------------------------------------------------------------------
+// FFI Registration
+// ---------------------------------------------------------------------------
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
-  refl::GlobalDef().def("tl.schedule.ScheduleLaunchThread",
-                        [](Schedule self, int num_threads) {
-                          return LaunchThread(self->state(), num_threads);
-                        });
+  refl::GlobalDef().def(
+      "tl.schedule.ScheduleLaunchThread",
+      [](Schedule self, const BlockRV& block_rv, int num_threads) {
+        LaunchThread(self->state(), self->GetSRef(block_rv), num_threads);
+      });
 }
-}  // namespace tir
+
+}  // namespace tl
 }  // namespace tvm
