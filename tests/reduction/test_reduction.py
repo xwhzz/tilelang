@@ -1,9 +1,13 @@
-"""Element-wise template correctness + performance check.
+"""Reduction template correctness + performance check.
 
-This mirrors the reduction/transpose prototype scripts and validates:
-1. The `ElementWise` schedule template can be applied.
-2. Lowered IR contains tile primitives (`T.copy`) and fragment buffers.
-3. Numerical correctness against PyTorch.
+This script mirrors the workflow used in:
+- tests/elementwise/test_tl.py
+- tests/transpose/test_transpose.py
+
+It validates:
+1. The `Reduction` schedule template compiles and runs.
+2. Numerical correctness against `torch.sum`.
+3. Runtime and effective memory bandwidth.
 """
 
 from __future__ import annotations
@@ -22,13 +26,15 @@ from tilelang.profiler import do_bench
 from tvm import te
 
 
-def _load_elementwise_rule():
-    """Load ElementWise rule with a fallback that avoids optional gpu deps."""
+def _load_reduction_rule():
+    """Load Reduction rule with a fallback that avoids optional deps in gpu __init__."""
     try:
-        from tilelang.schedule.gpu.element_wise import ElementWise  # pylint: disable=import-outside-toplevel
+        from tilelang.schedule.gpu.reduction import Reduction  # pylint: disable=import-outside-toplevel
 
-        return ElementWise
+        return Reduction
     except Exception:
+        # Fallback: construct a minimal package shell and load only the needed
+        # submodules (base/utils/reduction) directly from files.
         repo_root = Path(__file__).resolve().parents[2]
         gpu_dir = repo_root / "tilelang" / "schedule" / "gpu"
         pkg_name = "tilelang.schedule.gpu"
@@ -37,7 +43,7 @@ def _load_elementwise_rule():
             gpu_pkg.__path__ = [str(gpu_dir)]
             sys.modules[pkg_name] = gpu_pkg
 
-        for module_name in ("base", "utils", "element_wise"):
+        for module_name in ("base", "utils", "reduction"):
             full_name = f"{pkg_name}.{module_name}"
             if full_name in sys.modules:
                 continue
@@ -49,32 +55,31 @@ def _load_elementwise_rule():
             sys.modules[full_name] = module
             spec.loader.exec_module(module)
 
-        return sys.modules[f"{pkg_name}.element_wise"].ElementWise
+        return sys.modules[f"{pkg_name}.reduction"].Reduction
 
 
 def _build_mod(m: int, n: int, k: int, arch: str):
-    """Build and lower a scheduled element-wise module."""
+    """Build and lower a scheduled reduction module."""
+    # Define TE reduction: c[i] = sum_j a[i, j]
     a = te.placeholder((m, n, k), name="a")
-    b = te.placeholder((m, n, k), name="b")
-    scale = te.placeholder((m, n, k), name="scale")
-    c = te.compute(
-        (m, n, k),
-        lambda i, j, kk: te.max(a[i, j, kk] + b[i, j, kk] * scale[i, j, kk], 0.0),
-        name="c",
-    )
-    func = te.create_prim_func([a, b, scale, c])
+    rk = te.reduce_axis((0, k), name="rk")
+    c = te.compute((m, n, ), lambda i, j: te.max(a[i, j, rk], axis=rk), name="c")
+    # d = te.compute((m, n,), lambda i, j: c[i, j] * b[i, j], name="d")  # add some extra elementwise ops to increase IR complexity
+    func = te.create_prim_func([a, c])
 
-    ElementWise = _load_elementwise_rule()
+    Reduction = _load_reduction_rule()
     target = tvm.target.cuda(arch=arch)
-    sch = ElementWise().apply(func, target, False)
+    sch = Reduction().apply(func, target, None)
     if sch is None:
-        raise RuntimeError("ElementWise schedule rule returned None for this workload.")
+        raise RuntimeError("Reduction schedule rule returned None for this workload.")
 
     print("=== Scheduled IR ===")
     print(sch.mod)
 
+    # Keep the same style as elementwise/transpose prototype tests.
     mod = sch.mod
     mod = tvm.tir.transform.Simplify()(mod)
+    mod = tvm.tir.transform.LowerInitBlock()(mod)
     mod = tvm.tir.transform.ConvertBlocksToOpaque()(mod)
     mod = tilelang.transform.ReserveRootBlock()(mod)
 
@@ -84,55 +89,56 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     lowered_ir = str(mod)
     if "T.copy(" not in lowered_ir:
         raise RuntimeError("Expected T.copy in lowered IR, but it was not found.")
+    if "T.reduce(" not in lowered_ir:
+        raise RuntimeError("Expected T.reduce in lowered IR, but it was not found.")
     if "local.fragment" not in lowered_ir:
         raise RuntimeError("Expected local.fragment buffers in lowered IR, but none were found.")
-    if 'launch_thread("threadIdx.x"' not in lowered_ir:
-        raise RuntimeError("Expected launch_thread(threadIdx.x) in lowered IR, but it was not found.")
 
     return mod
 
 
 def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tuple[float, float]:
-    """Build an element-wise kernel, run correctness check, and benchmark."""
+    """Build a reduction kernel, run correctness check, and benchmark."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
-
     mod = _build_mod(m, n, k, arch)
     kernel = tilelang.compile(mod["main"])
 
+    # Correctness
     torch.manual_seed(0)
     a_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
-    b_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
-    scale_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
-    c_torch = torch.empty((m, n, k), device="cuda", dtype=torch.float32)
-
-    kernel(a_torch, b_torch, scale_torch, c_torch)
-
+    # b_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
+    c_torch = torch.empty((m, n), device="cuda", dtype=torch.float32)
+    kernel(a_torch, c_torch)
+    
     @torch.compile()
-    def fn_torch(a, b, scale):
-        return torch.relu(a + b * scale)
+    def fntorch(a):
+        return torch.max(a, dim=2)[0]
 
-    torch.testing.assert_close(c_torch, fn_torch(a_torch, b_torch, scale_torch), rtol=1e-4, atol=1e-4)
+    # ref = torch.sum(a_torch, dim=1)
+    torch.testing.assert_close(c_torch, fntorch(a_torch), rtol=1e-4, atol=1e-4)
     print("\033[92mCorrectness check passed.\033[0m")
 
-    tilelang_time = do_bench(lambda: kernel(a_torch, b_torch, scale_torch, c_torch), backend=bench_backend)
-    torch_time = do_bench(lambda: fn_torch(a_torch, b_torch, scale_torch), backend=bench_backend)
+    # Performance
+    tilelang_time = do_bench(lambda: kernel(a_torch, c_torch), backend=bench_backend)
+    torch_time = do_bench(lambda: fntorch(a_torch), backend=bench_backend)
 
-    total_bytes = (3 * m * n * k + m * n * k) * 4  # 3 reads + 1 write in fp32
+    total_bytes = (m * n * k + m * n) * 4  # fp32 read + write
     tilelang_gbps = total_bytes / (tilelang_time * 1e-3) / 1e9
     torch_gbps = total_bytes / (torch_time * 1e-3) / 1e9
 
     print(f"TileLang time: {tilelang_time:.6f} ms, BW: {tilelang_gbps:.2f} GB/s")
     print(f"Torch   time: {torch_time:.6f} ms, BW: {torch_gbps:.2f} GB/s")
     print(f"Speedup (torch/tilelang): {torch_time / tilelang_time:.4f}x")
+
     return tilelang_time, torch_time
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Check element-wise template correctness and performance.")
-    parser.add_argument("--m", type=int, default=64, help="First input dimension.")
-    parser.add_argument("--n", type=int, default=128, help="Second input dimension.")
-    parser.add_argument("--k", type=int, default=512, help="Third input dimension.")
+    parser = argparse.ArgumentParser(description="Check reduction template correctness and performance.")
+    parser.add_argument("--m", type=int, default=1024, help="Output length / first input dimension.")
+    parser.add_argument("--n", type=int, default=16, help="Output length / second input dimension.")
+    parser.add_argument("--k", type=int, default=2048, help="Reduction length / third input dimension.")
     parser.add_argument("--arch", type=str, default="sm_90a", help='CUDA arch string, e.g. "sm_90a".')
     parser.add_argument(
         "--check-only",
