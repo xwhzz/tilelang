@@ -10,6 +10,7 @@ from tvm import tir
 from tvm.target import Target
 
 from .. import Schedule as TileSchedule
+from tilelang.carver.common_schedules import get_output_blocks
 from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
 from tvm.dlight.analysis import get_root_block, BlockInfo
 from .base import GPUScheduleRule
@@ -295,7 +296,7 @@ class GeneralReduction(GPUScheduleRule):
             return None
         output_block_names = {
             sch.get(output_block).name_hint
-            for output_block in sch.get_output_blocks(block_infos)
+            for output_block in get_output_blocks(sch, block_infos)
         }
 
         if len(reduction_indices) > 1:
@@ -1038,4 +1039,3 @@ class GeneralReduction(GPUScheduleRule):
             sch.bind(tx, "threadIdx.x")
 
         return sch
-
