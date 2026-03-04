@@ -20,23 +20,20 @@ import torch
 from tilelang import tvm
 from tilelang.profiler import do_bench
 from tvm import te
-
-from tilelang.schedule.gpu.element_wise import ElementWise  # pylint: disable=import-outside-toplevel
-
-
+from tilelang.schedule.gpu.element_wise import ElementWise
 
 def _build_mod(m: int, n: int, k: int, arch: str):
     """Build and lower a scheduled element-wise module."""
-    a = te.placeholder((m, n, k), name="a")
-    b = te.placeholder((m, n, k), name="b")
-    scale = te.placeholder((m, n, k), name="scale")
+    a = te.placeholder((m, n,), name="a")
+
+    ## implement gelu activation
     c = te.compute(
-        (m, n, k),
-        lambda i, j, kk: te.max(a[i, j, kk] + b[i, j, kk] * scale[i, j, kk], 0.0),
+        (m, n, ),
+        lambda i, j: a[i, j] * 0.5 * (1.0 + te.tanh(0.7978845608028654 * (a[i, j] + 0.044715 * a[i, j] * a[i, j] * a[i, j]))),
         name="c",
     )
-    # create_prim_func 的参数应该是最终要输出的输入和输出buffer，所以如果有一些中间的buffer，比如 reduction 里面的 rmax、rsum，就不应该放在参数里，而是直接在 compute 里面定义
-    func = te.create_prim_func([a, b, scale, c])
+
+    func = te.create_prim_func([a, c])
 
     target = tvm.target.cuda(arch=arch)
     sch = ElementWise().apply(func, target, False)
@@ -74,24 +71,22 @@ def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tupl
     kernel = tilelang.compile(mod["main"])
 
     torch.manual_seed(0)
-    a_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
-    b_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
-    scale_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
-    c_torch = torch.empty((m, n, k), device="cuda", dtype=torch.float32)
+    a_torch = torch.randn((m, n), device="cuda", dtype=torch.float32)
+    c_torch = torch.empty((m, n), device="cuda", dtype=torch.float32)
 
-    kernel(a_torch, b_torch, scale_torch, c_torch)
+    kernel(a_torch, c_torch)
 
     @torch.compile()
-    def fn_torch(a, b, scale):
-        return torch.relu(a + b * scale)
+    def fn_torch(a):
+        return torch.nn.functional.gelu(a, approximate='tanh')
 
-    torch.testing.assert_close(c_torch, fn_torch(a_torch, b_torch, scale_torch), rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(c_torch, fn_torch(a_torch), rtol=1e-4, atol=1e-4)
     print("\033[92mCorrectness check passed.\033[0m")
 
-    tilelang_time = do_bench(lambda: kernel(a_torch, b_torch, scale_torch, c_torch), backend=bench_backend)
-    torch_time = do_bench(lambda: fn_torch(a_torch, b_torch, scale_torch), backend=bench_backend)
+    tilelang_time = do_bench(lambda: kernel(a_torch, c_torch), backend=bench_backend)
+    torch_time = do_bench(lambda: fn_torch(a_torch), backend=bench_backend)
 
-    total_bytes = (3 * m * n * k + m * n * k) * 4  # 3 reads + 1 write in fp32
+    total_bytes = (2 * m * n) * 4  # 2 reads in fp32
     tilelang_gbps = total_bytes / (tilelang_time * 1e-3) / 1e9
     torch_gbps = total_bytes / (torch_time * 1e-3) / 1e9
 
@@ -103,8 +98,8 @@ def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tupl
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check element-wise template correctness and performance.")
-    parser.add_argument("--m", type=int, default=64, help="First input dimension.")
-    parser.add_argument("--n", type=int, default=128, help="Second input dimension.")
+    parser.add_argument("--m", type=int, default=128, help="First input dimension.")
+    parser.add_argument("--n", type=int, default=16384, help="Second input dimension.")
     parser.add_argument("--k", type=int, default=512, help="Third input dimension.")
     parser.add_argument("--arch", type=str, default="sm_90a", help='CUDA arch string, e.g. "sm_90a".')
     parser.add_argument(

@@ -28,16 +28,19 @@ from typing import List, Optional, Union, Dict
 from tvm import DataType, arith, ir, tir
 from tvm.target import Target
 
-from ..base import (
+from tvm.dlight import (
     BlockInfo,
+    normalize_prim_func,
+    try_inline_contiguous_spatial,
+)
+
+from tvm.dlight.analysis import (
     collect_block_iter_vars_used_in_access_region,
     collect_vars_used_in_prim_expr,
     detect_dominant_read,
     is_broadcast_epilogue,
-    normalize_prim_func,
-    try_inline_contiguous_spatial,
-    get_output_blocks,
 )
+
 from .base import GPUScheduleRule
 from .gemv_dequantize import GEMVWithDequantizeInfo
 
@@ -622,7 +625,7 @@ class GEMV(GPUScheduleRule):
         warp_size = int(prod(config.reduce_thread))
 
         block_b = reduction_block
-        output_blocks = get_output_blocks(sch, block_infos)
+        output_blocks = sch.get_output_blocks(block_infos)
         # compute inline
         for block_info in reversed(block_infos):
             block = block_info.block_rv

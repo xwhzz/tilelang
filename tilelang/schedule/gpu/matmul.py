@@ -10,8 +10,8 @@ from tvm import tir
 from tvm.target import Target
 from tvm.tir.stmt import ForKind
 
-from ..base import analysis
-from ..base.analysis import get_coalesced_veclen
+from tvm.dlight import analysis
+from tvm.dlight.analysis import get_coalesced_veclen
 from .base import GPUScheduleRule
 from . import utils
 from .matmul_analysis import (

@@ -26,8 +26,8 @@ from tvm.target import Target
 from tvm.tir import Schedule
 from tvm.tir.schedule import BlockRV
 
-from ..base import (
-    detect_dominant_read,
+from tvm.dlight.analysis import detect_dominant_read
+from tvm.dlight import (
     normalize_prim_func,
     try_inline_contiguous_spatial,
 )

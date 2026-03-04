@@ -19,34 +19,7 @@ import torch
 from tilelang import tvm
 from tvm import te
 
-
-def _load_general_reduction_rule():
-    try:
-        from tilelang.schedule.gpu.general_reduction import GeneralReduction  # pylint: disable=import-outside-toplevel
-
-        return GeneralReduction
-    except Exception:
-        repo_root = Path(__file__).resolve().parents[2]
-        gpu_dir = repo_root / "tilelang" / "schedule" / "gpu"
-        pkg_name = "tilelang.schedule.gpu"
-        if pkg_name not in sys.modules:
-            gpu_pkg = types.ModuleType(pkg_name)
-            gpu_pkg.__path__ = [str(gpu_dir)]
-            sys.modules[pkg_name] = gpu_pkg
-
-        for module_name in ("base", "utils", "reduction", "general_reduction"):
-            full_name = f"{pkg_name}.{module_name}"
-            if full_name in sys.modules:
-                continue
-            mod_path = gpu_dir / f"{module_name}.py"
-            spec = importlib.util.spec_from_file_location(full_name, mod_path)
-            if spec is None or spec.loader is None:
-                raise RuntimeError(f"Cannot load module from {mod_path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[full_name] = module
-            spec.loader.exec_module(module)
-
-        return sys.modules[f"{pkg_name}.general_reduction"].GeneralReduction
+from tilelang.schedule.gpu.general_reduction import GeneralReduction  # pylint: disable=import-outside-toplevel
 
 
 def _build_mod(m: int, k: int, arch: str):
@@ -59,7 +32,6 @@ def _build_mod(m: int, k: int, arch: str):
     out = te.compute((m, k), lambda i, j: expv[i, j] / rsum[i], name="out")
     func = te.create_prim_func([a, out])
 
-    GeneralReduction = _load_general_reduction_rule()
     target = tvm.target.cuda(arch=arch)
     sch = GeneralReduction().apply(func, target, False)
     if sch is None:
@@ -69,9 +41,16 @@ def _build_mod(m: int, k: int, arch: str):
     print(sch.mod)
 
     mod = sch.mod
-    mod = tvm.tir.transform.Simplify()(mod)
-    mod = tvm.tir.transform.ConvertBlocksToOpaque()(mod)
-    mod = tilelang.transform.ReserveRootBlock()(mod)
+    scheduled_ir = str(mod)
+
+    # DSL-generated functions (with alloc_reducer / finalize_reducer) must
+    # skip schedule-specific transforms that would strip reducer metadata.
+    is_dsl_generated = "finalize_reducer" in scheduled_ir
+
+    if not is_dsl_generated:
+        mod = tvm.tir.transform.Simplify()(mod)
+        mod = tvm.tir.transform.ConvertBlocksToOpaque()(mod)
+        mod = tilelang.transform.ReserveRootBlock()(mod)
 
     print("=== Lowered IR ===")
     print(mod)
@@ -94,7 +73,13 @@ def build_and_run(m: int, k: int, arch: str):
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
     mod = _build_mod(m, k, arch)
-    kernel = tilelang.compile(mod["main"])
+    kernel = tilelang.compile(
+        mod["main"],
+        pass_configs={
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        },
+    )
 
     torch.manual_seed(0)
     a_torch = torch.randn((m, k), device="cuda", dtype=torch.float32)

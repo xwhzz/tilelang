@@ -22,7 +22,7 @@
 
 from tvm.target import Target
 
-from ..base import ScheduleRule
+from tvm.dlight import ScheduleRule
 
 
 class GPUScheduleRule(ScheduleRule):  # pylint: disable=too-few-public-methods
