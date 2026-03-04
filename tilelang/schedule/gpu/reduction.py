@@ -25,7 +25,7 @@ from tvm import ir, tir
 from tvm.target import Target
 
 from .. import Schedule as TileSchedule
-from ..base import normalize_prim_func, try_inline_contiguous_spatial
+from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
 from . import utils
 from .base import GPUScheduleRule
 
@@ -110,6 +110,11 @@ def _extract_single_input_buffer(rhs: tir.PrimExpr, write_buffer: tir.Buffer) ->
     if len(buffers) != 1:
         return None
     return buffers[0]
+
+
+def _is_direct_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> bool:
+    """Check whether expr is exactly a direct load from target_buffer."""
+    return isinstance(expr, tir.BufferLoad) and expr.buffer.same_as(target_buffer)
 
 
 def _find_buffer_index(regions, target_buffer: tir.Buffer) -> Optional[int]:
@@ -303,16 +308,19 @@ class Reduction(GPUScheduleRule):
         )
 
         # Replace explicit inner reduction loop by tile-level T.reduce.
-        sch.reduce_at(
-            reduce_loop,
-            block,
-            read_buffer_index=read_buffer_index,
-            write_buffer_index=write_buffer_index,
-            reduce_type=reduce_type,
-            dim=reduce_dim,
-            clear=False,
-            replace_loop_body=True,
-        )
+        # Only safe for direct-load reductions like: C += A.
+        # For transformed RHS (e.g. C += A * A), keep the explicit update loop.
+        if _is_direct_buffer_load(rhs_expr, input_buffer):
+            sch.reduce_at(
+                reduce_loop,
+                block,
+                read_buffer_index=read_buffer_index,
+                write_buffer_index=write_buffer_index,
+                reduce_type=reduce_type,
+                dim=reduce_dim,
+                clear=False,
+                replace_loop_body=True,
+            )
 
         num_threads = _choose_num_threads(target, thread_extent_expr)
         sch.bind(bx, "blockIdx.x")

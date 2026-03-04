@@ -25,37 +25,8 @@ from tilelang import tvm
 from tilelang.profiler import do_bench
 from tvm import te
 
+from tilelang.schedule.gpu.reduction import Reduction  # pylint: disable=import-outside-toplevel
 
-def _load_reduction_rule():
-    """Load Reduction rule with a fallback that avoids optional deps in gpu __init__."""
-    try:
-        from tilelang.schedule.gpu.reduction import Reduction  # pylint: disable=import-outside-toplevel
-
-        return Reduction
-    except Exception:
-        # Fallback: construct a minimal package shell and load only the needed
-        # submodules (base/utils/reduction) directly from files.
-        repo_root = Path(__file__).resolve().parents[2]
-        gpu_dir = repo_root / "tilelang" / "schedule" / "gpu"
-        pkg_name = "tilelang.schedule.gpu"
-        if pkg_name not in sys.modules:
-            gpu_pkg = types.ModuleType(pkg_name)
-            gpu_pkg.__path__ = [str(gpu_dir)]
-            sys.modules[pkg_name] = gpu_pkg
-
-        for module_name in ("base", "utils", "reduction"):
-            full_name = f"{pkg_name}.{module_name}"
-            if full_name in sys.modules:
-                continue
-            mod_path = gpu_dir / f"{module_name}.py"
-            spec = importlib.util.spec_from_file_location(full_name, mod_path)
-            if spec is None or spec.loader is None:
-                raise RuntimeError(f"Cannot load module from {mod_path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[full_name] = module
-            spec.loader.exec_module(module)
-
-        return sys.modules[f"{pkg_name}.reduction"].Reduction
 
 
 def _build_mod(m: int, n: int, k: int, arch: str):
@@ -67,7 +38,6 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     # d = te.compute((m, n,), lambda i, j: c[i, j] * b[i, j], name="d")  # add some extra elementwise ops to increase IR complexity
     func = te.create_prim_func([a, c])
 
-    Reduction = _load_reduction_rule()
     target = tvm.target.cuda(arch=arch)
     sch = Reduction().apply(func, target, None)
     if sch is None:

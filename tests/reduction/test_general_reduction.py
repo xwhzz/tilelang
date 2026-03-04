@@ -21,35 +21,7 @@ from tilelang import tvm
 from tilelang.profiler import do_bench
 from tvm import te
 
-
-def _load_general_reduction_rule():
-    """Load GeneralReduction with a fallback that avoids optional gpu deps."""
-    try:
-        from tilelang.schedule.gpu.general_reduction import GeneralReduction  # pylint: disable=import-outside-toplevel
-
-        return GeneralReduction
-    except Exception:
-        repo_root = Path(__file__).resolve().parents[2]
-        gpu_dir = repo_root / "tilelang" / "schedule" / "gpu"
-        pkg_name = "tilelang.schedule.gpu"
-        if pkg_name not in sys.modules:
-            gpu_pkg = types.ModuleType(pkg_name)
-            gpu_pkg.__path__ = [str(gpu_dir)]
-            sys.modules[pkg_name] = gpu_pkg
-
-        for module_name in ("base", "utils", "reduction", "general_reduction"):
-            full_name = f"{pkg_name}.{module_name}"
-            if full_name in sys.modules:
-                continue
-            mod_path = gpu_dir / f"{module_name}.py"
-            spec = importlib.util.spec_from_file_location(full_name, mod_path)
-            if spec is None or spec.loader is None:
-                raise RuntimeError(f"Cannot load module from {mod_path}")
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[full_name] = module
-            spec.loader.exec_module(module)
-
-        return sys.modules[f"{pkg_name}.general_reduction"].GeneralReduction
+from tilelang.schedule.gpu.general_reduction import GeneralReduction  # pylint: disable=import-outside-toplevel
 
 
 def _build_mod(m: int, n: int, k: int, arch: str):
@@ -60,7 +32,6 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     out = te.compute((m, n), lambda i, j: te.max(red[i, j], 0.0), name="out")
     func = te.create_prim_func([a, out])
 
-    GeneralReduction = _load_general_reduction_rule()
     target = tvm.target.cuda(arch=arch)
     sch = GeneralReduction().apply(func, target, False)
     if sch is None:

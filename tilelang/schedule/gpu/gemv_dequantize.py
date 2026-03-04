@@ -7,10 +7,8 @@ from tvm.target import Target
 from tvm.tir.function import PrimFunc
 from tvm import DataType, tir
 import logging
-from ..base import (
+from tvm.dlight import (
     normalize_prim_func,
-    get_output_blocks,
-    get_block,
 )
 from .base import GPUScheduleRule
 from .matmul_analysis import auto_inline_producers, auto_inline_consumers
@@ -101,8 +99,8 @@ class GEMVWithDequantizeInfo(GPUScheduleRule):
         warp_size = 32
 
         block_b = reduction_block
-        output_blocks = get_output_blocks(sch, block_infos)  # noqa: F841
-        B_decode_block = get_block(sch, block_infos, weight_decode_info["decode_block"])
+        output_blocks = sch.get_output_blocks(block_infos)  # noqa: F841
+        B_decode_block = sch.get_block(block_infos, weight_decode_info["decode_block"])
 
         block_decode_B = sch.cache_read(block_b, 1, "local")
         sch.compute_inline(B_decode_block)
@@ -270,8 +268,8 @@ class GEMVWithDequantizeInfo(GPUScheduleRule):
         warp_size = int(prod(config.reduce_thread))
 
         block_b = reduction_block
-        output_blocks = get_output_blocks(sch, block_infos)  # noqa: F841
-        B_decode_block = get_block(sch, block_infos, weight_decode_info["decode_block"])
+        output_blocks = sch.get_output_blocks(block_infos)  # noqa: F841
+        B_decode_block = sch.get_block(block_infos, weight_decode_info["decode_block"])
 
         block_decode_B = sch.cache_read(block_b, 1, "local")
         sch.compute_inline(B_decode_block)

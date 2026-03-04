@@ -10,8 +10,8 @@ from tvm import tir
 from tvm.target import Target
 
 from .. import Schedule as TileSchedule
-from ..base import get_output_blocks, normalize_prim_func, try_inline_contiguous_spatial
-from ..base.analysis import get_root_block, get_reduction_blocks, BlockInfo
+from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
+from tvm.dlight.analysis import get_root_block, BlockInfo
 from .base import GPUScheduleRule
 from .reduction import (
     _as_const_int,
@@ -21,6 +21,7 @@ from .reduction import (
     _find_buffer_index,
     _infer_init_value,
     _infer_reduce_dim,
+    _is_direct_buffer_load,
 )
 
 
@@ -189,7 +190,8 @@ def _schedule_reduction_stage_at_bx(
         block = sch.get_block(block_name)
         sch.cache_reduce_at(bx, block, write_buffer_index, "local.fragment", init_value)
 
-        if reduce_loop is not None:
+        can_lower_to_tile_reduce = is_single_source and _is_direct_buffer_load(rhs_expr, input_buffers[0])
+        if reduce_loop is not None and can_lower_to_tile_reduce:
             read_buffer_index = read_buffer_indices[0]
             block = sch.get_block(block_name)
             block_stmt = sch.get(block)
@@ -293,18 +295,24 @@ class GeneralReduction(GPUScheduleRule):
             return None
         output_block_names = {
             sch.get(output_block).name_hint
-            for output_block in get_output_blocks(sch, block_infos)
+            for output_block in sch.get_output_blocks(block_infos)
         }
 
         if len(reduction_indices) > 1:
-            # Specialized two-reduction chain (e.g. softmax-like):
-            #  reduce0(SR) -> reduce1(SR) -> out(SS)
-            if len(reduction_indices) == 2 and reduction_indices[1] == reduction_indices[0] + 1:
-                first_reduction_info = block_infos[reduction_indices[0]]
-                second_reduction_info = block_infos[reduction_indices[1]]
-                trailing_infos = block_infos[reduction_indices[1] + 1:]
-                if (len(trailing_infos) == 1 and trailing_infos[0].is_injective() and
-                        sch.get(trailing_infos[0].block_rv).name_hint in output_block_names):
+            # Specialized two-reduction chains with an optional injective bridge:
+            #   reduce0 -> [injective...]* -> reduce1 -> out
+            if len(reduction_indices) == 2:
+                first_reduction_idx, second_reduction_idx = reduction_indices
+                first_reduction_info = block_infos[first_reduction_idx]
+                second_reduction_info = block_infos[second_reduction_idx]
+                bridge_infos = block_infos[first_reduction_idx + 1:second_reduction_idx]
+                trailing_infos = block_infos[second_reduction_idx + 1:]
+                if (
+                    all(info.is_injective() for info in bridge_infos)
+                    and len(trailing_infos) == 1
+                    and trailing_infos[0].is_injective()
+                    and sch.get(trailing_infos[0].block_rv).name_hint in output_block_names
+                ):
                     output_block = trailing_infos[0].block_rv
                     output_loops = sch.get_loops(output_block)
 
@@ -315,11 +323,10 @@ class GeneralReduction(GPUScheduleRule):
 
                     output_bx_loops = list(output_loops[:num_leading_s])
                     output_inner_loops = list(output_loops[num_leading_s:])
-                    if len(output_inner_loops) == 0:
-                        return None
 
                     first_reduction_name = sch.get(first_reduction_info.block_rv).name_hint
                     second_reduction_name = sch.get(second_reduction_info.block_rv).name_hint
+                    bridge_names = [sch.get(info.block_rv).name_hint for info in bridge_infos]
 
                     output_s_fused = (
                         sch.fuse(*output_bx_loops)
@@ -328,23 +335,61 @@ class GeneralReduction(GPUScheduleRule):
                     output_inner_fused = (
                         sch.fuse(*output_inner_loops)
                         if len(output_inner_loops) > 1 else output_inner_loops[0]
-                    )
-                    num_threads = _choose_num_threads(target, sch.get(output_inner_fused).extent)
+                    ) if output_inner_loops else None
+
+                    # Scalar-output chains (e.g. logsumexp) do not benefit from
+                    # keeping large bridge tensors in local.fragment. Re-inline
+                    # the bridge and schedule the second reduction as multi-source.
+                    if output_inner_fused is None and bridge_names:
+                        for bridge_name in reversed(bridge_names):
+                            try:
+                                sch.compute_inline(sch.get_block(bridge_name))
+                            except Exception:
+                                return None
+                        bridge_names = []
+
+                    second_reduction_stmt = sch.get(second_reduction_info.block_rv)
+                    second_update_info = _analyze_reduction_update(second_reduction_stmt)
+                    is_second_multi_source = False
+                    if second_update_info is not None and len(second_reduction_stmt.writes) == 1:
+                        _, second_rhs_expr = second_update_info
+                        second_input_buffers = _collect_input_buffers(
+                            second_rhs_expr,
+                            second_reduction_stmt.writes[0].buffer,
+                        )
+                        is_second_multi_source = len(second_input_buffers) > 1
+                    if output_inner_fused is None:
+                        num_threads = 1
+                    else:
+                        num_threads = _choose_num_threads(target, sch.get(output_inner_fused).extent)
+                    if is_second_multi_source:
+                        # Multi-source updates currently stay as explicit loops.
+                        # Keep single-thread launch to avoid duplicated reduction work.
+                        num_threads = 1
                     if num_threads < 1:
                         return None
 
+                    # Keep row tile at 1. Larger row tiles can trigger invalid
+                    # copy-back index vars in current cache_reduce_at lowering.
                     bx, output_inner = sch.split(
                         output_s_fused,
                         factors=[None, 1],
                         preserve_unit_iters=True,
                     )
-                    output_outer, tx = sch.split(
-                        output_inner_fused,
-                        factors=[None, num_threads],
-                        preserve_unit_iters=True,
-                    )
-                    sch.reorder(bx, output_inner, output_outer, tx)
-                    sch.bind(tx, "threadIdx.x")
+                    if output_inner_fused is not None and num_threads > 1:
+                        output_outer, tx = sch.split(
+                            output_inner_fused,
+                            factors=[None, num_threads],
+                            preserve_unit_iters=True,
+                        )
+                        sch.reorder(bx, output_inner, output_outer, tx)
+                        sch.bind(tx, "threadIdx.x")
+                    elif output_inner_fused is not None:
+                        sch.reorder(bx, output_inner, output_inner_fused)
+                        sch.parallel(output_inner_fused)
+                    else:
+                        sch.reorder(bx, output_inner)
+                        sch.parallel(output_inner)
                     sch.bind(bx, "blockIdx.x")
 
                     sch.compute_at(
@@ -352,6 +397,13 @@ class GeneralReduction(GPUScheduleRule):
                         bx,
                         preserve_unit_loops=True,
                     )
+                    for bridge_name in reversed(bridge_names):
+                        sch.compute_at(
+                            sch.get_block(bridge_name),
+                            bx,
+                            preserve_unit_loops=True,
+                            index=0,
+                        )
                     sch.compute_at(
                         sch.get_block(first_reduction_name),
                         bx,
@@ -359,23 +411,40 @@ class GeneralReduction(GPUScheduleRule):
                         index=0,
                     )
 
-                    if (_schedule_reduction_stage_at_bx(
+                    first_thread_extent = _schedule_reduction_stage_at_bx(
                         sch,
                         first_reduction_name,
                         bx,
                         target,
                         output_block_names,
-                    ) is None):
+                    )
+                    if first_thread_extent is None:
                         return None
-                    if (_schedule_reduction_stage_at_bx(
+                    second_thread_extent = _schedule_reduction_stage_at_bx(
                         sch,
                         second_reduction_name,
                         bx,
                         target,
                         output_block_names,
-                    ) is None):
+                    )
+                    if second_thread_extent is None:
                         return None
 
+                    for bridge_name in bridge_names:
+                        bridge_block = sch.get_block(bridge_name)
+                        bridge_stmt = sch.get(bridge_block)
+                        for write_buffer_index, _ in enumerate(bridge_stmt.writes):
+                            sch.set_scope(bridge_block, write_buffer_index, "local.fragment")
+                            bridge_block = sch.get_block(bridge_name)
+
+                    if num_threads == 1:
+                        launch_threads = 1
+                        if output_inner_fused is not None and not is_second_multi_source:
+                            launch_threads = max(
+                                _choose_num_threads(target, first_thread_extent),
+                                _choose_num_threads(target, second_thread_extent),
+                            )
+                        sch.launch_thread(sch.get_block("root"), launch_threads)
                     return sch
 
             # Fallback for unsupported multi-reduction patterns.
@@ -572,7 +641,12 @@ class GeneralReduction(GPUScheduleRule):
         )
 
         # Lower to tile-level T.reduce only for single-source reductions.
-        if len(read_buffer_indices) == 1 and reduce_loop is not None:
+        can_lower_main_reduce = (
+            len(read_buffer_indices) == 1 and
+            reduce_loop is not None and
+            _is_direct_buffer_load(rhs_expr, input_buffers[0])
+        )
+        if can_lower_main_reduce:
             read_buffer_index = read_buffer_indices[0]
             reduction_block = sch.get_block(reduction_name)
             reduction_stmt = sch.get(reduction_block)
@@ -965,22 +1039,3 @@ class GeneralReduction(GPUScheduleRule):
 
         return sch
 
-    def apply_config(  # pylint: disable=too-many-locals,missing-docstring
-        self,
-        func: tir.PrimFunc,
-        config,
-    ) -> tir.Schedule:
-        # check the number of reduction blocks
-        sch = tir.Schedule(func)
-        root_block = get_root_block(sch)
-        blocks = sch.get_child_blocks(root_block)
-        reduction_blocks = get_reduction_blocks(sch, blocks)
-        if len(reduction_blocks) > 1:
-            # schedule for multiple reduction blocks (e.g. softmax)
-            return self.sch_mutiple_reductions_with_config(func, config)
-
-        if any([t > 1 for t in config.reduce_thread]):
-            # todo(lei) should implement block reduction schedule
-            return self.sch_inner_reduction_with_config(func, config)
-        else:
-            return self.sch_outer_reduction_with_config(func, config)
