@@ -10,7 +10,6 @@ from .element_wise import ElementWise  # noqa: F401
 from .reduction import Reduction  # noqa: F401
 from .general_reduction import GeneralReduction  # noqa: F401
 from .transpose import Transpose  # noqa: F401
-from .rmsnorm import RMSNorm  # noqa: F401
 
 try:
     from .gemv import GEMV  # noqa: F401
