@@ -1088,6 +1088,9 @@ private:
     if (lhs.touched.size() != 1 || rhs.touched.size() != 1) {
       return false;
     }
+    if (lhs.threads.size() < 3 || rhs.threads.size() < 3) {
+      return false;
+    }
     ConstrSet prev_cset{lhs.cset};
     ConstrSet curr_cset{rhs.cset};
     arith::Analyzer analyzer;
@@ -1106,25 +1109,16 @@ private:
     PrimExpr rhs_max = analyzer.Simplify(rhs.touched[0].max());
     for (unsigned idx = 0; idx != 3; ++idx) {
       auto &info = thread_vars[idx];
-      int lhs_pos = static_cast<int>(lhs.threads.size()) +
-                    static_cast<int>(idx) - 3;
-      int rhs_pos = static_cast<int>(rhs.threads.size()) +
-                    static_cast<int>(idx) - 3;
-
-      if (lhs_pos >= 0) {
-        Var old_prev_var = lhs.threads[lhs_pos]->var;
-        Var prev_var(info.name_prev, old_prev_var.dtype());
-        lhs_min = Substitute(lhs_min, {{old_prev_var, prev_var}});
-        lhs_max = Substitute(lhs_max, {{old_prev_var, prev_var}});
-        prev_cset = prev_cset.Substitute({{old_prev_var, prev_var}});
-      }
-      if (rhs_pos >= 0) {
-        Var old_curr_var = rhs.threads[rhs_pos]->var;
-        Var curr_var(info.name_curr, old_curr_var.dtype());
-        rhs_min = Substitute(rhs_min, {{old_curr_var, curr_var}});
-        rhs_max = Substitute(rhs_max, {{old_curr_var, curr_var}});
-        curr_cset = curr_cset.Substitute({{old_curr_var, curr_var}});
-      }
+      Var old_prev_var = lhs.threads[lhs.threads.size() + idx - 3]->var;
+      Var old_curr_var = rhs.threads[rhs.threads.size() + idx - 3]->var;
+      Var prev_var(info.name_prev, old_prev_var.dtype());
+      Var curr_var(info.name_curr, old_curr_var.dtype());
+      lhs_min = Substitute(lhs_min, {{old_prev_var, prev_var}});
+      lhs_max = Substitute(lhs_max, {{old_prev_var, prev_var}});
+      prev_cset = prev_cset.Substitute({{old_prev_var, prev_var}});
+      rhs_min = Substitute(rhs_min, {{old_curr_var, curr_var}});
+      rhs_max = Substitute(rhs_max, {{old_curr_var, curr_var}});
+      curr_cset = curr_cset.Substitute({{old_curr_var, curr_var}});
     }
     prev_cset.Populate(analyzer);
     curr_cset.Populate(analyzer);
@@ -1349,36 +1343,14 @@ private:
       ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
       for (unsigned idx = 0; idx != 3; ++idx) {
         auto &info = thread_vars[idx];
-        int prev_pos = static_cast<int>(prev.threads.size()) +
-                       static_cast<int>(idx) - 3;
-        int curr_pos = static_cast<int>(curr.threads.size()) +
-                       static_cast<int>(idx) - 3;
-
-        PrimExpr prev_thread = IntImm(DataType::Int(32), 0);
-        PrimExpr curr_thread = IntImm(DataType::Int(32), 0);
-
-        if (prev_pos >= 0) {
-          Var old_prev_var = prev.threads[prev_pos]->var;
-          Var prev_var(info.name_prev, old_prev_var.dtype());
-          prev_sub.Set(old_prev_var, prev_var);
-          prev_thread = prev_var;
-        }
-        if (curr_pos >= 0) {
-          Var old_curr_var = curr.threads[curr_pos]->var;
-          Var curr_var(info.name_curr, old_curr_var.dtype());
-          curr_sub.Set(old_curr_var, curr_var);
-          curr_thread = curr_var;
-        }
-
-        if (prev_thread.dtype() != curr_thread.dtype()) {
-          if (prev_thread.dtype().bits() < curr_thread.dtype().bits()) {
-            prev_thread = tir::Cast(curr_thread.dtype(), prev_thread);
-          } else {
-            curr_thread = tir::Cast(prev_thread.dtype(), curr_thread);
-          }
-        }
+        Var old_prev_var = prev.threads[prev.threads.size() + idx - 3]->var;
+        Var old_curr_var = curr.threads[curr.threads.size() + idx - 3]->var;
+        Var prev_var(info.name_prev, old_prev_var.dtype());
+        Var curr_var(info.name_curr, old_curr_var.dtype());
         thread_condition =
-            tir::Or(thread_condition, tir::NE(prev_thread, curr_thread));
+            tir::Or(thread_condition, tir::NE(prev_var, curr_var));
+        prev_sub.Set(old_prev_var, prev_var);
+        curr_sub.Set(old_curr_var, curr_var);
       }
       analyzer.EnterConstraint(thread_condition);
       prev_cset.Substitute(prev_sub).Populate(analyzer);

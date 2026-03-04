@@ -157,6 +157,9 @@ def _schedule_reduction_stage_at_bx(
             return None
         read_buffer_indices.append(read_index)
 
+    is_single_source = len(set(read_buffer_indices)) == 1
+    init_value = _infer_init_value(block_stmt, reduce_type)
+
     reduction_loops = sch.get_loops(block)
     if len(reduction_loops) == 0:
         return None
@@ -173,44 +176,74 @@ def _schedule_reduction_stage_at_bx(
         reduce_loop = None
         thread_extent_expr = sch.get(r_fused).extent
 
-    # Avoid illegal in-kernel global temporaries for intermediate reductions.
-    block = sch.get_block(block_name)
-    if block_name not in output_block_names:
-        sch.set_scope(block, write_buffer_index, "local.fragment")
-
-    for read_buffer_index in sorted(set(read_buffer_indices)):
+    if is_single_source:
+        # ------ Single-source path: cache_reduce_at + reduce_at ------
         block = sch.get_block(block_name)
-        sch.cache_read_at(cache_read_loop, block, read_buffer_index, "local.fragment")
+        if block_name not in output_block_names:
+            sch.set_scope(block, write_buffer_index, "local.fragment")
 
-    block = sch.get_block(block_name)
-    block_stmt = sch.get(block)
-    init_value = _infer_init_value(block_stmt, reduce_type)
-    sch.cache_reduce_at(
-        bx,
-        block,
-        write_buffer_index,
-        "local.fragment",
-        init_value,
-    )
+        for read_buffer_index in sorted(set(read_buffer_indices)):
+            block = sch.get_block(block_name)
+            sch.cache_read_at(cache_read_loop, block, read_buffer_index, "local.fragment")
 
-    if len(read_buffer_indices) == 1 and reduce_loop is not None:
-        read_buffer_index = read_buffer_indices[0]
+        block = sch.get_block(block_name)
+        sch.cache_reduce_at(bx, block, write_buffer_index, "local.fragment", init_value)
+
+        if reduce_loop is not None:
+            read_buffer_index = read_buffer_indices[0]
+            block = sch.get_block(block_name)
+            block_stmt = sch.get(block)
+            reduce_dim = _infer_reduce_dim(
+                block_stmt.reads[read_buffer_index].buffer,
+                block_stmt.writes[write_buffer_index].buffer,
+            )
+            sch.reduce_at(
+                reduce_loop,
+                block,
+                read_buffer_index=read_buffer_index,
+                write_buffer_index=write_buffer_index,
+                reduce_type=reduce_type,
+                dim=reduce_dim,
+                clear=False,
+                replace_loop_body=True,
+            )
+    else:
+        # ------ Multi-source path (e.g. sum(exp(x - max)) in softmax) ------
+        # reduce_at only works for single-source reductions.
+        # Strategy: decompose_reduction first (while the loop tree is
+        # intact), then use fill_at + set_scope + cache_read_at.
+        # We deliberately skip cache_reduce_at because it inserts a
+        # per-chunk read-copy that resets the accumulator.
+
         block = sch.get_block(block_name)
         block_stmt = sch.get(block)
-        reduce_dim = _infer_reduce_dim(
-            block_stmt.reads[read_buffer_index].buffer,
-            block_stmt.writes[write_buffer_index].buffer,
-        )
-        sch.reduce_at(
-            reduce_loop,
-            block,
-            read_buffer_index=read_buffer_index,
-            write_buffer_index=write_buffer_index,
-            reduce_type=reduce_type,
-            dim=reduce_dim,
-            clear=False,
-            replace_loop_body=True,
-        )
+        if block_stmt.init is not None:
+            decompose_loop = reduce_loop if reduce_loop is not None else r_fused
+            sch.decompose_reduction(block, decompose_loop)
+            block_name = block_name + "_update"
+
+        block = sch.get_block(block_name)
+        orig_name = block_name.removesuffix("_update")
+        if orig_name not in output_block_names and block_name not in output_block_names:
+            sch.set_scope(block, write_buffer_index, "local.fragment")
+
+        # Tile-level initialization via T.fill (replaces the decomposed init).
+        block = sch.get_block(block_name)
+        sch.fill_at(bx, block, write_buffer_index, init_value)
+
+        # Re-compute read buffer indices for the update block since the
+        # reads array may have changed after decompose + set_scope.
+        block = sch.get_block(block_name)
+        block_stmt = sch.get(block)
+        read_buffer_indices = []
+        for input_buffer in input_buffers:
+            read_index = _find_buffer_index(block_stmt.reads, input_buffer)
+            if read_index is not None:
+                read_buffer_indices.append(read_index)
+
+        for read_buffer_index in sorted(set(read_buffer_indices)):
+            block = sch.get_block(block_name)
+            sch.cache_read_at(cache_read_loop, block, read_buffer_index, "local.fragment")
 
     return thread_extent_expr
 
