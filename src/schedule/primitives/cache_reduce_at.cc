@@ -154,7 +154,8 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
                            const StmtSRef& block_sref,
                            int write_buffer_index,
                            const ffi::String& storage_scope,
-                           double init_value) {
+                           double init_value,
+                           bool write_back) {
   // ---- Step 1: Obtain destination buffer and loop -------------------------
   const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -246,13 +247,16 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
       Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
            {fill_region_arg, fill_value}));
 
-  // ---- Step 6: Build the T.copy call (write-back) -------------------------
-  PrimExpr cache_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
-  PrimExpr orig_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/2);
+  // ---- Step 6: Build optional T.copy call (write-back) --------------------
+  Stmt copy_stmt;
+  if (write_back) {
+    PrimExpr cache_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
+    PrimExpr orig_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/2);
 
-  Stmt copy_stmt = Evaluate(
-      Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
-           {cache_region_arg, orig_region_arg}));
+    copy_stmt = Evaluate(
+        Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
+             {cache_region_arg, orig_region_arg}));
+  }
 
   // ---- Step 7: Rewrite buffer references in the loop body -----------------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
@@ -265,10 +269,12 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
     subtrees.Set(i, replacer(std::move(old_stmt)));
   }
 
-  // ---- Step 8: Insert fill at start, copy at end --------------------------
-  // Order: [fill, ...original subtrees..., copy]
+  // ---- Step 8: Insert fill at start, optional copy at end -----------------
+  // Order: [fill, ...original subtrees..., copy?]
   subtrees.insert(subtrees.begin(), fill_stmt);
-  subtrees.push_back(copy_stmt);
+  if (write_back) {
+    subtrees.push_back(copy_stmt);
+  }
 
   // Wrap in an opaque Block that owns the cache buffer allocation.
   Block alloc_block(
@@ -296,6 +302,22 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
   Block new_scope_block = Downcast<Block>(
       LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
 
+  if (!write_back) {
+    // Intermediate reduction use-case: all consumers are rewritten to the
+    // cache buffer, so the original tensor allocation can be removed from the
+    // surrounding scope block.
+    ObjectPtr<BlockNode> scope_ptr = ffi::make_object<BlockNode>(*new_scope_block.get());
+    ffi::Array<Buffer> kept_alloc_buffers;
+    kept_alloc_buffers.reserve(scope_ptr->alloc_buffers.size());
+    for (const Buffer& buf : scope_ptr->alloc_buffers) {
+      if (!buf.same_as(src)) {
+        kept_alloc_buffers.push_back(buf);
+      }
+    }
+    scope_ptr->alloc_buffers = std::move(kept_alloc_buffers);
+    new_scope_block = Block(scope_ptr);
+  }
+
   block_sref_reuse.Set(ffi::GetRef<Block>(scope_block), new_scope_block);
   self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
 }
@@ -309,10 +331,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.schedule.ScheduleCacheReduceAt",
       [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
          int write_buffer_index, const ffi::String& storage_scope,
-         double init_value) {
+         double init_value, bool write_back) {
         CacheReduceAt(self->state(), self->GetSRef(loop_rv),
                       self->GetSRef(block_rv), write_buffer_index,
-                      storage_scope, init_value);
+                      storage_scope, init_value, write_back);
       });
 }
 
