@@ -127,7 +127,8 @@ class Schedule(TVMSchedule):
 
     def cache_reduce_at(self, loop: LoopRV, block: BlockRV,
                         write_buffer_index: int, storage_scope: str,
-                        init_value: float = 0.0) -> None:
+                        init_value: float = 0.0,
+                        write_back: bool = True) -> None:
         """Cache a write buffer for reduction with initialization.
 
         This is a combined primitive for reduction scheduling that:
@@ -158,6 +159,10 @@ class Schedule(TVMSchedule):
         init_value : float
             The initial value for the accumulator (default: 0.0).
             Use 0.0 for sum, float('-inf') for max, float('inf') for min.
+        write_back : bool
+            Whether to emit a final T.copy from cache back to the original
+            buffer (default: True). Set to False for purely intermediate
+            tensors whose consumers are all rewritten to read the cache.
         """
         _ffi_api.ScheduleCacheReduceAt(self, loop, block, write_buffer_index,
-                                       storage_scope, init_value)
+                                       storage_scope, init_value, write_back)

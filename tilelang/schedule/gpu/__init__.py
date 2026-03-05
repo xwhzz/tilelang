@@ -9,6 +9,7 @@ from .fallback import Fallback  # noqa: F401
 from .element_wise import ElementWise  # noqa: F401
 from .reduction import Reduction  # noqa: F401
 from .general_reduction import GeneralReduction  # noqa: F401
+from .layernorm_like import LayerNormLike  # noqa: F401
 from .transpose import Transpose  # noqa: F401
 
 try:
