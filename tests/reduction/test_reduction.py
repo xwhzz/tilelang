@@ -35,7 +35,7 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     a = te.placeholder((m, n, k), name="a")
     rk = te.reduce_axis((0, k), name="rk")
     c = te.compute((m, n, ), lambda i, j: te.max(a[i, j, rk], axis=rk), name="c")
-    # d = te.compute((m, n,), lambda i, j: c[i, j] * b[i, j], name="d")  # add some extra elementwise ops to increase IR complexity
+
     func = te.create_prim_func([a, c])
 
     target = tvm.target.cuda(arch=arch)

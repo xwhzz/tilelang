@@ -205,7 +205,10 @@ def _choose_reduction_step(target: Target, reduction_extent: tir.PrimExpr) -> Op
 
     max_threads = int(utils.max_threads_per_block(target))
     max_threads = min(max_threads, 256)
-    step_limit = max(1, max_threads * 16)  # 256 threads -> 4096 elements
+    # TileLang favors wider tile chunks than thread-level templates.
+    # Keep chunk size capped to avoid oversized local fragments while
+    # allowing softmax-like K=16384 to stay within a single chunk.
+    step_limit = max(1, min(max_threads * 64, 16384))
     step = min(extent, step_limit)
 
     # Keep static divisibility to avoid tail-copy OOB in cache_read_at.

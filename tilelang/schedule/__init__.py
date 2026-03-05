@@ -31,7 +31,7 @@ class Schedule(TVMSchedule):
                                      storage_scope)
 
     def cache_write_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
-                       storage_scope: str) -> None:
+                       storage_scope: str, write_back: bool = True) -> None:
         """Insert a cached copy of a write buffer at the specified loop level.
 
         This creates a compact cache buffer inside the loop, rewrites all
@@ -49,9 +49,13 @@ class Schedule(TVMSchedule):
         storage_scope : str
             Storage scope for the cache buffer (e.g. "shared.dyn",
             "local.fragment").
+        write_back : bool
+            Whether to emit a final T.copy from cache back to the original
+            buffer (default: True). Set to False for purely intermediate
+            tensors whose consumers are all rewritten to read the cache.
         """
         _ffi_api.ScheduleCacheWriteAt(self, loop, block, write_buffer_index,
-                                      storage_scope)
+                                      storage_scope, write_back)
 
     def fill_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
                 value: float = 0.0) -> None:
