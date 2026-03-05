@@ -68,6 +68,7 @@ def _build_sum_relu_3d(args: argparse.Namespace) -> CaseBuild:
     red = te.compute((m, n), lambda i, j: te.sum(a[i, j, rk], axis=rk), name="red")
     out = te.compute((m, n), lambda i, j: te.max(red[i, j], tir.const(0.0, "float32")), name="out")
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor) -> torch.Tensor:
         return torch.relu(torch.sum(a_t, dim=2))
 
@@ -91,6 +92,7 @@ def _build_max_bias_relu_3d(args: argparse.Namespace) -> CaseBuild:
         name="out",
     )
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor, bias_t: torch.Tensor) -> torch.Tensor:
         return torch.relu(torch.max(a_t, dim=2).values + bias_t)
 
@@ -114,6 +116,7 @@ def _build_keepdim_sum_sigmoid_3d(args: argparse.Namespace) -> CaseBuild:
         name="out",
     )
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor) -> torch.Tensor:
         return torch.sigmoid(torch.sum(a_t, dim=2, keepdim=True))
 
@@ -136,6 +139,7 @@ def _build_rmsnorm_like_2d(args: argparse.Namespace) -> CaseBuild:
     inv_rms = te.compute((m,), lambda i: tir.const(1.0, "float32") / te.sqrt(sqsum[i] * inv_k + eps), name="inv_rms")
     out = te.compute((m, k), lambda i, j: a[i, j] * inv_rms[i], name="out")
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor) -> torch.Tensor:
         inv = torch.rsqrt(torch.mean(a_t * a_t, dim=1, keepdim=True) + args.eps)
         return a_t * inv
@@ -163,6 +167,7 @@ def _build_layernorm_like_2d(args: argparse.Namespace) -> CaseBuild:
     inv_std = te.compute((m,), lambda i: tir.const(1.0, "float32") / te.sqrt(var[i] * inv_k + eps), name="inv_std")
     out = te.compute((m, k), lambda i, j: center[i, j] * inv_std[i], name="out")
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor) -> torch.Tensor:
         mean_t = torch.mean(a_t, dim=1, keepdim=True)
         center_t = a_t - mean_t
@@ -187,6 +192,7 @@ def _build_softmax_like_2d(args: argparse.Namespace) -> CaseBuild:
     rsum = te.compute((m,), lambda i: te.sum(expv[i, rk1], axis=rk1), name="rsum")
     out = te.compute((m, k), lambda i, j: expv[i, j] / rsum[i], name="out")
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor) -> torch.Tensor:
         return torch.softmax(a_t, dim=1)
 
@@ -208,6 +214,7 @@ def _build_logsumexp_like_2d(args: argparse.Namespace) -> CaseBuild:
     rsum = te.compute((m,), lambda i: te.sum(expv[i, rk1], axis=rk1), name="rsum")
     out = te.compute((m,), lambda i: te.log(rsum[i]) + rmax[i], name="out")
 
+    @torch.compile
     def ref_fn(a_t: torch.Tensor) -> torch.Tensor:
         return torch.logsumexp(a_t, dim=1)
 
@@ -366,7 +373,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--arch", type=str, default="sm_90a", help='CUDA arch string, e.g. "sm_90a".')
     parser.add_argument("--m", type=int, default=1024, help="3D workloads: first dim.")
     parser.add_argument("--n", type=int, default=16, help="3D workloads: second dim.")
-    parser.add_argument("--k", type=int, default=2048, help="3D workloads: reduction dim.")
+    parser.add_argument("--k", type=int, default=16384, help="3D workloads: reduction dim.")
     parser.add_argument("--m2d", type=int, default=8192, help="2D workloads: first dim.")
     parser.add_argument("--k2d", type=int, default=16384, help="2D workloads: reduction/second dim.")
     parser.add_argument("--eps", type=float, default=1e-5, help="Epsilon for norm-like workloads.")
