@@ -17,6 +17,7 @@ using namespace tir;
 /// Supported reduction operation types
 enum class ReduceTypeEnum : uint8_t {
   kSum,    ///< Sum reduction
+  kSumSq,  ///< Sum of squares reduction
   kAbsSum, ///< Absolute sum reduction
   kMax,    ///< Maximum value reduction
   kMin,    ///< Minimum value reduction
@@ -39,6 +40,7 @@ public:
 
   /// Type checking methods
   bool isSum() const { return type == int(ReduceTypeEnum::kSum); }
+  bool isSumSq() const { return type == int(ReduceTypeEnum::kSumSq); }
   bool isAbsSum() const { return type == int(ReduceTypeEnum::kAbsSum); }
   bool isMax() const { return type == int(ReduceTypeEnum::kMax); }
   bool isMin() const { return type == int(ReduceTypeEnum::kMin); }
@@ -57,6 +59,8 @@ public:
     auto node = tvm::ffi::make_object<ReduceTypeNode>();
     if (type == "sum") {
       node->type = int(ReduceTypeEnum::kSum);
+    } else if (type == "sumsq") {
+      node->type = int(ReduceTypeEnum::kSumSq);
     } else if (type == "abssum") {
       node->type = int(ReduceTypeEnum::kAbsSum);
     } else if (type == "max") {

@@ -8,7 +8,7 @@ class Schedule(TVMSchedule):
         _ffi_api.ScheduleLaunchThread(self, block, num_threads)
 
     def cache_read_at(self, loop: LoopRV, block: BlockRV, read_buffer_index: int,
-                      storage_scope: str) -> None:
+                      storage_scope: str, transform: str = "") -> None:
         """Insert a cached copy of a read buffer at the specified loop level.
 
         This creates a compact cache buffer inside the loop, inserts a T.copy
@@ -26,9 +26,14 @@ class Schedule(TVMSchedule):
         storage_scope : str
             Storage scope for the cache buffer (e.g. "shared.dyn",
             "local.fragment").
+        transform : str
+            Optional elementwise transform applied on the cached tile after
+            copy. Supported values:
+            - "" (default): no transform
+            - "square": dst = dst * dst
         """
         _ffi_api.ScheduleCacheReadAt(self, loop, block, read_buffer_index,
-                                     storage_scope)
+                                     storage_scope, transform)
 
     def cache_write_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
                        storage_scope: str, write_back: bool = True) -> None:
@@ -105,7 +110,8 @@ class Schedule(TVMSchedule):
         write_buffer_index : int
             Index of the destination (write) buffer in the block's write list.
         reduce_type : str
-            Type of reduction: "sum", "max", "min", "abssum", "absmax".
+            Type of reduction: "sum", "sumsq", "max", "min",
+            "abssum", "absmax".
         dim : int
             The dimension along which to reduce.
         clear : bool

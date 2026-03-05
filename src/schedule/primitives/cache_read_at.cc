@@ -79,6 +79,57 @@ static PrimExpr MakeRegionCall(const Buffer& buf, const ffi::Array<Range>& range
   return Call(DataType::Handle(), RegionOp::Get(), args);
 }
 
+// Detect whether the loop body already contains tl.tileop.region calls that
+// reference `buf`. In that case, squeezing dimensions would require rewriting
+// region extents as well; keep full rank to preserve consistency.
+static bool HasTileRegionCallOnBuffer(const Stmt& body, const Buffer& buf) {
+  bool found = false;
+  PostOrderVisit(body, [&found, &buf](const ObjectRef& obj) {
+    if (found) return;
+    const auto* call = obj.as<CallNode>();
+    if (call == nullptr) return;
+    const auto* op = call->op.as<OpNode>();
+    if (op == nullptr || op->name != "tl.tileop.region" || call->args.empty()) {
+      return;
+    }
+    const auto* load = call->args[0].as<BufferLoadNode>();
+    if (load != nullptr && load->buffer.same_as(buf)) {
+      found = true;
+    }
+  });
+  return found;
+}
+
+// Build an in-place square transform:
+//   for ...:
+//     dst[idx] = dst[idx] * dst[idx]
+static Stmt BuildSquareInplaceStmt(const Buffer& dst,
+                                   const ffi::Array<PrimExpr>& shape) {
+  int ndim = static_cast<int>(shape.size());
+  std::vector<Var> iters;
+  iters.reserve(ndim);
+
+  ffi::Array<PrimExpr> indices;
+  indices.reserve(ndim);
+  for (int d = 0; d < ndim; ++d) {
+    Var it("ax" + std::to_string(d), DataType::Int(32));
+    iters.push_back(it);
+    indices.push_back(it);
+  }
+
+  PrimExpr val = BufferLoad(dst, indices);
+  Stmt body = BufferStore(dst, val * val, indices);
+  for (int d = ndim - 1; d >= 0; --d) {
+    body = For(
+        iters[d],
+        /*min=*/IntImm(DataType::Int(32), 0),
+        /*extent=*/shape[d],
+        ForKind::kSerial,
+        body);
+  }
+  return body;
+}
+
 // ---------------------------------------------------------------------------
 // Visitor that replaces all accesses to `src_` with accesses to `dst_`,
 // shifting the indices by subtracting the per-axis region minimums.
@@ -89,14 +140,22 @@ class CacheBufferReplacer : public StmtExprMutator {
   CacheBufferReplacer(const Buffer& src, const Buffer& dst,
                       const ffi::Array<PrimExpr>& region_mins,
                       const std::vector<int>& kept_dims,
-                      ffi::Map<Block, Block>* block_sref_reuse)
+                      ffi::Map<Block, Block>* block_sref_reuse,
+                      const BlockNode* target_block = nullptr)
       : src_(src),
         dst_(dst),
         region_mins_(region_mins),
         kept_dims_(kept_dims),
-        block_sref_reuse_(block_sref_reuse) {}
+        block_sref_reuse_(block_sref_reuse),
+        target_block_(target_block),
+        block_only_(target_block != nullptr),
+        in_target_scope_(false) {}
 
  private:
+  bool ShouldRewriteAccess() const {
+    return !block_only_ || in_target_scope_;
+  }
+
   // Build squeezed indices: for each kept dim, compute (original_idx - min).
   ffi::Array<PrimExpr> SqueezedIndices(const ffi::Array<PrimExpr>& indices) {
     ffi::Array<PrimExpr> new_indices;
@@ -108,7 +167,7 @@ class CacheBufferReplacer : public StmtExprMutator {
 
   PrimExpr VisitExpr_(const BufferLoadNode* _load) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(_load));
-    if (load->buffer.same_as(src_)) {
+    if (ShouldRewriteAccess() && load->buffer.same_as(src_)) {
       ObjectPtr<BufferLoadNode> n = ffi::make_object<BufferLoadNode>(*load.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
@@ -119,7 +178,7 @@ class CacheBufferReplacer : public StmtExprMutator {
 
   Stmt VisitStmt_(const BufferStoreNode* _store) final {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(_store));
-    if (store->buffer.same_as(src_)) {
+    if (ShouldRewriteAccess() && store->buffer.same_as(src_)) {
       ObjectPtr<BufferStoreNode> n = ffi::make_object<BufferStoreNode>(*store.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
@@ -129,13 +188,20 @@ class CacheBufferReplacer : public StmtExprMutator {
   }
 
   Stmt VisitStmt_(const BlockNode* _block) final {
+    bool prev_in_target_scope = in_target_scope_;
+    if (block_only_ && _block == target_block_) {
+      in_target_scope_ = true;
+    }
     Block old_block = ffi::GetRef<Block>(_block);
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(_block));
     ObjectPtr<BlockNode> n = ffi::make_object<BlockNode>(*block.get());
-    n->reads = ReplaceBufferWithShift(n->reads);
-    n->writes = ReplaceBufferWithShift(n->writes);
+    if (ShouldRewriteAccess()) {
+      n->reads = ReplaceBufferWithShift(n->reads);
+      n->writes = ReplaceBufferWithShift(n->writes);
+    }
     Block new_block(n);
     block_sref_reuse_->Set(old_block, new_block);
+    in_target_scope_ = prev_in_target_scope;
     return new_block;
   }
 
@@ -163,6 +229,9 @@ class CacheBufferReplacer : public StmtExprMutator {
   const ffi::Array<PrimExpr>& region_mins_;
   const std::vector<int>& kept_dims_;
   ffi::Map<Block, Block>* block_sref_reuse_;
+  const BlockNode* target_block_;
+  bool block_only_;
+  bool in_target_scope_;
 };
 
 // ---------------------------------------------------------------------------
@@ -195,7 +264,8 @@ class LoopReplacer : public StmtMutator {
 // ---------------------------------------------------------------------------
 static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
                         const StmtSRef& block_sref, int read_buffer_index,
-                        const ffi::String& storage_scope) {
+                        const ffi::String& storage_scope,
+                        const ffi::String& transform) {
   // ---- Step 1: Obtain source buffer and loop --------------------------------
   const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -249,20 +319,30 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
   }
 
   // ---- Step 4: Create the cache buffer --------------------------------------
-  // Squeeze dimensions with extent == 1 (must keep at least one dim).
   std::vector<int> kept_dims;
   ffi::Array<PrimExpr> squeezed_shape;
-  for (int d = 0; d < ndim; ++d) {
-    if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
-      if (imm->value == 1) continue;
+  bool keep_full_rank = HasTileRegionCallOnBuffer(loop->body, src);
+  if (keep_full_rank) {
+    kept_dims.reserve(ndim);
+    squeezed_shape.reserve(ndim);
+    for (int d = 0; d < ndim; ++d) {
+      kept_dims.push_back(d);
+      squeezed_shape.push_back(cache_shape[d]);
     }
-    kept_dims.push_back(d);
-    squeezed_shape.push_back(cache_shape[d]);
-  }
-  // If all dims are 1, keep the last one to avoid 0-d buffer.
-  if (kept_dims.empty()) {
-    kept_dims.push_back(ndim - 1);
-    squeezed_shape.push_back(cache_shape[ndim - 1]);
+  } else {
+    // Default behavior: squeeze unit extents for compact cache allocation.
+    for (int d = 0; d < ndim; ++d) {
+      if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
+        if (imm->value == 1) continue;
+      }
+      kept_dims.push_back(d);
+      squeezed_shape.push_back(cache_shape[d]);
+    }
+    // If all dims are 1, keep the last one to avoid 0-d buffer.
+    if (kept_dims.empty()) {
+      kept_dims.push_back(ndim - 1);
+      squeezed_shape.push_back(cache_shape[ndim - 1]);
+    }
   }
 
   Buffer dst = WithScope(src, storage_scope);
@@ -297,10 +377,22 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
       Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
            {src_region_arg, dst_region_arg}));
 
+  std::string transform_mode = transform;
+  ICHECK(transform_mode.empty() || transform_mode == "square")
+      << "ValueError: unsupported cache_read_at transform `" << transform_mode
+      << "`, expected one of {\"\", \"square\"}";
+  bool do_square_transform = transform_mode == "square";
+  Stmt square_stmt;
+  if (do_square_transform) {
+    square_stmt = BuildSquareInplaceStmt(dst, squeezed_shape);
+  }
+
   // ---- Step 6: Rewrite buffer references in the loop body -------------------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
-  CacheBufferReplacer replacer(src, dst, region_mins, kept_dims, &block_sref_reuse);
+  CacheBufferReplacer replacer(
+      src, dst, region_mins, kept_dims, &block_sref_reuse,
+      /*target_block=*/do_square_transform ? block : nullptr);
   for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
     Stmt old_stmt = subtrees[i];
     subtrees.Set(i, Stmt(nullptr));
@@ -310,6 +402,9 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 7: Insert copy + allocation into the loop body ------------------
   // Prepend the copy statement before the existing subtrees.
   subtrees.insert(subtrees.begin(), copy_stmt);
+  if (do_square_transform) {
+    subtrees.insert(subtrees.begin() + 1, square_stmt);
+  }
 
   // Wrap everything in an opaque Block that owns the cache buffer allocation.
   Block alloc_block(
@@ -347,7 +442,7 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
 // ---------------------------------------------------------------------------
 static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
                          const StmtSRef& block_sref, int write_buffer_index,
-                         const ffi::String& storage_scope) {
+                         const ffi::String& storage_scope, bool write_back) {
   // ---- Step 1: Obtain destination buffer and loop ---------------------------
   const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -400,19 +495,29 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   }
 
   // ---- Step 4: Create the cache buffer --------------------------------------
-  // Squeeze dimensions with extent == 1 (must keep at least one dim).
   std::vector<int> kept_dims;
   ffi::Array<PrimExpr> squeezed_shape;
-  for (int d = 0; d < ndim; ++d) {
-    if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
-      if (imm->value == 1) continue;
+  bool keep_full_rank = HasTileRegionCallOnBuffer(loop->body, src);
+  if (keep_full_rank) {
+    kept_dims.reserve(ndim);
+    squeezed_shape.reserve(ndim);
+    for (int d = 0; d < ndim; ++d) {
+      kept_dims.push_back(d);
+      squeezed_shape.push_back(cache_shape[d]);
     }
-    kept_dims.push_back(d);
-    squeezed_shape.push_back(cache_shape[d]);
-  }
-  if (kept_dims.empty()) {
-    kept_dims.push_back(ndim - 1);
-    squeezed_shape.push_back(cache_shape[ndim - 1]);
+  } else {
+    // Default behavior: squeeze unit extents for compact cache allocation.
+    for (int d = 0; d < ndim; ++d) {
+      if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
+        if (imm->value == 1) continue;
+      }
+      kept_dims.push_back(d);
+      squeezed_shape.push_back(cache_shape[d]);
+    }
+    if (kept_dims.empty()) {
+      kept_dims.push_back(ndim - 1);
+      squeezed_shape.push_back(cache_shape[ndim - 1]);
+    }
   }
 
   Buffer dst = WithScope(src, storage_scope);
@@ -427,7 +532,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
     w->strides = {};
   }
 
-  // ---- Step 5: Build the T.copy call (write-back: cache → original) ---------
+  // ---- Step 5: Build optional T.copy call (write-back: cache → original) ---
   ffi::Array<Range> dst_ranges;
   dst_ranges.reserve(squeezed_shape.size());
   for (size_t i = 0; i < squeezed_shape.size(); ++i) {
@@ -435,13 +540,15 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
         Range::FromMinExtent(IntImm(DataType::Int(32), 0), squeezed_shape[i]));
   }
 
-  // For write-back: source is the cache, destination is the original buffer
-  PrimExpr cache_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
-  PrimExpr orig_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/2);
-
-  Stmt copy_stmt = Evaluate(
-      Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
-           {cache_region_arg, orig_region_arg}));
+  Stmt copy_stmt;
+  if (write_back) {
+    // For write-back: source is the cache, destination is the original buffer
+    PrimExpr cache_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
+    PrimExpr orig_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/2);
+    copy_stmt = Evaluate(
+        Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
+             {cache_region_arg, orig_region_arg}));
+  }
 
   // ---- Step 6: Rewrite buffer references in the loop body -------------------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
@@ -453,8 +560,10 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
     subtrees.Set(i, replacer(std::move(old_stmt)));
   }
 
-  // ---- Step 7: Append the write-back copy after the subtrees ----------------
-  subtrees.push_back(copy_stmt);
+  // ---- Step 7: Append the optional write-back copy --------------------------
+  if (write_back) {
+    subtrees.push_back(copy_stmt);
+  }
 
   Block alloc_block(
       /*iter_vars=*/{},
@@ -481,6 +590,22 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   Block new_scope_block = Downcast<Block>(
       LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
 
+  if (!write_back) {
+    // Bridge/intermediate use-case: all consumers are rewritten to the cache
+    // buffer, so the original tensor allocation can be removed from the
+    // surrounding scope block.
+    ObjectPtr<BlockNode> scope_ptr = ffi::make_object<BlockNode>(*new_scope_block.get());
+    ffi::Array<Buffer> kept_alloc_buffers;
+    kept_alloc_buffers.reserve(scope_ptr->alloc_buffers.size());
+    for (const Buffer& buf : scope_ptr->alloc_buffers) {
+      if (!buf.same_as(src)) {
+        kept_alloc_buffers.push_back(buf);
+      }
+    }
+    scope_ptr->alloc_buffers = std::move(kept_alloc_buffers);
+    new_scope_block = Block(scope_ptr);
+  }
+
   block_sref_reuse.Set(ffi::GetRef<Block>(scope_block), new_scope_block);
   self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
 }
@@ -494,18 +619,21 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   refl::GlobalDef().def(
       "tl.schedule.ScheduleCacheReadAt",
       [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
-         int read_buffer_index, const ffi::String& storage_scope) {
+         int read_buffer_index, const ffi::String& storage_scope,
+         const ffi::String& transform) {
         CacheReadAt(self->state(), self->GetSRef(loop_rv),
-                    self->GetSRef(block_rv), read_buffer_index, storage_scope);
+                    self->GetSRef(block_rv), read_buffer_index,
+                    storage_scope, transform);
       });
 
   refl::GlobalDef().def(
       "tl.schedule.ScheduleCacheWriteAt",
       [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
-         int write_buffer_index, const ffi::String& storage_scope) {
+         int write_buffer_index, const ffi::String& storage_scope,
+         bool write_back) {
         CacheWriteAt(self->state(), self->GetSRef(loop_rv),
                      self->GetSRef(block_rv), write_buffer_index,
-                     storage_scope);
+                     storage_scope, write_back);
       });
 }
 

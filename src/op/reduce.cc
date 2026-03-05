@@ -83,7 +83,7 @@ PrimExpr ReduceOpNode::MakeInitValue() const {
   bool is_uint = dst_dtype.is_uint();
   auto bits = dst_dtype.bits();
 
-  if (type->isSum()) {
+  if (type->isSum() || type->isSumSq()) {
     return make_zero(dst->dtype);
   } else if (type->isAbsSum()) {
     return make_zero(dst->dtype);
@@ -134,6 +134,8 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
       nan_propagate && (acc.dtype().is_float16() || acc.dtype().is_bfloat16());
   if (type->isSum()) {
     return acc + rhs;
+  } else if (type->isSumSq()) {
+    return acc + rhs * rhs;
   } else if (type->isAbsSum()) {
     return acc + Max(rhs, -rhs);
   } else if (type->isMax()) {
@@ -165,7 +167,7 @@ PrimExpr ReduceOpNode::MakeReduce(const PrimExpr &acc,
 std::string ReduceOpNode::MakeCodegenReducer() const {
   const bool use_nan_op =
       nan_propagate && (dst->dtype.is_float16() || dst->dtype.is_bfloat16());
-  if (type->isSum()) {
+  if (type->isSum() || type->isSumSq()) {
     return "tl::SumOp";
   } else if (type->isAbsSum()) {
     return "tl::SumOp";
@@ -318,7 +320,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     Array<Stmt> stmts;
 
     auto require_init = this->clear;
-    if (this->type->isSum() || this->type->isAbsSum() ||
+    if (this->type->isSum() || this->type->isSumSq() ||
+        this->type->isAbsSum() ||
         this->type->isBitAnd() || this->type->isBitOr() ||
         this->type->isBitXor()) {
       require_init = true;
@@ -327,7 +330,9 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
     auto clear_buffer = dst_buffer;
     auto need_duplicate = false;
     auto need_update = false;
-    if ((this->type->isSum() || this->type->isAbsSum()) && !this->clear) {
+    if ((this->type->isSum() || this->type->isSumSq() ||
+         this->type->isAbsSum()) &&
+        !this->clear) {
       need_duplicate = true;
       need_update = true;
     } else if (this->type->isBitAnd() && !this->clear) {
@@ -483,7 +488,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
       if (need_update) {
         auto src_val = BufferLoad(clear_buffer, red_indices);
         auto dst_val = BufferLoad(dst_buffer, dst_indices);
-        if (this->type->isSum() || this->type->isAbsSum()) {
+        if (this->type->isSum() || this->type->isSumSq() ||
+            this->type->isAbsSum()) {
           update = dst_val + src_val;
         } else if (this->type->isBitAnd()) {
           update = this->clear ? src_val : bitwise_and(dst_val, src_val);
