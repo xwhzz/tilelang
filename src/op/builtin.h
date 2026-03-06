@@ -27,6 +27,13 @@ static constexpr const char *kWarpSpecializationScope =
     "kWarpSpecializationScope";
 static constexpr const char *kCustomWarpSpecialization =
     "kCustomWarpSpecialization";
+// Loop annotation key controlling whether PTX async-copy rewriting is enabled
+// in the annotated loop subtree. Value should be Bool (False/True).
+static constexpr const char *kLoopPreferAsync = "parallel_prefer_async";
+// Loop annotation key controlling whether async commit/wait should be omitted
+// for injected cp.async in this parallel loop subtree. Value should be Bool.
+static constexpr const char *kParallelAsyncWithoutAsyncCommitWait =
+    "parallel_async_without_async_commit_wait";
 static constexpr const char *kLocalVarInit = "tl.local_var_init";
 // A PrimFunc-level attribute carrying a list of handle Vars
 // that must NOT be marked with the restrict qualifier in codegen.
@@ -51,6 +58,7 @@ static constexpr const char *kPtxasRegisterUsageLevel =
 static constexpr const char *kEnablePTXASVerboseOutput =
     "tl.enable_ptxas_verbose_output";
 static constexpr const char *kDisableVectorize256 = "tl.disable_vectorize_256";
+static constexpr const char *kEnableAsyncCopy = "tl.enable_async_copy";
 static constexpr const char *kEnableVectorizePlannerVerbose =
     "tl.enable_vectorize_planner_verbose";
 static constexpr const char *kDisableWGMMA = "tl.disable_wgmma";
