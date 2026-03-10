@@ -12,11 +12,7 @@ from .general_reduction import GeneralReduction  # noqa: F401
 from .layernorm_like import LayerNormLike  # noqa: F401
 from .transpose import Transpose  # noqa: F401
 
-try:
-    from .gemv import GEMV  # noqa: F401
-except ModuleNotFoundError:
-    # GEMV depends on optional bitblas modules in this repository snapshot.
-    pass
+from .gemv import GEMV  # noqa: F401
 
 try:
     from tvm.dlight.gpu import Matmul  # noqa: F401

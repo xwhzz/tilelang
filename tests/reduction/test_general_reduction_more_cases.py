@@ -383,8 +383,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--bench-backend",
         type=str,
-        default="cupti",
-        choices=["cupti", "torch"],
+        default="event",
+        choices=["event", "cupti"],
         help="Profiler backend used by tilelang.profiler.do_bench.",
     )
     parser.add_argument("--check-only", action="store_true", help="Only run schedule/lowering checks.")
