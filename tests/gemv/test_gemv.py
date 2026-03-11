@@ -1,7 +1,7 @@
 """GEMV template correctness + performance check.
 
 Validates:
-1. The `GEMV` schedule template can be applied to GEMV TE expressions.
+1. The `GEMV` schedule template lowers GEMV TE expressions to tile-style IR.
 2. Numerical correctness against PyTorch.
 3. Performance comparison against torch.compile.
 """
@@ -21,23 +21,10 @@ from tilelang.schedule.gpu.gemv import GEMV
 
 
 def _lower_mod(mod):
-    """Apply the correct lowering passes for rfactor-based schedule.
-
-    The pass ordering matters:
-    1. LowerCrossThreadReduction must come before LowerInitBlock,
-       because it needs the block structure with T.init() to detect
-       cross-thread reduction patterns.
-    2. PlanAndUpdateBufferAllocationLocation + CompactBufferAllocation
-       must come after ConvertBlocksToOpaque to properly localize buffers.
-    """
+    """Apply the lowering passes for tile-primitive GEMV."""
     mod = tir.transform.Simplify()(mod)
-    mod = tir.transform.LowerCrossThreadReduction()(mod)
     mod = tir.transform.LowerInitBlock()(mod)
-    mod = tir.transform.PlanAndUpdateBufferAllocationLocation()(mod)
     mod = tir.transform.ConvertBlocksToOpaque()(mod)
-    mod = tir.transform.UnifyThreadBinding()(mod)
-    mod = tir.transform.CompactBufferAllocation()(mod)
-    mod = tir.transform.Simplify()(mod)
     mod = tilelang.transform.ReserveRootBlock()(mod)
     return mod
 
@@ -64,6 +51,18 @@ def _build_mod(M: int, N: int, arch: str):
     print("=== Lowered IR ===")
     print(mod)
 
+    lowered_ir = str(mod)
+    if "T.copy(" not in lowered_ir:
+        raise RuntimeError("Expected tiled T.copy staging in lowered IR, but none was found.")
+    if "shared.dyn" not in lowered_ir:
+        raise RuntimeError("Expected shared.dyn staging in lowered IR, but none was found.")
+    if "local.fragment" not in lowered_ir:
+        raise RuntimeError("Expected local.fragment buffers in lowered IR, but none were found.")
+    if "T.parallel(" not in lowered_ir:
+        raise RuntimeError("Expected tile-level T.parallel loops in lowered IR, but none were found.")
+    if "tvm_thread_allreduce" in lowered_ir:
+        raise RuntimeError("Unexpected cross-thread allreduce in tile-style GEMV lowering.")
+
     return mod
 
 
@@ -89,6 +88,16 @@ def _build_mod_transposed(M: int, N: int, arch: str):
     print("=== Lowered IR (transposed) ===")
     print(mod)
 
+    lowered_ir = str(mod)
+    if "T.copy(" not in lowered_ir:
+        raise RuntimeError("Expected tiled T.copy staging in transposed lowered IR, but none was found.")
+    if "shared.dyn" not in lowered_ir:
+        raise RuntimeError("Expected shared.dyn staging in transposed lowered IR, but none was found.")
+    if "local.fragment" not in lowered_ir:
+        raise RuntimeError("Expected local.fragment buffers in transposed lowered IR, but none were found.")
+    if "tvm_thread_allreduce" in lowered_ir:
+        raise RuntimeError("Unexpected cross-thread allreduce in transposed tile-style GEMV lowering.")
+
     return mod
 
 
@@ -113,6 +122,16 @@ def _build_mod_batched(B: int, M: int, N: int, arch: str):
 
     print("=== Lowered IR (batched) ===")
     print(mod)
+
+    lowered_ir = str(mod)
+    if "T.copy(" not in lowered_ir:
+        raise RuntimeError("Expected tiled T.copy staging in batched lowered IR, but none was found.")
+    if "shared.dyn" not in lowered_ir:
+        raise RuntimeError("Expected shared.dyn staging in batched lowered IR, but none was found.")
+    if "local.fragment" not in lowered_ir:
+        raise RuntimeError("Expected local.fragment buffers in batched lowered IR, but none were found.")
+    if "tvm_thread_allreduce" in lowered_ir:
+        raise RuntimeError("Unexpected cross-thread allreduce in batched tile-style GEMV lowering.")
 
     return mod
 

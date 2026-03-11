@@ -79,6 +79,33 @@ static PrimExpr MakeRegionCall(const Buffer& buf, const ffi::Array<Range>& range
   return Call(DataType::Handle(), RegionOp::Get(), args);
 }
 
+static ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
+    const StmtSRef& low_inclusive, const ffi::Optional<StmtSRef>& high_exclusive,
+    const runtime::StorageScope& extra_relax_scope) {
+  ffi::Map<Var, Range> result;
+  const StmtSRefNode* p = low_inclusive.get();
+  const StmtSRefNode* limit = static_cast<const StmtSRefNode*>(high_exclusive.get());
+  for (; p != limit; p = p->parent) {
+    if (const ForNode* loop = p->StmtAs<ForNode>()) {
+      result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+    }
+  }
+  if (extra_relax_scope.rank != runtime::StorageRank::kGlobal) {
+    for (; p; p = p->parent) {
+      if (const ForNode* loop = p->StmtAs<ForNode>()) {
+        if (loop->kind == ForKind::kThreadBinding) {
+          const ffi::String& thread_tag = loop->thread_binding.value()->thread_tag;
+          if (CanRelaxStorageUnderThread(
+                  extra_relax_scope, runtime::ThreadScope::Create(thread_tag))) {
+            result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+          }
+        }
+      }
+    }
+  }
+  return result;
+}
+
 // Detect whether the loop body already contains tl.tileop.region calls that
 // reference `buf`. In that case, squeezing dimensions would require rewriting
 // region extents as well; keep full rank to preserve consistency.
@@ -279,7 +306,7 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create(storage_scope);
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePath(
+  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
       /*low_inclusive=*/ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
       /*high_exclusive=*/loop_sref,
       /*extra_relax_scope=*/scope));
@@ -456,7 +483,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create(storage_scope);
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePath(
+  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
       /*low_inclusive=*/ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
       /*high_exclusive=*/loop_sref,
       /*extra_relax_scope=*/scope));

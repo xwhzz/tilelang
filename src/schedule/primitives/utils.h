@@ -28,6 +28,8 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "tir/schedule/analysis.h"
+
 #include "../../op/region.h"
 
 namespace tvm {
@@ -53,6 +55,43 @@ static inline PrimExpr MakeRegionCall(const Buffer& buf,
     args.push_back(range->extent);
   }
   return Call(DataType::Handle(), RegionOp::Get(), args);
+}
+
+// ---------------------------------------------------------------------------
+// LoopDomainOfSRefTreePathSkipBlocks: variant of TVM's loop-domain collector
+// that keeps traversing through intermediate Block/BlockRealize wrappers.
+//
+// TileLang primitives often wrap loop bodies in opaque allocation blocks.
+// Subsequent primitives still need to relax loop vars under the target loop,
+// but TVM's default helper stops at the first non-For ancestor.  That makes
+// later cache/reduce primitives think there are no inner loops, collapsing
+// multi-element tiles to scalars.
+// ---------------------------------------------------------------------------
+static inline ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
+    const StmtSRef& low_inclusive, const ffi::Optional<StmtSRef>& high_exclusive,
+    const runtime::StorageScope& extra_relax_scope) {
+  ffi::Map<Var, Range> result;
+  const StmtSRefNode* p = low_inclusive.get();
+  const StmtSRefNode* limit = static_cast<const StmtSRefNode*>(high_exclusive.get());
+  for (; p != limit; p = p->parent) {
+    if (const ForNode* loop = p->StmtAs<ForNode>()) {
+      result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+    }
+  }
+  if (extra_relax_scope.rank != runtime::StorageRank::kGlobal) {
+    for (; p; p = p->parent) {
+      if (const ForNode* loop = p->StmtAs<ForNode>()) {
+        if (loop->kind == ForKind::kThreadBinding) {
+          const ffi::String& thread_tag = loop->thread_binding.value()->thread_tag;
+          if (CanRelaxStorageUnderThread(
+                  extra_relax_scope, runtime::ThreadScope::Create(thread_tag))) {
+            result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+          }
+        }
+      }
+    }
+  }
+  return result;
 }
 
 // ---------------------------------------------------------------------------

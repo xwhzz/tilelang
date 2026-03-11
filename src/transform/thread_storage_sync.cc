@@ -1343,14 +1343,29 @@ private:
       ffi::Map<Var, PrimExpr> prev_sub, curr_sub;
       for (unsigned idx = 0; idx != 3; ++idx) {
         auto &info = thread_vars[idx];
-        Var old_prev_var = prev.threads[prev.threads.size() + idx - 3]->var;
-        Var old_curr_var = curr.threads[curr.threads.size() + idx - 3]->var;
-        Var prev_var(info.name_prev, old_prev_var.dtype());
-        Var curr_var(info.name_curr, old_curr_var.dtype());
+        PrimExpr prev_thread = make_zero(DataType::Int(32));
+        PrimExpr curr_thread = make_zero(DataType::Int(32));
+
+        int prev_thread_idx =
+            static_cast<int>(prev.threads.size()) + static_cast<int>(idx) - 3;
+        if (prev_thread_idx >= 0) {
+          Var old_prev_var = prev.threads[prev_thread_idx]->var;
+          Var prev_var(info.name_prev, old_prev_var.dtype());
+          prev_thread = prev_var;
+          prev_sub.Set(old_prev_var, prev_var);
+        }
+
+        int curr_thread_idx =
+            static_cast<int>(curr.threads.size()) + static_cast<int>(idx) - 3;
+        if (curr_thread_idx >= 0) {
+          Var old_curr_var = curr.threads[curr_thread_idx]->var;
+          Var curr_var(info.name_curr, old_curr_var.dtype());
+          curr_thread = curr_var;
+          curr_sub.Set(old_curr_var, curr_var);
+        }
+
         thread_condition =
-            tir::Or(thread_condition, tir::NE(prev_var, curr_var));
-        prev_sub.Set(old_prev_var, prev_var);
-        curr_sub.Set(old_curr_var, curr_var);
+            tir::Or(thread_condition, tir::NE(prev_thread, curr_thread));
       }
       analyzer.EnterConstraint(thread_condition);
       prev_cset.Substitute(prev_sub).Populate(analyzer);
