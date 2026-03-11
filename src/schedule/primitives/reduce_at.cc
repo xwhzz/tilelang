@@ -144,7 +144,7 @@ static ffi::Array<Range> ComputeRelaxedRegion(
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create("local");
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePath(
+  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
       ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
       loop_sref, scope));
 

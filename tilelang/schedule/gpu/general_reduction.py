@@ -643,7 +643,7 @@ class GeneralReduction(GPUScheduleRule):
                         target,
                         output_block_names,
                         force_explicit_update=False,
-                        cache_reduce_write_back=(not is_second_square_single_source),
+                        cache_reduce_write_back=(first_reduction_name in output_block_names),
                     )
                     if first_thread_extent is None:
                         return None
@@ -654,7 +654,7 @@ class GeneralReduction(GPUScheduleRule):
                         target,
                         output_block_names,
                         force_explicit_update=False,
-                        cache_reduce_write_back=(not is_second_square_single_source),
+                        cache_reduce_write_back=(second_reduction_name in output_block_names),
                     )
                     if second_thread_extent is None:
                         return None
@@ -894,6 +894,7 @@ class GeneralReduction(GPUScheduleRule):
             write_buffer_index,
             "local.fragment",
             init_value,
+            write_back=(reduction_name in output_block_names or not use_output_epilogue_anchor),
         )
 
         # Lower to tile-level T.reduce only for single-source reductions.
