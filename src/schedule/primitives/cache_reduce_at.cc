@@ -68,19 +68,16 @@ using support::NDIntSet;
 // (Same approach as in cache_read_at.cc)
 // ---------------------------------------------------------------------------
 class CacheReduceBufferReplacer : public StmtExprMutator {
- public:
-  CacheReduceBufferReplacer(const Buffer& src, const Buffer& dst,
-                            const ffi::Array<PrimExpr>& region_mins,
-                            const std::vector<int>& kept_dims,
-                            ffi::Map<Block, Block>* block_sref_reuse)
-      : src_(src),
-        dst_(dst),
-        region_mins_(region_mins),
-        kept_dims_(kept_dims),
+public:
+  CacheReduceBufferReplacer(const Buffer &src, const Buffer &dst,
+                            const ffi::Array<PrimExpr> &region_mins,
+                            const std::vector<int> &kept_dims,
+                            ffi::Map<Block, Block> *block_sref_reuse)
+      : src_(src), dst_(dst), region_mins_(region_mins), kept_dims_(kept_dims),
         block_sref_reuse_(block_sref_reuse) {}
 
- private:
-  ffi::Array<PrimExpr> SqueezedIndices(const ffi::Array<PrimExpr>& indices) {
+private:
+  ffi::Array<PrimExpr> SqueezedIndices(const ffi::Array<PrimExpr> &indices) {
     ffi::Array<PrimExpr> new_indices;
     for (int d : kept_dims_) {
       new_indices.push_back(indices[d] - region_mins_[d]);
@@ -88,10 +85,11 @@ class CacheReduceBufferReplacer : public StmtExprMutator {
     return new_indices;
   }
 
-  PrimExpr VisitExpr_(const BufferLoadNode* _load) final {
+  PrimExpr VisitExpr_(const BufferLoadNode *_load) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(_load));
     if (load->buffer.same_as(src_)) {
-      ObjectPtr<BufferLoadNode> n = ffi::make_object<BufferLoadNode>(*load.get());
+      ObjectPtr<BufferLoadNode> n =
+          ffi::make_object<BufferLoadNode>(*load.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
       return BufferLoad(n);
@@ -99,10 +97,12 @@ class CacheReduceBufferReplacer : public StmtExprMutator {
     return load;
   }
 
-  Stmt VisitStmt_(const BufferStoreNode* _store) final {
-    BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(_store));
+  Stmt VisitStmt_(const BufferStoreNode *_store) final {
+    BufferStore store =
+        Downcast<BufferStore>(StmtExprMutator::VisitStmt_(_store));
     if (store->buffer.same_as(src_)) {
-      ObjectPtr<BufferStoreNode> n = ffi::make_object<BufferStoreNode>(*store.get());
+      ObjectPtr<BufferStoreNode> n =
+          ffi::make_object<BufferStoreNode>(*store.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
       return BufferStore(n);
@@ -110,7 +110,7 @@ class CacheReduceBufferReplacer : public StmtExprMutator {
     return store;
   }
 
-  Stmt VisitStmt_(const BlockNode* _block) final {
+  Stmt VisitStmt_(const BlockNode *_block) final {
     Block old_block = ffi::GetRef<Block>(_block);
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(_block));
     ObjectPtr<BlockNode> n = ffi::make_object<BlockNode>(*block.get());
@@ -121,16 +121,16 @@ class CacheReduceBufferReplacer : public StmtExprMutator {
     return new_block;
   }
 
-  ffi::Array<BufferRegion> ReplaceBufferWithShift(
-      const ffi::Array<BufferRegion>& regions) {
+  ffi::Array<BufferRegion>
+  ReplaceBufferWithShift(const ffi::Array<BufferRegion> &regions) {
     ffi::Array<BufferRegion> result;
-    for (const auto& region : regions) {
+    for (const auto &region : regions) {
       if (region->buffer.same_as(src_)) {
         ffi::Array<Range> new_ranges;
         for (int d : kept_dims_) {
-          new_ranges.push_back(Range::FromMinExtent(
-              region->region[d]->min - region_mins_[d],
-              region->region[d]->extent));
+          new_ranges.push_back(
+              Range::FromMinExtent(region->region[d]->min - region_mins_[d],
+                                   region->region[d]->extent));
         }
         result.push_back(BufferRegion(dst_, new_ranges));
       } else {
@@ -140,51 +140,49 @@ class CacheReduceBufferReplacer : public StmtExprMutator {
     return result;
   }
 
-  const Buffer& src_;
-  const Buffer& dst_;
-  const ffi::Array<PrimExpr>& region_mins_;
-  const std::vector<int>& kept_dims_;
-  ffi::Map<Block, Block>* block_sref_reuse_;
+  const Buffer &src_;
+  const Buffer &dst_;
+  const ffi::Array<PrimExpr> &region_mins_;
+  const std::vector<int> &kept_dims_;
+  ffi::Map<Block, Block> *block_sref_reuse_;
 };
 
 // ---------------------------------------------------------------------------
 // CacheReduceAt: main entry point
 // ---------------------------------------------------------------------------
-static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
-                           const StmtSRef& block_sref,
-                           int write_buffer_index,
-                           const ffi::String& storage_scope,
-                           double init_value,
-                           bool write_back) {
+static void CacheReduceAt(ScheduleState self, const StmtSRef &loop_sref,
+                          const StmtSRef &block_sref, int write_buffer_index,
+                          const ffi::String &storage_scope, double init_value,
+                          bool write_back) {
   // ---- Step 1: Obtain destination buffer and loop -------------------------
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
   Buffer src = GetNthAccessBuffer(self, block_ref, write_buffer_index,
                                   BufferIndexType::kWrite);
 
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   // ---- Step 2: Gather inner-loop domains and block bindings ---------------
   BlockRealize realize = GetBlockRealize(self, block_sref);
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create(storage_scope);
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-      ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
-      loop_sref, scope));
+  ffi::Map<Var, arith::IntSet> var_dom =
+      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+          ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent), loop_sref,
+          scope));
 
   // ---- Step 3: Relax the buffer write region over the inner loops ---------
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion& buffer_region : block->writes) {
+  for (const BufferRegion &buffer_region : block->writes) {
     if (buffer_region->buffer.same_as(src)) {
       ffi::Array<arith::IntSet> relaxed =
           arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
       relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
     }
   }
-  ICHECK(!relaxed_regions.empty())
-      << "ValueError: buffer " << src->name
-      << " is not written in the specified block";
+  ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << src->name
+                                   << " is not written in the specified block";
 
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
   int ndim = static_cast<int>(unified.size());
@@ -210,8 +208,9 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
   std::vector<int> kept_dims;
   ffi::Array<PrimExpr> squeezed_shape;
   for (int d = 0; d < ndim; ++d) {
-    if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
-      if (imm->value == 1) continue;
+    if (const auto *imm = cache_shape[d].as<IntImmNode>()) {
+      if (imm->value == 1)
+        continue;
     }
     kept_dims.push_back(d);
     squeezed_shape.push_back(cache_shape[d]);
@@ -223,11 +222,12 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
 
   Buffer dst = WithScope(src, storage_scope);
   {
-    auto* w = dst.CopyOnWrite();
+    auto *w = dst.CopyOnWrite();
     w->shape = squeezed_shape;
     std::string scope_suffix = storage_scope;
-    for (auto& c : scope_suffix) {
-      if (c == '.') c = '_';
+    for (auto &c : scope_suffix) {
+      if (c == '.')
+        c = '_';
     }
     w->name = src->name + "_" + scope_suffix;
     w->strides = {};
@@ -243,19 +243,19 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
 
   PrimExpr fill_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
   PrimExpr fill_value = make_const(src->dtype, init_value);
-  Stmt fill_stmt = Evaluate(
-      Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
-           {fill_region_arg, fill_value}));
+  Stmt fill_stmt = Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
+                                 {fill_region_arg, fill_value}));
 
   // ---- Step 6: Build optional T.copy call (write-back) --------------------
   Stmt copy_stmt;
   if (write_back) {
-    PrimExpr cache_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
-    PrimExpr orig_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/2);
+    PrimExpr cache_region_arg =
+        MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
+    PrimExpr orig_region_arg =
+        MakeRegionCall(src, cache_region, /*access_mask=*/2);
 
-    copy_stmt = Evaluate(
-        Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
-             {cache_region_arg, orig_region_arg}));
+    copy_stmt = Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
+                              {cache_region_arg, orig_region_arg}));
   }
 
   // ---- Step 7: Rewrite buffer references in the loop body -----------------
@@ -287,8 +287,7 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
       /*alloc_buffers=*/{dst});
   BlockRealize alloc_realize(
       /*values=*/{},
-      /*predicate=*/const_true(),
-      alloc_block);
+      /*predicate=*/const_true(), alloc_block);
 
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
   new_loop_node->body = std::move(alloc_realize);
@@ -297,7 +296,7 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 9: Replace in the scope root block ----------------------------
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   Block new_scope_block = Downcast<Block>(
       LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
@@ -306,10 +305,11 @@ static void CacheReduceAt(ScheduleState self, const StmtSRef& loop_sref,
     // Intermediate reduction use-case: all consumers are rewritten to the
     // cache buffer, so the original tensor allocation can be removed from the
     // surrounding scope block.
-    ObjectPtr<BlockNode> scope_ptr = ffi::make_object<BlockNode>(*new_scope_block.get());
+    ObjectPtr<BlockNode> scope_ptr =
+        ffi::make_object<BlockNode>(*new_scope_block.get());
     ffi::Array<Buffer> kept_alloc_buffers;
     kept_alloc_buffers.reserve(scope_ptr->alloc_buffers.size());
-    for (const Buffer& buf : scope_ptr->alloc_buffers) {
+    for (const Buffer &buf : scope_ptr->alloc_buffers) {
       if (!buf.same_as(src)) {
         kept_alloc_buffers.push_back(buf);
       }
@@ -329,8 +329,8 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def(
       "tl.schedule.ScheduleCacheReduceAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
-         int write_buffer_index, const ffi::String& storage_scope,
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
+         int write_buffer_index, const ffi::String &storage_scope,
          double init_value, bool write_back) {
         CacheReduceAt(self->state(), self->GetSRef(loop_rv),
                       self->GetSRef(block_rv), write_buffer_index,
@@ -338,5 +338,5 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       });
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

@@ -2,8 +2,8 @@ from . import _ffi_api
 from tvm.tir import Schedule as TVMSchedule
 from tvm.tir.schedule import LoopRV, BlockRV
 
+
 class Schedule(TVMSchedule):
-    
     def launch_thread(self, block: BlockRV, num_threads: int) -> None:
         _ffi_api.ScheduleLaunchThread(self, block, num_threads)
 
@@ -30,10 +30,7 @@ class Schedule(TVMSchedule):
             "full_col": 2,
         }.get(policy)
         if policy_id is None:
-            raise ValueError(
-                f"Unsupported gemm policy `{policy}`, expected one of "
-                '{"square", "full_row", "full_col"}'
-            )
+            raise ValueError(f'Unsupported gemm policy `{policy}`, expected one of {{"square", "full_row", "full_col"}}')
         _ffi_api.ScheduleGemmAt(
             self,
             loop,
@@ -61,8 +58,7 @@ class Schedule(TVMSchedule):
             write_buffer_index,
         )
 
-    def cache_read_at(self, loop: LoopRV, block: BlockRV, read_buffer_index: int,
-                      storage_scope: str, transform: str = "") -> None:
+    def cache_read_at(self, loop: LoopRV, block: BlockRV, read_buffer_index: int, storage_scope: str, transform: str = "") -> None:
         """Insert a cached copy of a read buffer at the specified loop level.
 
         This creates a compact cache buffer inside the loop, inserts a T.copy
@@ -86,12 +82,18 @@ class Schedule(TVMSchedule):
             - "" (default): no transform
             - "square": dst = dst * dst
         """
-        _ffi_api.ScheduleCacheReadAt(self, loop, block, read_buffer_index,
-                                     storage_scope, transform)
+        _ffi_api.ScheduleCacheReadAt(self, loop, block, read_buffer_index, storage_scope, transform)
 
-    def cache_write_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
-                       storage_scope: str, write_back: bool = True,
-                       reduce_type: str = "", reducer_replication: str = "none") -> None:
+    def cache_write_at(
+        self,
+        loop: LoopRV,
+        block: BlockRV,
+        write_buffer_index: int,
+        storage_scope: str,
+        write_back: bool = True,
+        reduce_type: str = "",
+        reducer_replication: str = "none",
+    ) -> None:
         """Insert a cached copy of a write buffer at the specified loop level.
 
         This creates a compact cache buffer inside the loop, rewrites all
@@ -120,12 +122,9 @@ class Schedule(TVMSchedule):
         reducer_replication : str
             Reducer replication strategy, either "none" (default) or "all".
         """
-        _ffi_api.ScheduleCacheWriteAt(self, loop, block, write_buffer_index,
-                                      storage_scope, write_back,
-                                      reduce_type, reducer_replication)
+        _ffi_api.ScheduleCacheWriteAt(self, loop, block, write_buffer_index, storage_scope, write_back, reduce_type, reducer_replication)
 
-    def fill_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
-                value: float = 0.0) -> None:
+    def fill_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int, value: float = 0.0) -> None:
         """Insert a T.fill to initialize a buffer at the specified loop level.
 
         This analyzes the block's write buffer access region within one
@@ -150,10 +149,17 @@ class Schedule(TVMSchedule):
         """
         _ffi_api.ScheduleFillAt(self, loop, block, write_buffer_index, value)
 
-    def reduce_at(self, loop: LoopRV, block: BlockRV,
-                  read_buffer_index: int, write_buffer_index: int,
-                  reduce_type: str, dim: int, clear: bool = True,
-                  replace_loop_body: bool = False) -> None:
+    def reduce_at(
+        self,
+        loop: LoopRV,
+        block: BlockRV,
+        read_buffer_index: int,
+        write_buffer_index: int,
+        reduce_type: str,
+        dim: int,
+        clear: bool = True,
+        replace_loop_body: bool = False,
+    ) -> None:
         """Insert a T.reduce at the specified loop level.
 
         This inserts a tile-level reduction operation for the specified loop.
@@ -183,14 +189,11 @@ class Schedule(TVMSchedule):
             If True, replace the loop body with only the generated T.reduce.
             If False (default), append T.reduce at the end of loop body.
         """
-        _ffi_api.ScheduleReduceAt(self, loop, block, read_buffer_index,
-                                  write_buffer_index, reduce_type, dim, clear,
-                                  replace_loop_body)
+        _ffi_api.ScheduleReduceAt(self, loop, block, read_buffer_index, write_buffer_index, reduce_type, dim, clear, replace_loop_body)
 
-    def cache_reduce_at(self, loop: LoopRV, block: BlockRV,
-                        write_buffer_index: int, storage_scope: str,
-                        init_value: float = 0.0,
-                        write_back: bool = True) -> None:
+    def cache_reduce_at(
+        self, loop: LoopRV, block: BlockRV, write_buffer_index: int, storage_scope: str, init_value: float = 0.0, write_back: bool = True
+    ) -> None:
         """Cache a write buffer for reduction with initialization.
 
         This is a combined primitive for reduction scheduling that:
@@ -226,5 +229,4 @@ class Schedule(TVMSchedule):
             buffer (default: True). Set to False for purely intermediate
             tensors whose consumers are all rewritten to read the cache.
         """
-        _ffi_api.ScheduleCacheReduceAt(self, loop, block, write_buffer_index,
-                                       storage_scope, init_value, write_back)
+        _ffi_api.ScheduleCacheReduceAt(self, loop, block, write_buffer_index, storage_scope, init_value, write_back)

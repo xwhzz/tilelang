@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from typing import Tuple
 
 import tilelang
 import torch
@@ -22,7 +21,7 @@ def _lower_mod(mod):
     return mod
 
 
-def _dtype_tolerance(dtype: str) -> Tuple[float, float]:
+def _dtype_tolerance(dtype: str) -> tuple[float, float]:
     if dtype == "float16":
         return 1e-1, 1e-1
     return 1e-4, 1e-4
@@ -176,7 +175,7 @@ def build_and_run(
     batch: int = 1,
     transposed_b: bool = False,
     epilogue: bool = False,
-) -> Tuple[float, float]:
+) -> tuple[float, float]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
 
@@ -209,10 +208,7 @@ def build_and_run(
     tilelang_time = do_bench(lambda: kernel(a_torch, b_torch, c_torch), backend=bench_backend)
     torch_time = do_bench(lambda: ref_fn(a_torch, b_torch), backend=bench_backend)
 
-    print(
-        f"TileLang time: {tilelang_time:.6f} ms, "
-        f"torch.compile time: {torch_time:.6f} ms"
-    )
+    print(f"TileLang time: {tilelang_time:.6f} ms, torch.compile time: {torch_time:.6f} ms")
     return tilelang_time, torch_time
 
 

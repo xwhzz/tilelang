@@ -3,7 +3,9 @@
 
 # pylint: disable=missing-docstring
 """Utility methods for generic GPU."""
-from typing import List, Optional
+
+from __future__ import annotations
+
 
 from tvm import tir
 from tvm.target import Target
@@ -33,17 +35,17 @@ def max_threads_per_block(target: Target) -> int:
 
 def suggest_threads_per_block(
     target: Target,
-    loops: List[tir.For],
+    loops: list[tir.For],
     max_threads_for_dynamic_loop: int = 32,
-) -> List[int]:
+) -> list[int]:
     if target.kind.name == "cuda":
         threads = 1024
     elif target.kind.name == "rocm" or target.kind.name == "metal":
         threads = 256
     else:
         threads = 64
-    results: List[Optional[int]] = []
-    dynamic: List[int] = []
+    results: list[int | None] = []
+    dynamic: list[int] = []
     for i, loop in enumerate(loops):
         loop_extent = loop.extent
         if isinstance(loop_extent, tir.IntImm):

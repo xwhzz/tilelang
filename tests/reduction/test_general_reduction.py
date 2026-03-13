@@ -9,11 +9,6 @@ This script validates a reduction + injective epilogue pattern:
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-import types
-from pathlib import Path
-from typing import Tuple
 
 import tilelang
 import torch
@@ -62,7 +57,7 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     return mod
 
 
-def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tuple[float, float]:
+def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> tuple[float, float]:
     """Build a general-reduction kernel, run correctness check, and benchmark."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -95,9 +90,7 @@ def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tupl
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Check general-reduction template correctness and performance."
-    )
+    parser = argparse.ArgumentParser(description="Check general-reduction template correctness and performance.")
     parser.add_argument("--m", type=int, default=1024, help="First output dimension.")
     parser.add_argument("--n", type=int, default=16, help="Second output dimension.")
     parser.add_argument("--k", type=int, default=2048, help="Reduction dimension.")

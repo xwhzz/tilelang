@@ -19,7 +19,9 @@
 # Modifications Copyright (c) Microsoft.
 """A tile-primitive-first schedule rule for element-wise operators."""
 
-from typing import Any, List, Optional, Union
+from __future__ import annotations
+
+from typing import Any
 
 from tvm import tir
 from tvm.target import Target
@@ -30,7 +32,7 @@ from . import utils
 from .base import GPUScheduleRule
 
 
-def _as_const_int(expr: tir.PrimExpr) -> Optional[int]:
+def _as_const_int(expr: tir.PrimExpr) -> int | None:
     if isinstance(expr, tir.IntImm):
         return int(expr.value)
     return None
@@ -89,7 +91,7 @@ class ElementWise(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -125,8 +127,8 @@ class ElementWise(GPUScheduleRule):
         if len(sch.get_loops(block)) == 0:
             return None
 
-        s_loops: List[tir.schedule.LoopRV] = []
-        o_loops: List[tir.schedule.LoopRV] = []
+        s_loops: list[tir.schedule.LoopRV] = []
+        o_loops: list[tir.schedule.LoopRV] = []
         for iter_info in block_info.iters:
             if iter_info.kind == "S":
                 s_loops.append(iter_info.loop_rv)
@@ -164,6 +166,6 @@ class ElementWise(GPUScheduleRule):
         sch.launch_thread(sch.get_block("root"), num_threads)
         return sch
 
-    def apply_config(self, func: tir.PrimFunc, config) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    def apply_config(self, func: tir.PrimFunc, config) -> None | tir.Schedule | list[tir.Schedule]:
         target = _resolve_target_from_config(config)
         return self.apply(func, target, False)

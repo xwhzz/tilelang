@@ -41,17 +41,17 @@ using namespace tir;
 // MakeRegionCall: construct a tl.region() Call that encodes a BufferRegion as
 // a PrimExpr for passing as an argument to tl.tileop.{copy,fill,reduce}.
 // ---------------------------------------------------------------------------
-static inline PrimExpr MakeRegionCall(const Buffer& buf,
-                                      const ffi::Array<Range>& ranges,
+static inline PrimExpr MakeRegionCall(const Buffer &buf,
+                                      const ffi::Array<Range> &ranges,
                                       int access_mask) {
   ffi::Array<PrimExpr> args;
   ffi::Array<PrimExpr> min_indices;
-  for (const auto& range : ranges) {
+  for (const auto &range : ranges) {
     min_indices.push_back(range->min);
   }
   args.push_back(BufferLoad(buf, min_indices));
   args.push_back(IntImm(DataType::Int(32), access_mask));
-  for (const auto& range : ranges) {
+  for (const auto &range : ranges) {
     args.push_back(range->extent);
   }
   return Call(DataType::Handle(), RegionOp::Get(), args);
@@ -68,24 +68,29 @@ static inline PrimExpr MakeRegionCall(const Buffer& buf,
 // multi-element tiles to scalars.
 // ---------------------------------------------------------------------------
 static inline ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
-    const StmtSRef& low_inclusive, const ffi::Optional<StmtSRef>& high_exclusive,
-    const runtime::StorageScope& extra_relax_scope) {
+    const StmtSRef &low_inclusive,
+    const ffi::Optional<StmtSRef> &high_exclusive,
+    const runtime::StorageScope &extra_relax_scope) {
   ffi::Map<Var, Range> result;
-  const StmtSRefNode* p = low_inclusive.get();
-  const StmtSRefNode* limit = static_cast<const StmtSRefNode*>(high_exclusive.get());
+  const StmtSRefNode *p = low_inclusive.get();
+  const StmtSRefNode *limit =
+      static_cast<const StmtSRefNode *>(high_exclusive.get());
   for (; p != limit; p = p->parent) {
-    if (const ForNode* loop = p->StmtAs<ForNode>()) {
+    if (const ForNode *loop = p->StmtAs<ForNode>()) {
       result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
     }
   }
   if (extra_relax_scope.rank != runtime::StorageRank::kGlobal) {
     for (; p; p = p->parent) {
-      if (const ForNode* loop = p->StmtAs<ForNode>()) {
+      if (const ForNode *loop = p->StmtAs<ForNode>()) {
         if (loop->kind == ForKind::kThreadBinding) {
-          const ffi::String& thread_tag = loop->thread_binding.value()->thread_tag;
+          const ffi::String &thread_tag =
+              loop->thread_binding.value()->thread_tag;
           if (CanRelaxStorageUnderThread(
-                  extra_relax_scope, runtime::ThreadScope::Create(thread_tag))) {
-            result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+                  extra_relax_scope,
+                  runtime::ThreadScope::Create(thread_tag))) {
+            result.Set(loop->loop_var,
+                       Range::FromMinExtent(loop->min, loop->extent));
           }
         }
       }
@@ -98,14 +103,14 @@ static inline ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
 // LoopReplacer: rewrite a specific ForNode in the AST with a new one.
 // ---------------------------------------------------------------------------
 class LoopReplacer : public StmtMutator {
- public:
-  LoopReplacer(const ForNode* old_loop, For new_loop)
+public:
+  LoopReplacer(const ForNode *old_loop, For new_loop)
       : old_loop_(old_loop), new_loop_(std::move(new_loop)), found_(false) {}
 
-  Stmt VisitStmt(const Stmt& stmt) final {
+  Stmt VisitStmt(const Stmt &stmt) final {
     return found_ ? stmt : StmtMutator::VisitStmt(stmt);
   }
-  Stmt VisitStmt_(const ForNode* loop) final {
+  Stmt VisitStmt_(const ForNode *loop) final {
     if (loop == old_loop_) {
       found_ = true;
       return new_loop_;
@@ -113,13 +118,13 @@ class LoopReplacer : public StmtMutator {
     return StmtMutator::VisitStmt_(loop);
   }
 
- private:
-  const ForNode* old_loop_;
+private:
+  const ForNode *old_loop_;
   For new_loop_;
   bool found_;
 };
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TL_SCHEDULE_PRIMITIVES_UTILS_H_
+#endif // TVM_TL_SCHEDULE_PRIMITIVES_UTILS_H_

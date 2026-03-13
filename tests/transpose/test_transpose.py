@@ -4,7 +4,7 @@ import tilelang
 from tilelang.schedule import Schedule
 
 """
-Transpose Schedule Template 
+Transpose Schedule Template
 """
 M, N = 1024, 2048
 
@@ -49,15 +49,18 @@ print(mod)
 kernel = tilelang.compile(mod["main"])
 
 import torch
-torch._dynamo.reset() # 强制重置 Dynamo，确保重新触发编译
+
+torch._dynamo.reset()  # 强制重置 Dynamo，确保重新触发编译
 a = torch.randn((M, N)).cuda()
 
 c = torch.empty((N, M)).cuda()
 kernel(a, c)
 
+
 @torch.compile()
 def fntorch(a):
     return a.transpose(0, 1).contiguous()
+
 
 ref_c = fntorch(a)
 

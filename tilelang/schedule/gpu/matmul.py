@@ -6,7 +6,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple, Union
 
 from tilelang import tvm
 from tvm.target import Target
@@ -38,13 +37,13 @@ def _largest_power_of_two_at_most(value: int) -> int:
     return result
 
 
-def _as_static_int(expr: tir.PrimExpr) -> Optional[int]:
+def _as_static_int(expr: tir.PrimExpr) -> int | None:
     if isinstance(expr, tir.IntImm):
         return int(expr.value)
     return None
 
 
-def _choose_static_tile(candidates: List[int], extent: Optional[int]) -> int:
+def _choose_static_tile(candidates: list[int], extent: int | None) -> int:
     if extent is None:
         return candidates[0]
     for candidate in candidates:
@@ -94,8 +93,8 @@ def _has_block(sch: TileSchedule, name: str) -> bool:
 def _collect_injective_consumer_chain(
     sch: TileSchedule,
     main_block: tir.schedule.BlockRV,
-) -> Optional[List[str]]:
-    chain: List[str] = []
+) -> list[str] | None:
+    chain: list[str] = []
     current = main_block
     while True:
         consumers = list(sch.get_consumers(current))
@@ -123,11 +122,8 @@ def _expr_uses_var(expr: tir.PrimExpr, var: tir.Var) -> bool:
     return used
 
 
-def _infer_transpose_flags(block_stmt: tir.Block) -> Tuple[bool, bool]:
-    reduce_vars = [
-        iter_var.var for iter_var in block_stmt.iter_vars
-        if iter_var.iter_type == tir.IterVar.CommReduce
-    ]
+def _infer_transpose_flags(block_stmt: tir.Block) -> tuple[bool, bool]:
+    reduce_vars = [iter_var.var for iter_var in block_stmt.iter_vars if iter_var.iter_type == tir.IterVar.CommReduce]
     if len(reduce_vars) != 1 or len(block_stmt.reads) != 2:
         return False, False
 
@@ -152,12 +148,10 @@ def _can_use_tile_gemm(
     output_dtype = original_block_stmt.writes[0].buffer.dtype
     if any(dtype not in {"float16", "bfloat16", "int8", "uint8"} for dtype in input_dtypes):
         return False
-    if output_dtype not in {"float16", "float32", "int32"}:
-        return False
-    return True
+    return output_dtype in {"float16", "float32", "int32"}
 
 
-def _analyze_original_chain(sch: TileSchedule) -> Optional[Tuple[str, List[str]]]:
+def _analyze_original_chain(sch: TileSchedule) -> tuple[str, list[str]] | None:
     root = get_root_block(sch)
     blocks = list(sch.get_child_blocks(root))
     if not blocks:
@@ -184,7 +178,7 @@ def _analyze_original_chain(sch: TileSchedule) -> Optional[Tuple[str, List[str]]
         if not _is_injective_block(sch.get(block)):
             return None
 
-    epilogue_names: List[str] = []
+    epilogue_names: list[str] = []
     for block in blocks[main_index + 1 :]:
         if not _is_injective_block(sch.get(block)):
             return None
@@ -201,7 +195,7 @@ class Matmul(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -338,6 +332,6 @@ class Matmul(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         config,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         target = _resolve_target_from_config(config)
         return self.apply(func, target, False)

@@ -62,43 +62,49 @@ using support::NDIntSet;
 // Helper: construct a tl.region() Call that encodes a BufferRegion as a
 // PrimExpr so it can be passed as an argument to tl.tileop.copy.
 // ---------------------------------------------------------------------------
-static PrimExpr MakeRegionCall(const Buffer& buf, const ffi::Array<Range>& ranges,
+static PrimExpr MakeRegionCall(const Buffer &buf,
+                               const ffi::Array<Range> &ranges,
                                int access_mask) {
   ffi::Array<PrimExpr> args;
   // arg 0: BufferLoad whose indices are the per-axis minima
   ffi::Array<PrimExpr> min_indices;
-  for (const auto& range : ranges) {
+  for (const auto &range : ranges) {
     min_indices.push_back(range->min);
   }
   args.push_back(BufferLoad(buf, min_indices));
   // arg 1: access mask (1=read, 2=write)
   args.push_back(IntImm(DataType::Int(32), access_mask));
   // args 2+i: per-axis extents
-  for (const auto& range : ranges) {
+  for (const auto &range : ranges) {
     args.push_back(range->extent);
   }
   return Call(DataType::Handle(), RegionOp::Get(), args);
 }
 
 static ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
-    const StmtSRef& low_inclusive, const ffi::Optional<StmtSRef>& high_exclusive,
-    const runtime::StorageScope& extra_relax_scope) {
+    const StmtSRef &low_inclusive,
+    const ffi::Optional<StmtSRef> &high_exclusive,
+    const runtime::StorageScope &extra_relax_scope) {
   ffi::Map<Var, Range> result;
-  const StmtSRefNode* p = low_inclusive.get();
-  const StmtSRefNode* limit = static_cast<const StmtSRefNode*>(high_exclusive.get());
+  const StmtSRefNode *p = low_inclusive.get();
+  const StmtSRefNode *limit =
+      static_cast<const StmtSRefNode *>(high_exclusive.get());
   for (; p != limit; p = p->parent) {
-    if (const ForNode* loop = p->StmtAs<ForNode>()) {
+    if (const ForNode *loop = p->StmtAs<ForNode>()) {
       result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
     }
   }
   if (extra_relax_scope.rank != runtime::StorageRank::kGlobal) {
     for (; p; p = p->parent) {
-      if (const ForNode* loop = p->StmtAs<ForNode>()) {
+      if (const ForNode *loop = p->StmtAs<ForNode>()) {
         if (loop->kind == ForKind::kThreadBinding) {
-          const ffi::String& thread_tag = loop->thread_binding.value()->thread_tag;
+          const ffi::String &thread_tag =
+              loop->thread_binding.value()->thread_tag;
           if (CanRelaxStorageUnderThread(
-                  extra_relax_scope, runtime::ThreadScope::Create(thread_tag))) {
-            result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
+                  extra_relax_scope,
+                  runtime::ThreadScope::Create(thread_tag))) {
+            result.Set(loop->loop_var,
+                       Range::FromMinExtent(loop->min, loop->extent));
           }
         }
       }
@@ -110,17 +116,19 @@ static ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
 // Detect whether the loop body already contains tl.tileop.region calls that
 // reference `buf`. In that case, squeezing dimensions would require rewriting
 // region extents as well; keep full rank to preserve consistency.
-static bool HasTileRegionCallOnBuffer(const Stmt& body, const Buffer& buf) {
+static bool HasTileRegionCallOnBuffer(const Stmt &body, const Buffer &buf) {
   bool found = false;
-  PostOrderVisit(body, [&found, &buf](const ObjectRef& obj) {
-    if (found) return;
-    const auto* call = obj.as<CallNode>();
-    if (call == nullptr) return;
-    const auto* op = call->op.as<OpNode>();
+  PostOrderVisit(body, [&found, &buf](const ObjectRef &obj) {
+    if (found)
+      return;
+    const auto *call = obj.as<CallNode>();
+    if (call == nullptr)
+      return;
+    const auto *op = call->op.as<OpNode>();
     if (op == nullptr || op->name != "tl.tileop.region" || call->args.empty()) {
       return;
     }
-    const auto* load = call->args[0].as<BufferLoadNode>();
+    const auto *load = call->args[0].as<BufferLoadNode>();
     if (load != nullptr && load->buffer.same_as(buf)) {
       found = true;
     }
@@ -131,8 +139,8 @@ static bool HasTileRegionCallOnBuffer(const Stmt& body, const Buffer& buf) {
 // Build an in-place square transform:
 //   for ...:
 //     dst[idx] = dst[idx] * dst[idx]
-static Stmt BuildSquareInplaceStmt(const Buffer& dst,
-                                   const ffi::Array<PrimExpr>& shape) {
+static Stmt BuildSquareInplaceStmt(const Buffer &dst,
+                                   const ffi::Array<PrimExpr> &shape) {
   int ndim = static_cast<int>(shape.size());
   std::vector<Var> iters;
   iters.reserve(ndim);
@@ -148,12 +156,9 @@ static Stmt BuildSquareInplaceStmt(const Buffer& dst,
   PrimExpr val = BufferLoad(dst, indices);
   Stmt body = BufferStore(dst, val * val, indices);
   for (int d = ndim - 1; d >= 0; --d) {
-    body = For(
-        iters[d],
-        /*min=*/IntImm(DataType::Int(32), 0),
-        /*extent=*/shape[d],
-        ForKind::kSerial,
-        body);
+    body = For(iters[d],
+               /*min=*/IntImm(DataType::Int(32), 0),
+               /*extent=*/shape[d], ForKind::kSerial, body);
   }
   return body;
 }
@@ -163,29 +168,22 @@ static Stmt BuildSquareInplaceStmt(const Buffer& dst,
 // shifting the indices by subtracting the per-axis region minimums.
 // ---------------------------------------------------------------------------
 class CacheBufferReplacer : public StmtExprMutator {
- public:
+public:
   // kept_dims: indices of original dimensions that are kept (not squeezed).
-  CacheBufferReplacer(const Buffer& src, const Buffer& dst,
-                      const ffi::Array<PrimExpr>& region_mins,
-                      const std::vector<int>& kept_dims,
-                      ffi::Map<Block, Block>* block_sref_reuse,
-                      const BlockNode* target_block = nullptr)
-      : src_(src),
-        dst_(dst),
-        region_mins_(region_mins),
-        kept_dims_(kept_dims),
-        block_sref_reuse_(block_sref_reuse),
-        target_block_(target_block),
-        block_only_(target_block != nullptr),
-        in_target_scope_(false) {}
+  CacheBufferReplacer(const Buffer &src, const Buffer &dst,
+                      const ffi::Array<PrimExpr> &region_mins,
+                      const std::vector<int> &kept_dims,
+                      ffi::Map<Block, Block> *block_sref_reuse,
+                      const BlockNode *target_block = nullptr)
+      : src_(src), dst_(dst), region_mins_(region_mins), kept_dims_(kept_dims),
+        block_sref_reuse_(block_sref_reuse), target_block_(target_block),
+        block_only_(target_block != nullptr), in_target_scope_(false) {}
 
- private:
-  bool ShouldRewriteAccess() const {
-    return !block_only_ || in_target_scope_;
-  }
+private:
+  bool ShouldRewriteAccess() const { return !block_only_ || in_target_scope_; }
 
   // Build squeezed indices: for each kept dim, compute (original_idx - min).
-  ffi::Array<PrimExpr> SqueezedIndices(const ffi::Array<PrimExpr>& indices) {
+  ffi::Array<PrimExpr> SqueezedIndices(const ffi::Array<PrimExpr> &indices) {
     ffi::Array<PrimExpr> new_indices;
     for (int d : kept_dims_) {
       new_indices.push_back(indices[d] - region_mins_[d]);
@@ -193,10 +191,11 @@ class CacheBufferReplacer : public StmtExprMutator {
     return new_indices;
   }
 
-  PrimExpr VisitExpr_(const BufferLoadNode* _load) final {
+  PrimExpr VisitExpr_(const BufferLoadNode *_load) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(_load));
     if (ShouldRewriteAccess() && load->buffer.same_as(src_)) {
-      ObjectPtr<BufferLoadNode> n = ffi::make_object<BufferLoadNode>(*load.get());
+      ObjectPtr<BufferLoadNode> n =
+          ffi::make_object<BufferLoadNode>(*load.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
       return BufferLoad(n);
@@ -204,10 +203,12 @@ class CacheBufferReplacer : public StmtExprMutator {
     return load;
   }
 
-  Stmt VisitStmt_(const BufferStoreNode* _store) final {
-    BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(_store));
+  Stmt VisitStmt_(const BufferStoreNode *_store) final {
+    BufferStore store =
+        Downcast<BufferStore>(StmtExprMutator::VisitStmt_(_store));
     if (ShouldRewriteAccess() && store->buffer.same_as(src_)) {
-      ObjectPtr<BufferStoreNode> n = ffi::make_object<BufferStoreNode>(*store.get());
+      ObjectPtr<BufferStoreNode> n =
+          ffi::make_object<BufferStoreNode>(*store.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
       return BufferStore(n);
@@ -215,7 +216,7 @@ class CacheBufferReplacer : public StmtExprMutator {
     return store;
   }
 
-  Stmt VisitStmt_(const BlockNode* _block) final {
+  Stmt VisitStmt_(const BlockNode *_block) final {
     bool prev_in_target_scope = in_target_scope_;
     if (block_only_ && _block == target_block_) {
       in_target_scope_ = true;
@@ -233,16 +234,16 @@ class CacheBufferReplacer : public StmtExprMutator {
     return new_block;
   }
 
-  ffi::Array<BufferRegion> ReplaceBufferWithShift(
-      const ffi::Array<BufferRegion>& regions) {
+  ffi::Array<BufferRegion>
+  ReplaceBufferWithShift(const ffi::Array<BufferRegion> &regions) {
     ffi::Array<BufferRegion> result;
-    for (const auto& region : regions) {
+    for (const auto &region : regions) {
       if (region->buffer.same_as(src_)) {
         ffi::Array<Range> new_ranges;
         for (int d : kept_dims_) {
-          new_ranges.push_back(Range::FromMinExtent(
-              region->region[d]->min - region_mins_[d],
-              region->region[d]->extent));
+          new_ranges.push_back(
+              Range::FromMinExtent(region->region[d]->min - region_mins_[d],
+                                   region->region[d]->extent));
         }
         result.push_back(BufferRegion(dst_, new_ranges));
       } else {
@@ -252,12 +253,12 @@ class CacheBufferReplacer : public StmtExprMutator {
     return result;
   }
 
-  const Buffer& src_;
-  const Buffer& dst_;
-  const ffi::Array<PrimExpr>& region_mins_;
-  const std::vector<int>& kept_dims_;
-  ffi::Map<Block, Block>* block_sref_reuse_;
-  const BlockNode* target_block_;
+  const Buffer &src_;
+  const Buffer &dst_;
+  const ffi::Array<PrimExpr> &region_mins_;
+  const std::vector<int> &kept_dims_;
+  ffi::Map<Block, Block> *block_sref_reuse_;
+  const BlockNode *target_block_;
   bool block_only_;
   bool in_target_scope_;
 };
@@ -266,14 +267,14 @@ class CacheBufferReplacer : public StmtExprMutator {
 // Simple rewriter that replaces a specific ForNode in the AST with a new one.
 // ---------------------------------------------------------------------------
 class LoopReplacer : public StmtMutator {
- public:
-  LoopReplacer(const ForNode* old_loop, For new_loop)
+public:
+  LoopReplacer(const ForNode *old_loop, For new_loop)
       : old_loop_(old_loop), new_loop_(std::move(new_loop)), found_(false) {}
 
-  Stmt VisitStmt(const Stmt& stmt) final {
+  Stmt VisitStmt(const Stmt &stmt) final {
     return found_ ? stmt : StmtMutator::VisitStmt(stmt);
   }
-  Stmt VisitStmt_(const ForNode* loop) final {
+  Stmt VisitStmt_(const ForNode *loop) final {
     if (loop == old_loop_) {
       found_ = true;
       return new_loop_;
@@ -281,30 +282,31 @@ class LoopReplacer : public StmtMutator {
     return StmtMutator::VisitStmt_(loop);
   }
 
- private:
-  const ForNode* old_loop_;
+private:
+  const ForNode *old_loop_;
   For new_loop_;
   bool found_;
 };
 
-static ffi::Array<Range> ComputeRelaxedRegion(
-    ScheduleState self, const StmtSRef& loop_sref,
-    const StmtSRef& block_sref, const Buffer& buf,
-    BufferIndexType buffer_type, const runtime::StorageScope& extra_relax_scope) {
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+static ffi::Array<Range>
+ComputeRelaxedRegion(ScheduleState self, const StmtSRef &loop_sref,
+                     const StmtSRef &block_sref, const Buffer &buf,
+                     BufferIndexType buffer_type,
+                     const runtime::StorageScope &extra_relax_scope) {
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   BlockRealize realize = GetBlockRealize(self, block_sref);
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-      ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
-      loop_sref, extra_relax_scope));
+  ffi::Map<Var, arith::IntSet> var_dom =
+      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+          ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent), loop_sref,
+          extra_relax_scope));
 
-  const auto& regions = (buffer_type == BufferIndexType::kRead)
-                            ? block->reads
-                            : block->writes;
+  const auto &regions =
+      (buffer_type == BufferIndexType::kRead) ? block->reads : block->writes;
 
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion& buffer_region : regions) {
+  for (const BufferRegion &buffer_region : regions) {
     if (!buffer_region->buffer.same_as(buf)) {
       continue;
     }
@@ -312,9 +314,8 @@ static ffi::Array<Range> ComputeRelaxedRegion(
         arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
     relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
   }
-  ICHECK(!relaxed_regions.empty())
-      << "ValueError: buffer " << buf->name
-      << " is not accessed in the specified block";
+  ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << buf->name
+                                   << " is not accessed in the specified block";
 
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
   int ndim = static_cast<int>(unified.size());
@@ -331,13 +332,13 @@ static ffi::Array<Range> ComputeRelaxedRegion(
   return result;
 }
 
-static bool ContainsTargetBlock(const Stmt& stmt, const BlockNode* target) {
+static bool ContainsTargetBlock(const Stmt &stmt, const BlockNode *target) {
   bool found = false;
-  PostOrderVisit(stmt, [&found, target](const ObjectRef& obj) {
+  PostOrderVisit(stmt, [&found, target](const ObjectRef &obj) {
     if (found) {
       return;
     }
-    if (const auto* realize = obj.as<BlockRealizeNode>()) {
+    if (const auto *realize = obj.as<BlockRealizeNode>()) {
       if (realize->block.get() == target) {
         found = true;
       }
@@ -347,21 +348,22 @@ static bool ContainsTargetBlock(const Stmt& stmt, const BlockNode* target) {
 }
 
 class ComputeNestReplacer : public StmtMutator {
- public:
-  ComputeNestReplacer(const BlockNode* target, Stmt replacement)
-      : target_(target), replacement_(std::move(replacement)), replaced_(false) {}
+public:
+  ComputeNestReplacer(const BlockNode *target, Stmt replacement)
+      : target_(target), replacement_(std::move(replacement)),
+        replaced_(false) {}
 
-  Stmt VisitStmt(const Stmt& stmt) final {
+  Stmt VisitStmt(const Stmt &stmt) final {
     if (replaced_ || !stmt.defined()) {
       return stmt;
     }
     return StmtMutator::VisitStmt(stmt);
   }
 
-  Stmt VisitStmt_(const SeqStmtNode* op) final {
+  Stmt VisitStmt_(const SeqStmtNode *op) final {
     ffi::Array<Stmt> new_seq;
     new_seq.reserve(op->seq.size());
-    for (const Stmt& stmt : op->seq) {
+    for (const Stmt &stmt : op->seq) {
       if (!replaced_ && ContainsTargetBlock(stmt, target_)) {
         Stmt new_stmt = StmtMutator::VisitStmt(stmt);
         if (!replaced_ && ContainsTargetBlock(new_stmt, target_)) {
@@ -379,66 +381,69 @@ class ComputeNestReplacer : public StmtMutator {
 
   bool replaced() const { return replaced_; }
 
- private:
-  const BlockNode* target_;
+private:
+  const BlockNode *target_;
   Stmt replacement_;
   bool replaced_;
 };
 
-static int GetConstInt(const PrimExpr& expr, const char* what) {
-  if (const auto* imm = expr.as<IntImmNode>()) {
+static int GetConstInt(const PrimExpr &expr, const char *what) {
+  if (const auto *imm = expr.as<IntImmNode>()) {
     return static_cast<int>(imm->value);
   }
-  LOG(FATAL) << "ValueError: gemm_at expects a static " << what << ", but got " << expr;
+  LOG(FATAL) << "ValueError: gemm_at expects a static " << what << ", but got "
+             << expr;
   return 0;
 }
 
-static PrimExpr GetMatrixStride(const Buffer& buf) {
+static PrimExpr GetMatrixStride(const Buffer &buf) {
   if (buf->strides.size() >= 2) {
     return buf->strides[buf->strides.size() - 2];
   }
   ICHECK_GE(buf->shape.size(), 2U)
-      << "ValueError: gemm_at expects at least a 2D buffer, but got " << buf->name;
+      << "ValueError: gemm_at expects at least a 2D buffer, but got "
+      << buf->name;
   return buf->shape[buf->shape.size() - 1];
 }
 
 // ---------------------------------------------------------------------------
 // CacheReadAt:  main entry point
 // ---------------------------------------------------------------------------
-static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
-                        const StmtSRef& block_sref, int read_buffer_index,
-                        const ffi::String& storage_scope,
-                        const ffi::String& transform) {
+static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
+                        const StmtSRef &block_sref, int read_buffer_index,
+                        const ffi::String &storage_scope,
+                        const ffi::String &transform) {
   // ---- Step 1: Obtain source buffer and loop --------------------------------
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
-  Buffer src =
-      GetNthAccessBuffer(self, block_ref, read_buffer_index, BufferIndexType::kRead);
+  Buffer src = GetNthAccessBuffer(self, block_ref, read_buffer_index,
+                                  BufferIndexType::kRead);
 
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   // ---- Step 2: Gather inner-loop domains and block bindings -----------------
   BlockRealize realize = GetBlockRealize(self, block_sref);
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create(storage_scope);
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-      /*low_inclusive=*/ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
-      /*high_exclusive=*/loop_sref,
-      /*extra_relax_scope=*/scope));
+  ffi::Map<Var, arith::IntSet> var_dom =
+      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+          /*low_inclusive=*/ffi::GetRef<StmtSRef>(
+              self->stmt2ref.at(block)->parent),
+          /*high_exclusive=*/loop_sref,
+          /*extra_relax_scope=*/scope));
 
   // ---- Step 3: Relax the buffer read region over the inner loops ------------
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion& buffer_region : block->reads) {
+  for (const BufferRegion &buffer_region : block->reads) {
     if (buffer_region->buffer.same_as(src)) {
       ffi::Array<arith::IntSet> relaxed =
           arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
       relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
     }
   }
-  ICHECK(!relaxed_regions.empty())
-      << "ValueError: buffer " << src->name
-      << " is not read in the specified block";
+  ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << src->name
+                                   << " is not read in the specified block";
 
   // Union all relaxed regions
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
@@ -475,8 +480,9 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
   } else {
     // Default behavior: squeeze unit extents for compact cache allocation.
     for (int d = 0; d < ndim; ++d) {
-      if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
-        if (imm->value == 1) continue;
+      if (const auto *imm = cache_shape[d].as<IntImmNode>()) {
+        if (imm->value == 1)
+          continue;
       }
       kept_dims.push_back(d);
       squeezed_shape.push_back(cache_shape[d]);
@@ -490,13 +496,14 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
 
   Buffer dst = WithScope(src, storage_scope);
   {
-    auto* w = dst.CopyOnWrite();
+    auto *w = dst.CopyOnWrite();
     w->shape = squeezed_shape;
     // Produce a readable name: e.g. a_shared_dyn  or  a_local_fragment
     std::string scope_suffix = storage_scope;
     // Replace '.' with '_' for valid identifier
-    for (auto& c : scope_suffix) {
-      if (c == '.') c = '_';
+    for (auto &c : scope_suffix) {
+      if (c == '.')
+        c = '_';
     }
     w->name = src->name + "_" + scope_suffix;
     // Strides can be empty (row-major) for the compact buffer.
@@ -513,12 +520,12 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
         Range::FromMinExtent(IntImm(DataType::Int(32), 0), squeezed_shape[i]));
   }
 
-  PrimExpr src_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/1);
+  PrimExpr src_region_arg =
+      MakeRegionCall(src, cache_region, /*access_mask=*/1);
   PrimExpr dst_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
 
-  Stmt copy_stmt = Evaluate(
-      Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
-           {src_region_arg, dst_region_arg}));
+  Stmt copy_stmt = Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
+                                 {src_region_arg, dst_region_arg}));
 
   std::string transform_mode = transform;
   ICHECK(transform_mode.empty() || transform_mode == "square")
@@ -533,9 +540,9 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 6: Rewrite buffer references in the target consumer block -------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
-  CacheBufferReplacer replacer(
-      src, dst, region_mins, kept_dims, &block_sref_reuse,
-      /*target_block=*/block);
+  CacheBufferReplacer replacer(src, dst, region_mins, kept_dims,
+                               &block_sref_reuse,
+                               /*target_block=*/block);
   for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
     Stmt old_stmt = subtrees[i];
     subtrees.Set(i, Stmt(nullptr));
@@ -560,8 +567,7 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
       /*alloc_buffers=*/{dst});
   BlockRealize alloc_realize(
       /*values=*/{},
-      /*predicate=*/const_true(),
-      alloc_block);
+      /*predicate=*/const_true(), alloc_block);
 
   // Build the new For loop with the wrapper block as the body.
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
@@ -571,7 +577,7 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 8: Replace in the scope root block ------------------------------
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   Block new_scope_block = Downcast<Block>(
       LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
@@ -583,41 +589,42 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
 // ---------------------------------------------------------------------------
 // CacheWriteAt:  mirror of CacheReadAt for write buffers
 // ---------------------------------------------------------------------------
-static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
-                         const StmtSRef& block_sref, int write_buffer_index,
-                         const ffi::String& storage_scope, bool write_back,
-                         const ffi::String& reduce_type,
-                         const ffi::String& reducer_replication) {
+static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
+                         const StmtSRef &block_sref, int write_buffer_index,
+                         const ffi::String &storage_scope, bool write_back,
+                         const ffi::String &reduce_type,
+                         const ffi::String &reducer_replication) {
   // ---- Step 1: Obtain destination buffer and loop ---------------------------
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
-  Buffer src =
-      GetNthAccessBuffer(self, block_ref, write_buffer_index, BufferIndexType::kWrite);
+  Buffer src = GetNthAccessBuffer(self, block_ref, write_buffer_index,
+                                  BufferIndexType::kWrite);
 
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   // ---- Step 2: Gather inner-loop domains and block bindings -----------------
   BlockRealize realize = GetBlockRealize(self, block_sref);
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create(storage_scope);
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-      /*low_inclusive=*/ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
-      /*high_exclusive=*/loop_sref,
-      /*extra_relax_scope=*/scope));
+  ffi::Map<Var, arith::IntSet> var_dom =
+      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+          /*low_inclusive=*/ffi::GetRef<StmtSRef>(
+              self->stmt2ref.at(block)->parent),
+          /*high_exclusive=*/loop_sref,
+          /*extra_relax_scope=*/scope));
 
   // ---- Step 3: Relax the buffer write region over the inner loops -----------
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion& buffer_region : block->writes) {
+  for (const BufferRegion &buffer_region : block->writes) {
     if (buffer_region->buffer.same_as(src)) {
       ffi::Array<arith::IntSet> relaxed =
           arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
       relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
     }
   }
-  ICHECK(!relaxed_regions.empty())
-      << "ValueError: buffer " << src->name
-      << " is not written in the specified block";
+  ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << src->name
+                                   << " is not written in the specified block";
 
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
   int ndim = static_cast<int>(unified.size());
@@ -653,8 +660,9 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   } else {
     // Default behavior: squeeze unit extents for compact cache allocation.
     for (int d = 0; d < ndim; ++d) {
-      if (const auto* imm = cache_shape[d].as<IntImmNode>()) {
-        if (imm->value == 1) continue;
+      if (const auto *imm = cache_shape[d].as<IntImmNode>()) {
+        if (imm->value == 1)
+          continue;
       }
       kept_dims.push_back(d);
       squeezed_shape.push_back(cache_shape[d]);
@@ -667,11 +675,12 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
 
   Buffer dst = WithScope(src, storage_scope);
   {
-    auto* w = dst.CopyOnWrite();
+    auto *w = dst.CopyOnWrite();
     w->shape = squeezed_shape;
     std::string scope_suffix = storage_scope;
-    for (auto& c : scope_suffix) {
-      if (c == '.') c = '_';
+    for (auto &c : scope_suffix) {
+      if (c == '.')
+        c = '_';
     }
     w->name = src->name + "_" + scope_suffix;
     w->strides = {};
@@ -688,11 +697,12 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   Stmt copy_stmt;
   if (write_back) {
     // For write-back: source is the cache, destination is the original buffer
-    PrimExpr cache_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
-    PrimExpr orig_region_arg = MakeRegionCall(src, cache_region, /*access_mask=*/2);
-    copy_stmt = Evaluate(
-        Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
-             {cache_region_arg, orig_region_arg}));
+    PrimExpr cache_region_arg =
+        MakeRegionCall(dst, dst_ranges, /*access_mask=*/1);
+    PrimExpr orig_region_arg =
+        MakeRegionCall(src, cache_region, /*access_mask=*/2);
+    copy_stmt = Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
+                              {cache_region_arg, orig_region_arg}));
   }
 
   bool use_reducer = !reduce_type.empty();
@@ -703,22 +713,23 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
         << "ValueError: reducer-backed cache_write_at currently only supports "
            "`sum` reductions";
     ICHECK(reducer_replication == "all" || reducer_replication == "none")
-        << "ValueError: unsupported reducer replication `" << reducer_replication
-        << "`, expected one of {\"all\", \"none\"}";
+        << "ValueError: unsupported reducer replication `"
+        << reducer_replication << "`, expected one of {\"all\", \"none\"}";
     PrimExpr reducer_region_arg =
         MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
-    fill_stmt = Evaluate(
-        Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
-             {reducer_region_arg, make_const(src->dtype, 0.0)}));
-    finalize_stmt = Evaluate(
-        Call(DataType::Handle(), Op::Get("tl.tileop.finalize_reducer"),
-             {reducer_region_arg}));
+    fill_stmt =
+        Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
+                      {reducer_region_arg, make_const(src->dtype, 0.0)}));
+    finalize_stmt =
+        Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.finalize_reducer"),
+                      {reducer_region_arg}));
   }
 
   // ---- Step 6: Rewrite buffer references in the loop body -------------------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
-  CacheBufferReplacer replacer(src, dst, region_mins, kept_dims, &block_sref_reuse);
+  CacheBufferReplacer replacer(src, dst, region_mins, kept_dims,
+                               &block_sref_reuse);
   for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
     Stmt old_stmt = subtrees[i];
     subtrees.Set(i, Stmt(nullptr));
@@ -745,7 +756,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
       /*init=*/std::nullopt,
       /*alloc_buffers=*/{dst});
   if (use_reducer) {
-    auto* block_ptr = alloc_block.CopyOnWrite();
+    auto *block_ptr = alloc_block.CopyOnWrite();
     ffi::Map<Var, ffi::Map<ffi::String, ffi::String>> reducer_info;
     ffi::Map<ffi::String, ffi::String> reducer_meta;
     reducer_meta.Set("op", reduce_type);
@@ -755,8 +766,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   }
   BlockRealize alloc_realize(
       /*values=*/{},
-      /*predicate=*/const_true(),
-      alloc_block);
+      /*predicate=*/const_true(), alloc_block);
 
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
   new_loop_node->body = std::move(alloc_realize);
@@ -765,7 +775,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 8: Replace in the scope root block ------------------------------
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   Block new_scope_block = Downcast<Block>(
       LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
@@ -774,10 +784,11 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
     // Bridge/intermediate use-case: all consumers are rewritten to the cache
     // buffer, so the original tensor allocation can be removed from the
     // surrounding scope block.
-    ObjectPtr<BlockNode> scope_ptr = ffi::make_object<BlockNode>(*new_scope_block.get());
+    ObjectPtr<BlockNode> scope_ptr =
+        ffi::make_object<BlockNode>(*new_scope_block.get());
     ffi::Array<Buffer> kept_alloc_buffers;
     kept_alloc_buffers.reserve(scope_ptr->alloc_buffers.size());
-    for (const Buffer& buf : scope_ptr->alloc_buffers) {
+    for (const Buffer &buf : scope_ptr->alloc_buffers) {
       if (!buf.same_as(src)) {
         kept_alloc_buffers.push_back(buf);
       }
@@ -790,18 +801,20 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
 }
 
-static void GemmAt(ScheduleState self, const StmtSRef& loop_sref,
-                   const StmtSRef& block_sref, bool transpose_a,
+static void GemmAt(ScheduleState self, const StmtSRef &loop_sref,
+                   const StmtSRef &block_sref, bool transpose_a,
                    bool transpose_b, bool clear_accum, int policy_type,
                    bool use_py) {
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   ICHECK_EQ(block->reads.size(), 2U)
-      << "ValueError: gemm_at expects a matmul-like block with exactly two reads";
+      << "ValueError: gemm_at expects a matmul-like block with exactly two "
+         "reads";
   ICHECK_EQ(block->writes.size(), 1U)
-      << "ValueError: gemm_at expects a matmul-like block with exactly one write";
+      << "ValueError: gemm_at expects a matmul-like block with exactly one "
+         "write";
 
   Buffer a = GetNthAccessBuffer(self, block_ref, 0, BufferIndexType::kRead);
   Buffer b = GetNthAccessBuffer(self, block_ref, 1, BufferIndexType::kRead);
@@ -823,15 +836,14 @@ static void GemmAt(ScheduleState self, const StmtSRef& loop_sref,
   ICHECK_EQ(b_region.size(), 2U)
       << "ValueError: gemm_at currently expects a 2D rhs tile, but got rank "
       << b_region.size();
-  ICHECK_EQ(c_region.size(), 2U)
-      << "ValueError: gemm_at currently expects a 2D accumulator tile, but got rank "
-      << c_region.size();
+  ICHECK_EQ(c_region.size(), 2U) << "ValueError: gemm_at currently expects a "
+                                    "2D accumulator tile, but got rank "
+                                 << c_region.size();
 
   int m = GetConstInt(c_region[0]->extent, "M extent");
   int n = GetConstInt(c_region[1]->extent, "N extent");
-  int k = GetConstInt(
-      transpose_a ? a_region[0]->extent : a_region[1]->extent,
-      "K extent");
+  int k = GetConstInt(transpose_a ? a_region[0]->extent : a_region[1]->extent,
+                      "K extent");
 
   PrimExpr a_region_arg = MakeRegionCall(a, a_region, /*access_mask=*/1);
   PrimExpr b_region_arg = MakeRegionCall(b, b_region, /*access_mask=*/1);
@@ -851,31 +863,29 @@ static void GemmAt(ScheduleState self, const StmtSRef& loop_sref,
   int c_row_value = GetConstInt(c_row, "accumulator row offset");
   int c_col_value = GetConstInt(c_col, "accumulator column offset");
 
-  const char* op_name = use_py ? "tl.tileop.gemm_py" : "tl.tileop.gemm";
-  Stmt gemm_stmt = Evaluate(Call(
-      DataType::Handle(),
-      Op::Get(op_name),
-      {
-          a_region_arg,
-          b_region_arg,
-          c_region_arg,
-          Bool(transpose_a),
-          Bool(transpose_b),
-          IntImm(DataType::Int(32), m),
-          IntImm(DataType::Int(32), n),
-          IntImm(DataType::Int(32), k),
-          IntImm(DataType::Int(32), policy_type),
-          Bool(clear_accum),
-          IntImm(DataType::Int(32), stride_a_value),
-          IntImm(DataType::Int(32), stride_b_value),
-          IntImm(DataType::Int(32), offset_a_value),
-          IntImm(DataType::Int(32), offset_b_value),
-          IntImm(DataType::Int(32), 1),
-          IntImm(DataType::Int(32), 0),
-          make_zero(DataType::UInt(32)),
-          IntImm(DataType::Int(32), c_row_value),
-          IntImm(DataType::Int(32), c_col_value),
-      }));
+  const char *op_name = use_py ? "tl.tileop.gemm_py" : "tl.tileop.gemm";
+  Stmt gemm_stmt = Evaluate(Call(DataType::Handle(), Op::Get(op_name),
+                                 {
+                                     a_region_arg,
+                                     b_region_arg,
+                                     c_region_arg,
+                                     Bool(transpose_a),
+                                     Bool(transpose_b),
+                                     IntImm(DataType::Int(32), m),
+                                     IntImm(DataType::Int(32), n),
+                                     IntImm(DataType::Int(32), k),
+                                     IntImm(DataType::Int(32), policy_type),
+                                     Bool(clear_accum),
+                                     IntImm(DataType::Int(32), stride_a_value),
+                                     IntImm(DataType::Int(32), stride_b_value),
+                                     IntImm(DataType::Int(32), offset_a_value),
+                                     IntImm(DataType::Int(32), offset_b_value),
+                                     IntImm(DataType::Int(32), 1),
+                                     IntImm(DataType::Int(32), 0),
+                                     make_zero(DataType::UInt(32)),
+                                     IntImm(DataType::Int(32), c_row_value),
+                                     IntImm(DataType::Int(32), c_col_value),
+                                 }));
 
   ComputeNestReplacer replacer(block, gemm_stmt);
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
@@ -886,7 +896,7 @@ static void GemmAt(ScheduleState self, const StmtSRef& loop_sref,
 
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   ffi::Map<Block, Block> block_sref_reuse;
   Block new_scope_block = Downcast<Block>(
@@ -895,12 +905,12 @@ static void GemmAt(ScheduleState self, const StmtSRef& loop_sref,
   self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
 }
 
-static void CopyAt(ScheduleState self, const StmtSRef& loop_sref,
-                   const StmtSRef& block_sref, int read_buffer_index,
+static void CopyAt(ScheduleState self, const StmtSRef &loop_sref,
+                   const StmtSRef &block_sref, int read_buffer_index,
                    int write_buffer_index) {
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   Buffer src = GetNthAccessBuffer(self, block_ref, read_buffer_index,
                                   BufferIndexType::kRead);
@@ -914,13 +924,12 @@ static void CopyAt(ScheduleState self, const StmtSRef& loop_sref,
       self, loop_sref, block_sref, dst, BufferIndexType::kWrite,
       runtime::StorageScope::Create(dst.scope()));
 
-  Stmt copy_stmt = Evaluate(Call(
-      DataType::Handle(),
-      Op::Get("tl.tileop.copy"),
-      {
-          MakeRegionCall(src, src_region, /*access_mask=*/1),
-          MakeRegionCall(dst, dst_region, /*access_mask=*/2),
-      }));
+  Stmt copy_stmt =
+      Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
+                    {
+                        MakeRegionCall(src, src_region, /*access_mask=*/1),
+                        MakeRegionCall(dst, dst_region, /*access_mask=*/2),
+                    }));
 
   ComputeNestReplacer replacer(block, copy_stmt);
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
@@ -931,7 +940,7 @@ static void CopyAt(ScheduleState self, const StmtSRef& loop_sref,
 
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   ffi::Map<Block, Block> block_sref_reuse;
   Block new_scope_block = Downcast<Block>(
@@ -948,43 +957,42 @@ TVM_FFI_STATIC_INIT_BLOCK() {
 
   refl::GlobalDef().def(
       "tl.schedule.ScheduleCacheReadAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
-         int read_buffer_index, const ffi::String& storage_scope,
-         const ffi::String& transform) {
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
+         int read_buffer_index, const ffi::String &storage_scope,
+         const ffi::String &transform) {
         CacheReadAt(self->state(), self->GetSRef(loop_rv),
-                    self->GetSRef(block_rv), read_buffer_index,
-                    storage_scope, transform);
+                    self->GetSRef(block_rv), read_buffer_index, storage_scope,
+                    transform);
       });
 
   refl::GlobalDef().def(
       "tl.schedule.ScheduleCacheWriteAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
-         int write_buffer_index, const ffi::String& storage_scope,
-         bool write_back, const ffi::String& reduce_type,
-         const ffi::String& reducer_replication) {
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
+         int write_buffer_index, const ffi::String &storage_scope,
+         bool write_back, const ffi::String &reduce_type,
+         const ffi::String &reducer_replication) {
         CacheWriteAt(self->state(), self->GetSRef(loop_rv),
-                     self->GetSRef(block_rv), write_buffer_index,
-                     storage_scope, write_back, reduce_type,
-                     reducer_replication);
+                     self->GetSRef(block_rv), write_buffer_index, storage_scope,
+                     write_back, reduce_type, reducer_replication);
       });
 
   refl::GlobalDef().def(
       "tl.schedule.ScheduleGemmAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
-         bool transpose_a, bool transpose_b, bool clear_accum,
-         int policy_type, bool use_py) {
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
+         bool transpose_a, bool transpose_b, bool clear_accum, int policy_type,
+         bool use_py) {
         GemmAt(self->state(), self->GetSRef(loop_rv), self->GetSRef(block_rv),
                transpose_a, transpose_b, clear_accum, policy_type, use_py);
       });
 
   refl::GlobalDef().def(
       "tl.schedule.ScheduleCopyAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int read_buffer_index, int write_buffer_index) {
         CopyAt(self->state(), self->GetSRef(loop_rv), self->GetSRef(block_rv),
                read_buffer_index, write_buffer_index);
       });
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

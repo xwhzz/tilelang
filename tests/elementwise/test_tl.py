@@ -9,11 +9,6 @@ This mirrors the reduction/transpose prototype scripts and validates:
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-import types
-from pathlib import Path
-from typing import Tuple
 
 import tilelang
 import torch
@@ -22,7 +17,6 @@ from tilelang.profiler import do_bench
 from tvm import te
 
 from tilelang.schedule.gpu.element_wise import ElementWise  # pylint: disable=import-outside-toplevel
-
 
 
 def _build_mod(m: int, n: int, k: int, arch: str):
@@ -65,7 +59,7 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     return mod
 
 
-def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tuple[float, float]:
+def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> tuple[float, float]:
     """Build an element-wise kernel, run correctness check, and benchmark."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
