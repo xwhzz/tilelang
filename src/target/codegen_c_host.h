@@ -94,6 +94,8 @@ private:
   std::string module_name_;
   /* \brief mapping global packed func to the unique name */
   std::unordered_map<std::string, std::string> declared_globals_;
+  /* \brief cpacked function symbols already forward-declared */
+  std::unordered_set<std::string> declared_cpacked_symbols_;
   /* \brief names of the functions declared in this module */
   tvm::ffi::Array<tvm::ffi::String> function_names_;
   /*! \brief whether to emit asserts in the resulting C code */
@@ -107,6 +109,7 @@ private:
   bool is_in_metal_context = false;
 
   std::string GetPackedName(const tvm::tir::CallNode *op);
+  void MaybeGenerateCPackedForwardDeclaration(const std::string &func_name);
   void PrintGetFuncFromBackend(const std::string &func_name,
                                const std::string &packed_func_name);
   void PrintCallPacked(const tvm::tir::CallNode *op);

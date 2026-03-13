@@ -474,10 +474,14 @@ bool CopyNode::CheckBulkLoad(Target target, arith::Analyzer *analyzer,
   // last dim of src * dtype.bits() must be a multiple of 16
   // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
   // now we check src (gmem) as tma box dim is deduced from src
+  PrimExpr last_extent = src_range[src_range.size() - 1]->extent;
+  DataType index_dtype = last_extent.dtype();
+  PrimExpr bytes = make_const(index_dtype, src->dtype.bytes());
+  PrimExpr alignment = make_const(index_dtype, 16);
+  PrimExpr zero = make_zero(index_dtype);
   if (check_last_dim &&
       analyzer->CanProve(
-          FloorMod(src_range[src_range.size() - 1]->extent * src->dtype.bytes(),
-                   16) != 0,
+          FloorMod(last_extent * bytes, alignment) != zero,
           arith::ProofStrength::kSymbolicBound)) {
     LOG(WARNING)
         << "src range must have last dim multiple of 16 for tma bulk load "
@@ -586,10 +590,14 @@ bool CopyNode::CheckBulkStore(Target target, arith::Analyzer *analyzer,
   // last dim of dst * dtype.bits() must be a multiple of 16
   // https://docs.nvidia.com/cuda/cuda-driver-api/group__CUDA__TENSOR__MEMORY.html#group__CUDA__TENSOR__MEMORY_1ga7c7d2aaac9e49294304e755e6f341d7
   // now we check dst (gmem) as tma box dim is deduced from dst
+  PrimExpr last_extent = dst_range[dst_range.size() - 1]->extent;
+  DataType index_dtype = last_extent.dtype();
+  PrimExpr bytes = make_const(index_dtype, dst->dtype.bytes());
+  PrimExpr alignment = make_const(index_dtype, 16);
+  PrimExpr zero = make_zero(index_dtype);
   if (check_last_dim &&
       analyzer->CanProve(
-          FloorMod(dst_range[dst_range.size() - 1]->extent * dst->dtype.bytes(),
-                   16) != 0,
+          FloorMod(last_extent * bytes, alignment) != zero,
           arith::ProofStrength::kSymbolicBound)) {
     LOG(WARNING)
         << "dst range must have last dim multiple of 16 for tma bulk store "

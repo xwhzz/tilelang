@@ -105,7 +105,12 @@ class ElementWise(GPUScheduleRule):
         for block_info in block_infos[:-1]:
             if block_info.is_reduction() or not block_info.is_injective():
                 return None
-            sch.compute_inline(block_info.block_rv)
+            try:
+                sch.compute_inline(block_info.block_rv)
+            except tir.ScheduleError:
+                # Output blocks cannot be inlined. Let the generic fallback
+                # handle multi-output injective graphs instead.
+                return None
 
         block_infos = normalize_prim_func(sch)
         if block_infos is None or len(block_infos) != 1:

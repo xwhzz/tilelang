@@ -13,11 +13,7 @@ from .layernorm_like import LayerNormLike  # noqa: F401
 from .transpose import Transpose  # noqa: F401
 
 from .gemv import GEMV  # noqa: F401
-
-try:
-    from tvm.dlight.gpu import Matmul  # noqa: F401
-except ModuleNotFoundError:
-    pass
+from .matmul import Matmul  # noqa: F401
 # from .gemv_dequantize import GEMVWithDequantizeInfo  # noqa: F401
 # from .matmul import (
 #     Matmul,  # noqa: F401
@@ -30,3 +26,16 @@ except ModuleNotFoundError:
 # from .matmul_wmma import MatmulTensorizationLegacy  # noqa: F401
 
 # from tvm.dlight.gpu import Reduction  # noqa: F401
+
+
+def default_schedule_rules():
+    """Return the default TileLang GPU rule order with generic fallback last."""
+    return [
+        Matmul(),
+        GEMV(),
+        Reduction(),
+        GeneralReduction(),
+        Transpose(),
+        ElementWise(),
+        Fallback(),
+    ]

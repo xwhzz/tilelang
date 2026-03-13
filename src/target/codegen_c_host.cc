@@ -49,6 +49,7 @@ void CodeGenCHost::Init(bool output_ssa, bool emit_asserts,
   emit_asserts_ = emit_asserts;
   emit_fwd_func_decl_ = emit_fwd_func_decl;
   declared_globals_.clear();
+  declared_cpacked_symbols_.clear();
   decl_stream << "// tilelang target: " << target_str << "\n";
   decl_stream << "#define TVM_EXPORTS\n";
   decl_stream << "#include \"tvm/runtime/base.h\"\n";
@@ -68,6 +69,36 @@ void CodeGenCHost::Init(bool output_ssa, bool emit_asserts,
 
   decl_stream << "#include <torch/mps.h>\n";
   decl_stream << "#endif\n";
+  decl_stream << "static int TileLangBackendAnyListSetPackedArg(void* anylist, int index, "
+                 "void* args, int arg_offset) {\n";
+  decl_stream << "  TVMFFIAny* list = (TVMFFIAny*)anylist;\n";
+  decl_stream << "  TVMFFIAny* ffi_args = (TVMFFIAny*)args;\n";
+  decl_stream << "  ffi_args[arg_offset] = list[index];\n";
+  decl_stream << "  return 0;\n";
+  decl_stream << "}\n";
+  decl_stream << "static int TileLangBackendAnyListResetItem(void* anylist, int index) {\n";
+  decl_stream << "  TVMFFIAny* list = (TVMFFIAny*)anylist;\n";
+  decl_stream << "  list[index].type_index = kTVMFFINone;\n";
+  decl_stream << "  list[index].zero_padding = 0;\n";
+  decl_stream << "  list[index].v_int64 = 0;\n";
+  decl_stream << "  return 0;\n";
+  decl_stream << "}\n";
+  decl_stream << "static int TileLangBackendAnyListMoveFromPackedReturn(void* anylist, int index, "
+                 "void* args, int ret_offset) {\n";
+  decl_stream << "  TVMFFIAny* list = (TVMFFIAny*)anylist;\n";
+  decl_stream << "  TVMFFIAny* ffi_args = (TVMFFIAny*)args;\n";
+  decl_stream << "  if (TVMFFIAnyViewToOwnedAny(&ffi_args[ret_offset], &list[index]) != 0) {\n";
+  decl_stream << "    return -1;\n";
+  decl_stream << "  }\n";
+  decl_stream << "  ffi_args[ret_offset].type_index = kTVMFFINone;\n";
+  decl_stream << "  ffi_args[ret_offset].zero_padding = 0;\n";
+  decl_stream << "  ffi_args[ret_offset].v_int64 = 0;\n";
+  decl_stream << "  return 0;\n";
+  decl_stream << "}\n";
+  decl_stream << "#define TVMBackendAnyListSetPackedArg TileLangBackendAnyListSetPackedArg\n";
+  decl_stream << "#define TVMBackendAnyListResetItem TileLangBackendAnyListResetItem\n";
+  decl_stream << "#define TVMBackendAnyListMoveFromPackedReturn "
+                 "TileLangBackendAnyListMoveFromPackedReturn\n";
 
   CodeGenCHost::InitGlobalContext();
   tvm::codegen::CodeGenC::Init(output_ssa);
@@ -142,7 +173,8 @@ void CodeGenCHost::GenerateForwardFunctionDeclarations(
 void CodeGenCHost::PrintFuncPrefix(std::ostream &os) { // NOLINT(*)
   os << "#ifdef __cplusplus\n"
      << "extern \"C\"\n"
-     << "#endif\n";
+     << "#endif\n"
+     << "TVM_DLL ";
 }
 
 void CodeGenCHost::PrintType(tvm::DataType t, std::ostream &os) { // NOLINT(*)
@@ -256,6 +288,17 @@ void CodeGenCHost::PrintGetFuncFromBackend(
   this->stream << "}\n";
 }
 
+void CodeGenCHost::MaybeGenerateCPackedForwardDeclaration(
+    const std::string &func_name) {
+  if (!declared_cpacked_symbols_.insert(func_name).second) {
+    return;
+  }
+  this->PrintFuncPrefix(fwd_decl_stream);
+  fwd_decl_stream << "int32_t " << ffi::symbol::tvm_ffi_symbol_prefix + func_name
+                  << "(void* self_handle, void* args, int32_t num_args, "
+                     "void* result);\n";
+}
+
 void CodeGenCHost::PrintCallPacked(const tvm::tir::CallNode *op) {
   using namespace tvm::tir;
   const StringImmNode *func_name = op->args[0].as<StringImmNode>();
@@ -271,10 +314,9 @@ void CodeGenCHost::PrintCallPacked(const tvm::tir::CallNode *op) {
     packed_func_name = GetPackedName(op);
     this->PrintGetFuncFromBackend(func_name->value, packed_func_name);
   } else {
-    // directly use the original symbol
     ICHECK(op->op.same_as(builtin::tvm_call_cpacked_lowered()));
-    packed_func_name =
-        tvm::ffi::symbol::tvm_ffi_symbol_prefix + func_name->value;
+    MaybeGenerateCPackedForwardDeclaration(func_name->value);
+    packed_func_name = ffi::symbol::tvm_ffi_symbol_prefix + func_name->value;
   }
 
   std::string args_stack = PrintExpr(op->args[1]);
@@ -331,6 +373,9 @@ void CodeGenCHost::PrintCallPacked(const tvm::tir::CallNode *op) {
     this->PrintLine("});");
     this->PrintLine("if (", metal_result, " != 0) return ", metal_result, ";");
   }
+
+  this->PrintIndent();
+  this->stream << "((TVMFFIAny*) " << args_stack << ")[" << end << "] = " << result << ";\n";
 }
 
 std::string CodeGenCHost::GetPackedName(const tvm::tir::CallNode *op) {

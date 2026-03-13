@@ -251,9 +251,12 @@ public:
                      {tvm::tir::attr::kKernelLaunchParams, info.launch_params},
                      {tvm::attr::kGlobalSymbol, info.global_symbol}});
     }
-    // @lei: workaround as we may require c host codegen, so we need to set the
-    // global symbol for cpu backend.
-    func = WithAttr(func, tvm::attr::kGlobalSymbol, gvar->name_hint);
+    // Preserve the packed-api symbol emitted earlier in the pipeline.  VM and
+    // runtime module lookup resolve PackedFuncs through the prefixed symbol, so
+    // stripping it here makes the generated module unreachable from Relax VM.
+    if (!func->GetAttr<String>(tvm::attr::kGlobalSymbol)) {
+      func = WithAttr(func, tvm::attr::kGlobalSymbol, gvar->name_hint);
+    }
 
     const auto &info = device_info_map_.at(gvar.get());
     const auto &thread_extent = info.thread_extent;
