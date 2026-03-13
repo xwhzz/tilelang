@@ -278,8 +278,10 @@ public:
                      {tvm::tir::attr::kKernelLaunchParams, info.launch_params},
                      {tvm::attr::kGlobalSymbol, info.global_symbol}});
     }
-    // Preserve any global_symbol chosen earlier during device splitting.
-    // Source kernels rely on this to launch the external CUDA entry directly.
+    // Preserve the packed-api symbol emitted earlier in the pipeline.  VM and
+    // runtime module lookup resolve PackedFuncs through the prefixed symbol, so
+    // stripping it here makes the generated module unreachable from Relax VM.
+    // Source kernels also rely on this to launch external CUDA entries directly.
     if (!func->GetAttr<String>(tvm::attr::kGlobalSymbol)) {
       func =
           WithAttr(std::move(func), tvm::attr::kGlobalSymbol, gvar->name_hint);

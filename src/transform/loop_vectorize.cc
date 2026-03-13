@@ -715,8 +715,17 @@ private:
         // Step 2: Decompose linear_offset into buffer->shape dimensions
         Array<PrimExpr> new_indices;
         for (int i = buffer->shape.size() - 1; i >= 0; --i) {
-          new_indices.push_back(FloorMod(linear_offset, buffer->shape[i]));
-          linear_offset = FloorDiv(linear_offset, buffer->shape[i]);
+          PrimExpr dim_extent = buffer->shape[i];
+          if (linear_offset.dtype() != dim_extent.dtype()) {
+            DataType common_dtype =
+                linear_offset.dtype().bits() >= dim_extent.dtype().bits()
+                    ? linear_offset.dtype()
+                    : dim_extent.dtype();
+            linear_offset = Cast(common_dtype, linear_offset);
+            dim_extent = Cast(common_dtype, dim_extent);
+          }
+          new_indices.push_back(FloorMod(linear_offset, dim_extent));
+          linear_offset = FloorDiv(linear_offset, dim_extent);
         }
         transformed_indices =
             Array<PrimExpr>{new_indices.rbegin(), new_indices.rend()};

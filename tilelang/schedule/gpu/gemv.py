@@ -2,11 +2,12 @@
 # Licensed under the MIT License.
 
 # pylint: disable=invalid-name
-"""A tile-primitive-first GEMV schedule rule for TileLang."""
+"""A GEMV schedule rule for TileLang."""
 
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
-from tvm import DataType, tir
+import tilelang
+from tilelang import tvm
 from tvm.target import Target
 
 from .. import Schedule as TileSchedule
@@ -17,6 +18,8 @@ from .base import GPUScheduleRule
 from .element_wise import _resolve_target_from_config
 from .reduction import _find_buffer_index
 
+tir = tvm.tir
+
 
 def _as_const_int(expr: tir.PrimExpr) -> Optional[int]:
     if isinstance(expr, tir.IntImm):
@@ -25,7 +28,11 @@ def _as_const_int(expr: tir.PrimExpr) -> Optional[int]:
 
 
 def _dtype_bytes(dtype: str) -> int:
-    return max(1, DataType(dtype).bits // 8)
+    return max(1, tvm.DataType(dtype).bits // 8)
+
+
+def _is_float_dtype(dtype: str) -> bool:
+    return dtype.startswith("float") or dtype.startswith("bfloat")
 
 
 def _largest_power_of_two_at_most(value: int) -> int:
@@ -54,7 +61,7 @@ def _choose_reduction_tile(
     prefer_large_tile: bool,
 ) -> int:
     del target
-    dtype_bits = DataType(dtype).bits
+    dtype_bits = tvm.DataType(dtype).bits
     vec_len = max(1, 128 // max(dtype_bits, 8))
     const_extent = _as_const_int(reduction_extent)
     base_tile = vec_len * (64 if prefer_large_tile and const_extent is not None and const_extent >= 8192 else 32)
@@ -77,17 +84,20 @@ def _choose_output_tile(
     preferred_rows = target_matrix_tile_bytes // max(1, reduction_tile * _dtype_bytes(dtype))
     tile_cap = max(1, min(tile_cap, 128, max(1, preferred_rows)))
     const_extent = _as_const_int(spatial_extent)
+    preferred_tile = tile_cap
+    if preferred_tile >= 128:
+        preferred_tile = 128
+    elif preferred_tile >= 64:
+        preferred_tile = 64
+    elif preferred_tile >= 32:
+        preferred_tile = 32
+    else:
+        preferred_tile = _largest_power_of_two_at_most(preferred_tile)
     if const_extent is None:
-        return _largest_power_of_two_at_most(max(16, tile_cap))
+        return max(1, preferred_tile)
     if const_extent <= 0:
         return 1
-    if const_extent >= 16:
-        tile_cap = max(tile_cap, 16)
-    tile_cap = min(tile_cap, const_extent)
-    tile = _largest_power_of_two_at_most(max(1, tile_cap))
-    while tile > 1 and const_extent % tile != 0:
-        tile >>= 1
-    return max(tile, 1)
+    return max(1, _largest_divisor_not_exceeding(const_extent, preferred_tile))
 
 
 def _choose_launch_threads(target: Target, output_tile: int, reduction_tile: int) -> int:
@@ -106,55 +116,184 @@ def _find_epilogue_name(block_infos: List[BlockInfo], sch: TileSchedule) -> Opti
     return sch.get(block_infos[1].block_rv).name_hint
 
 
-class GEMV(GPUScheduleRule):
-    """A tile-based GEMV rule using TileLang cache/tile primitives."""
+def _choose_splitk_schedule_params(
+    target: Target,
+    spatial_extent: tir.PrimExpr,
+    reduction_extent: tir.PrimExpr,
+    dtype: str,
+) -> Sequence[int]:
+    bits = tvm.DataType(dtype).bits
+    max_threads = min(int(utils.max_threads_per_block(target)), 256)
+    if max_threads <= 0:
+        return 1, 1, 1
 
-    def apply(
+    if bits <= 16:
+        output_candidate = 4
+        thread_candidate = 64
+        vec_candidate = 2
+    else:
+        output_candidate = 2
+        thread_candidate = 64
+        vec_candidate = 1
+
+    const_spatial = _as_const_int(spatial_extent)
+    if const_spatial is None:
+        output_tile = output_candidate
+    elif const_spatial <= 0:
+        output_tile = 1
+    else:
+        output_tile = max(1, _largest_divisor_not_exceeding(const_spatial, output_candidate))
+
+    while output_tile > 1 and output_tile * thread_candidate > max_threads:
+        output_tile //= 2
+
+    reduction_threads_cap = max(1, max_threads // max(output_tile, 1))
+    reduction_threads = _largest_power_of_two_at_most(min(thread_candidate, reduction_threads_cap))
+
+    const_reduction = _as_const_int(reduction_extent)
+    if const_reduction is None:
+        vec = vec_candidate
+    elif const_reduction <= 1:
+        vec = 1
+    elif vec_candidate > 1 and const_reduction % vec_candidate == 0:
+        vec = vec_candidate
+    else:
+        vec = 1
+
+    if const_reduction is not None and const_reduction > 0:
+        tiles = max(1, (const_reduction + vec - 1) // vec)
+        reduction_threads = max(
+            1,
+            _largest_power_of_two_at_most(min(reduction_threads, tiles)),
+        )
+
+    return output_tile, reduction_threads, vec
+
+
+def _can_use_splitk_schedule(
+    target: Target,
+    epilogue_name: Optional[str],
+    matrix_buffer: tir.Buffer,
+    vector_buffer: tir.Buffer,
+    output_buffer: tir.Buffer,
+) -> bool:
+    if target.kind.name != "cuda" or epilogue_name is not None:
+        return False
+    matrix_dtype = tvm.DataType(matrix_buffer.dtype)
+    vector_dtype = tvm.DataType(vector_buffer.dtype)
+    if (
+        not _is_float_dtype(matrix_buffer.dtype)
+        or not _is_float_dtype(vector_buffer.dtype)
+        or not _is_float_dtype(output_buffer.dtype)
+    ):
+        return False
+    if matrix_dtype.bits not in (16, 32) or vector_dtype.bits != matrix_dtype.bits:
+        return False
+    if len(matrix_buffer.shape) not in (2, 3):
+        return False
+    if len(vector_buffer.shape) + 1 != len(matrix_buffer.shape):
+        return False
+    if len(output_buffer.shape) + 1 != len(matrix_buffer.shape):
+        return False
+    return True
+
+
+class GEMV(GPUScheduleRule):
+    """A GEMV rule with a schedule-only CUDA split-K fast path and a tile fallback."""
+
+    def _apply_splitk_fast_path(
         self,
         func: tir.PrimFunc,
         target: Target,
-        _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
-        if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
+        epilogue_name: Optional[str],
+        matrix_buffer: tir.Buffer,
+        vector_buffer: tir.Buffer,
+        output_buffer: tir.Buffer,
+    ) -> Optional[tir.Schedule]:
+        if not _can_use_splitk_schedule(
+            target,
+            epilogue_name,
+            matrix_buffer,
+            vector_buffer,
+            output_buffer,
+        ):
             return None
 
+        try:
+            sch = tir.Schedule(func)
+            block_infos = normalize_prim_func(sch)
+            block_infos = try_inline_contiguous_spatial(sch, block_infos)
+            if block_infos is None or len(block_infos) not in (1, 2):
+                return None
+
+            epilogue = None
+            if len(block_infos) == 2:
+                if not block_infos[1].is_injective():
+                    return None
+                epilogue = block_infos[1].block_rv
+
+            block_info = block_infos[0]
+            block = block_info.block_rv
+            if normalize(sch, block_info) is not True:
+                return None
+
+            batch, s, r, c = sch.get_loops(block)
+            output_tile, reduce_threads, vec = _choose_splitk_schedule_params(
+                target,
+                sch.get(s).extent,
+                sch.get(r).extent,
+                matrix_buffer.dtype,
+            )
+
+            bo, bi = sch.split(s, factors=[None, output_tile], preserve_unit_iters=True)
+            if vec > 1:
+                ro, tx, vec_loop = sch.split(
+                    r, factors=[None, reduce_threads, vec], preserve_unit_iters=True
+                )
+                sch.reorder(batch, bo, bi, ro, tx, vec_loop, c)
+                sch.fuse(vec_loop, c, preserve_unit_iters=True)
+            else:
+                ro, tx = sch.split(r, factors=[None, reduce_threads], preserve_unit_iters=True)
+                sch.reorder(batch, bo, bi, ro, tx, c)
+                tx = sch.fuse(tx, c, preserve_unit_iters=True)
+
+            block_outer = sch.fuse(batch, bo)
+            sch.bind(block_outer, "blockIdx.x")
+            sch.bind(bi, "threadIdx.y")
+            sch.bind(tx, "threadIdx.x")
+
+            if epilogue is not None:
+                sch.set_scope(block, 0, "shared")
+                sch.reverse_compute_at(epilogue, block_outer, preserve_unit_loops=True)
+
+            mod = tir.transform.LowerCrossThreadReduction()(sch.mod)
+            mod = tir.transform.LowerInitBlock()(mod)
+            mod = tir.transform.ConvertBlocksToOpaque()(mod)
+            mod = tilelang.transform.ReserveRootBlock()(mod)
+            return TileSchedule(mod)
+        except Exception:
+            return None
+
+    def _apply_tile_schedule(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        epilogue_name: Optional[str],
+        block_infos: List[BlockInfo],
+        block: tir.schedule.BlockRV,
+        vector_input_buffers: List[tir.Buffer],
+        matrix_buffer: tir.Buffer,
+        vector_buffer: tir.Buffer,
+    ) -> Optional[tir.Schedule]:
         sch = TileSchedule(func)
         block_infos = normalize_prim_func(sch)
         block_infos = try_inline_contiguous_spatial(sch, block_infos)
         if block_infos is None:
             return None
 
-        epilogue_name = _find_epilogue_name(block_infos, sch)
-        if epilogue_name is None and len(block_infos) != 1:
-            return None
-
-        block_info = block_infos[0]
-        if len(block_info.iters) not in [2, 3]:
-            return None
-
-        block = block_info.block_rv
-        vector_input_buffers = is_gemv(sch, block_info)
-        if vector_input_buffers is None or len(vector_input_buffers) != 1:
-            return None
-
-        is_inner_reduction = normalize(sch, block_info)
-        if is_inner_reduction is None or not is_inner_reduction:
-            return None
-
+        block = block_infos[0].block_rv
+        normalize(sch, block_infos[0])
         block_stmt = sch.get(block)
-        if len(block_stmt.writes) != 1:
-            return None
-
-        vector_buffer = vector_input_buffers[0]
-        matrix_buffer = None
-        vector_read_index = None
-        matrix_read_index = None
-        for read_region in block_stmt.reads:
-            if not read_region.buffer.same_as(vector_buffer):
-                matrix_buffer = read_region.buffer
-                break
-        if matrix_buffer is None:
-            return None
         vector_read_index = _find_buffer_index(block_stmt.reads, vector_buffer)
         matrix_read_index = _find_buffer_index(block_stmt.reads, matrix_buffer)
         prefer_large_reduction_tile = (
@@ -175,6 +314,7 @@ class GEMV(GPUScheduleRule):
         bo, bi = sch.split(s, factors=[None, output_tile], preserve_unit_iters=True)
         ro, ri = sch.split(r, factors=[None, reduction_tile], preserve_unit_iters=True)
         sch.reorder(batch, bo, ro, bi, ri, c)
+        num_threads = _choose_launch_threads(target, output_tile, reduction_tile)
         block_outer = sch.fuse(batch, bo)
 
         c_extent = _as_const_int(sch.get(c).extent)
@@ -182,6 +322,7 @@ class GEMV(GPUScheduleRule):
             sch.vectorize(c)
 
         sch.parallel(bi)
+        sch.bind(block_outer, "blockIdx.x")
         block_name = sch.get(block).name_hint
 
         if epilogue_name is None:
@@ -239,17 +380,91 @@ class GEMV(GPUScheduleRule):
 
             epilogue = sch.get_block(epilogue_name)
             sch.reverse_compute_at(epilogue, block_outer, preserve_unit_loops=True)
+            update_block = sch.get_block(update_name)
+            sch.cache_write_at(block_outer, update_block, 0, "shared", write_back=False)
             epilogue = sch.get_block(epilogue_name)
             epilogue_loops = sch.get_loops(epilogue)
             if epilogue_loops:
                 sch.parallel(epilogue_loops[-1])
 
-        sch.bind(block_outer, "blockIdx.x")
-        sch.launch_thread(
-            sch.get_block("root"),
-            _choose_launch_threads(target, output_tile, reduction_tile),
-        )
+        sch.launch_thread(sch.get_block("root"), num_threads)
         return sch
+
+    def apply(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        _: bool,
+    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+        if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
+            return None
+
+        sch = TileSchedule(func)
+        block_infos = normalize_prim_func(sch)
+        block_infos = try_inline_contiguous_spatial(sch, block_infos)
+        if block_infos is None:
+            return None
+
+        epilogue_name = _find_epilogue_name(block_infos, sch)
+        if epilogue_name is None and len(block_infos) != 1:
+            return None
+
+        block_info = block_infos[0]
+        if len(block_info.iters) not in [2, 3]:
+            return None
+
+        block = block_info.block_rv
+        vector_input_buffers = is_gemv(sch, block_info)
+        if vector_input_buffers is None or len(vector_input_buffers) != 1:
+            return None
+
+        is_inner_reduction = normalize(sch, block_info)
+        if is_inner_reduction is None:
+            return None
+        if not is_inner_reduction:
+            return None
+
+        block_stmt = sch.get(block)
+        if len(block_stmt.writes) != 1:
+            return None
+
+        vector_buffer = vector_input_buffers[0]
+        matrix_buffer = None
+        vector_read_index = None
+        matrix_read_index = None
+        for read_region in block_stmt.reads:
+            if not read_region.buffer.same_as(vector_buffer):
+                matrix_buffer = read_region.buffer
+                break
+        if matrix_buffer is None:
+            return None
+        output_buffer = block_stmt.writes[0].buffer
+
+        fast_path = self._apply_splitk_fast_path(
+            func,
+            target,
+            epilogue_name,
+            matrix_buffer,
+            vector_buffer,
+            output_buffer,
+        )
+        if fast_path is not None:
+            return fast_path
+
+        tile_schedule = self._apply_tile_schedule(
+            func,
+            target,
+            epilogue_name,
+            block_infos,
+            block,
+            vector_input_buffers,
+            matrix_buffer,
+            vector_buffer,
+        )
+        if tile_schedule is not None:
+            return tile_schedule
+
+        return None
 
     def apply_config(
         self, func: tir.PrimFunc, config

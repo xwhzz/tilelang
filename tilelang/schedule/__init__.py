@@ -7,6 +7,60 @@ class Schedule(TVMSchedule):
     def launch_thread(self, block: BlockRV, num_threads: int) -> None:
         _ffi_api.ScheduleLaunchThread(self, block, num_threads)
 
+    def parallelize(self, loop: LoopRV) -> None:
+        _ffi_api.ScheduleParallelizeLoop(self, loop)
+
+    def pipeline(self, loop: LoopRV, num_stages: int) -> None:
+        _ffi_api.SchedulePipelineLoop(self, loop, num_stages)
+
+    def gemm_at(
+        self,
+        loop: LoopRV,
+        block: BlockRV,
+        transpose_a: bool = False,
+        transpose_b: bool = False,
+        clear_accum: bool = False,
+        policy: str = "square",
+        use_py: bool = False,
+    ) -> None:
+        """Replace a tiled matmul loop nest with a TileLang `T.gemm` call."""
+        policy_id = {
+            "square": 0,
+            "full_row": 1,
+            "full_col": 2,
+        }.get(policy)
+        if policy_id is None:
+            raise ValueError(
+                f"Unsupported gemm policy `{policy}`, expected one of "
+                '{"square", "full_row", "full_col"}'
+            )
+        _ffi_api.ScheduleGemmAt(
+            self,
+            loop,
+            block,
+            transpose_a,
+            transpose_b,
+            clear_accum,
+            policy_id,
+            use_py,
+        )
+
+    def copy_at(
+        self,
+        loop: LoopRV,
+        block: BlockRV,
+        read_buffer_index: int = 0,
+        write_buffer_index: int = 0,
+    ) -> None:
+        """Replace a tiled copy block with a TileLang `T.copy` call."""
+        _ffi_api.ScheduleCopyAt(
+            self,
+            loop,
+            block,
+            read_buffer_index,
+            write_buffer_index,
+        )
+
     def cache_read_at(self, loop: LoopRV, block: BlockRV, read_buffer_index: int,
                       storage_scope: str, transform: str = "") -> None:
         """Insert a cached copy of a read buffer at the specified loop level.
@@ -36,7 +90,8 @@ class Schedule(TVMSchedule):
                                      storage_scope, transform)
 
     def cache_write_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
-                       storage_scope: str, write_back: bool = True) -> None:
+                       storage_scope: str, write_back: bool = True,
+                       reduce_type: str = "", reducer_replication: str = "none") -> None:
         """Insert a cached copy of a write buffer at the specified loop level.
 
         This creates a compact cache buffer inside the loop, rewrites all
@@ -58,9 +113,16 @@ class Schedule(TVMSchedule):
             Whether to emit a final T.copy from cache back to the original
             buffer (default: True). Set to False for purely intermediate
             tensors whose consumers are all rewritten to read the cache.
+        reduce_type : str
+            Optional reducer annotation for the cached write buffer. When set
+            to "sum", "max", or "min", the allocated cache buffer is marked
+            as a TileLang reducer and finalized before write-back.
+        reducer_replication : str
+            Reducer replication strategy, either "none" (default) or "all".
         """
         _ffi_api.ScheduleCacheWriteAt(self, loop, block, write_buffer_index,
-                                      storage_scope, write_back)
+                                      storage_scope, write_back,
+                                      reduce_type, reducer_replication)
 
     def fill_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int,
                 value: float = 0.0) -> None:

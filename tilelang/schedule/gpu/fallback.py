@@ -20,8 +20,9 @@
 # The code below is mostly copied from apache/tvm fallback.py in dlight.
 # pylint: disable=missing-docstring
 """A fallback schedule rule for GPU operators."""
-from typing import List, Tuple
+from typing import List
 
+from .. import Schedule as TileSchedule
 from tvm import tir
 from tvm.target import Target
 
@@ -46,14 +47,18 @@ class Fallback(GPUScheduleRule):
             return None
         max_threads_per_block = utils.max_threads_per_block(target)
 
-        sch = tir.Schedule(func)
+        sch = TileSchedule(func)
         block_infos = normalize_prim_func(sch)
 
         if block_infos is None:
             return None
 
         block_infos = try_inline(sch, block_infos)
-        reduction_blocks: List[Tuple[tir.schedule.BlockRV, tir.schedule.LoopRV]] = []
+        if block_infos is None:
+            return None
+
+        param_buffers = [func.buffer_map[param] for param in func.params]
+        block_records = []
         for block in block_infos:
             s_loops: List[tir.schedule.LoopRV] = []
             r_loops: List[tir.schedule.LoopRV] = []
@@ -79,10 +84,55 @@ class Fallback(GPUScheduleRule):
             sch.bind(bx, "blockIdx.x")
             sch.bind(tx, "threadIdx.x")
 
-            if len(r_loops) > 0:
-                reduction_blocks.append((block, r_loops[0]))
+            block_stmt = sch.get(block)
+            block_records.append(
+                {
+                    "name": block_stmt.name_hint,
+                    "bx": bx,
+                    "intermediate_buffers": [
+                        write.buffer
+                        for write in block_stmt.writes
+                        if not any(buf.same_as(write.buffer) for buf in param_buffers)
+                    ],
+                }
+            )
 
-        for block, r_loop in reduction_blocks:
-            sch.decompose_reduction(block, r_loop)
+        for idx in reversed(range(len(block_records))):
+            record = block_records[idx]
+            if not record["intermediate_buffers"]:
+                continue
+
+            for consumer_record in reversed(block_records[idx + 1 :]):
+                consumer_block = sch.get_block(consumer_record["name"])
+                consumer_stmt = sch.get(consumer_block)
+                if not any(
+                    any(read.buffer.same_as(buf) for buf in record["intermediate_buffers"])
+                    for read in consumer_stmt.reads
+                ):
+                    continue
+                sch.reverse_compute_at(
+                    consumer_block,
+                    record["bx"],
+                    preserve_unit_loops=True,
+                )
+                consumer_block = sch.get_block(consumer_record["name"])
+                consumer_stmt = sch.get(consumer_block)
+                consumer_loops = sch.get_loops(consumer_block)
+                if consumer_stmt.init is None and consumer_loops:
+                    sch.parallel(consumer_loops[-1])
+
+            block = sch.get_block(record["name"])
+            block_stmt = sch.get(block)
+            for write_buffer_index, write_region in reversed(list(enumerate(block_stmt.writes))):
+                if any(buf.same_as(write_region.buffer) for buf in param_buffers):
+                    continue
+                sch.cache_write_at(
+                    record["bx"],
+                    block,
+                    write_buffer_index,
+                    "shared",
+                    write_back=False,
+                )
+                block = sch.get_block(record["name"])
 
         return sch

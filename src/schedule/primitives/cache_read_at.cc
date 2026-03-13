@@ -47,6 +47,7 @@
 
 // TileLang headers
 #include "../../op/region.h"
+#include "../../transform/layout_reducer.h"
 
 #include <string>
 #include <vector>
@@ -286,6 +287,121 @@ class LoopReplacer : public StmtMutator {
   bool found_;
 };
 
+static ffi::Array<Range> ComputeRelaxedRegion(
+    ScheduleState self, const StmtSRef& loop_sref,
+    const StmtSRef& block_sref, const Buffer& buf,
+    BufferIndexType buffer_type, const runtime::StorageScope& extra_relax_scope) {
+  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  BlockRealize realize = GetBlockRealize(self, block_sref);
+  ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
+
+  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+      ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
+      loop_sref, extra_relax_scope));
+
+  const auto& regions = (buffer_type == BufferIndexType::kRead)
+                            ? block->reads
+                            : block->writes;
+
+  std::vector<NDIntSet> relaxed_regions;
+  for (const BufferRegion& buffer_region : regions) {
+    if (!buffer_region->buffer.same_as(buf)) {
+      continue;
+    }
+    ffi::Array<arith::IntSet> relaxed =
+        arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
+    relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
+  }
+  ICHECK(!relaxed_regions.empty())
+      << "ValueError: buffer " << buf->name
+      << " is not accessed in the specified block";
+
+  NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
+  int ndim = static_cast<int>(unified.size());
+
+  arith::Analyzer analyzer;
+  ffi::Array<Range> result;
+  result.reserve(ndim);
+  for (int d = 0; d < ndim; ++d) {
+    PrimExpr mn = analyzer.Simplify(unified[d].min());
+    PrimExpr mx = analyzer.Simplify(unified[d].max());
+    PrimExpr extent = analyzer.Simplify(mx - mn + 1);
+    result.push_back(Range::FromMinExtent(mn, extent));
+  }
+  return result;
+}
+
+static bool ContainsTargetBlock(const Stmt& stmt, const BlockNode* target) {
+  bool found = false;
+  PostOrderVisit(stmt, [&found, target](const ObjectRef& obj) {
+    if (found) {
+      return;
+    }
+    if (const auto* realize = obj.as<BlockRealizeNode>()) {
+      if (realize->block.get() == target) {
+        found = true;
+      }
+    }
+  });
+  return found;
+}
+
+class ComputeNestReplacer : public StmtMutator {
+ public:
+  ComputeNestReplacer(const BlockNode* target, Stmt replacement)
+      : target_(target), replacement_(std::move(replacement)), replaced_(false) {}
+
+  Stmt VisitStmt(const Stmt& stmt) final {
+    if (replaced_ || !stmt.defined()) {
+      return stmt;
+    }
+    return StmtMutator::VisitStmt(stmt);
+  }
+
+  Stmt VisitStmt_(const SeqStmtNode* op) final {
+    ffi::Array<Stmt> new_seq;
+    new_seq.reserve(op->seq.size());
+    for (const Stmt& stmt : op->seq) {
+      if (!replaced_ && ContainsTargetBlock(stmt, target_)) {
+        Stmt new_stmt = StmtMutator::VisitStmt(stmt);
+        if (!replaced_ && ContainsTargetBlock(new_stmt, target_)) {
+          new_seq.push_back(replacement_);
+          replaced_ = true;
+        } else {
+          new_seq.push_back(new_stmt);
+        }
+      } else {
+        new_seq.push_back(stmt);
+      }
+    }
+    return SeqStmt(new_seq);
+  }
+
+  bool replaced() const { return replaced_; }
+
+ private:
+  const BlockNode* target_;
+  Stmt replacement_;
+  bool replaced_;
+};
+
+static int GetConstInt(const PrimExpr& expr, const char* what) {
+  if (const auto* imm = expr.as<IntImmNode>()) {
+    return static_cast<int>(imm->value);
+  }
+  LOG(FATAL) << "ValueError: gemm_at expects a static " << what << ", but got " << expr;
+  return 0;
+}
+
+static PrimExpr GetMatrixStride(const Buffer& buf) {
+  if (buf->strides.size() >= 2) {
+    return buf->strides[buf->strides.size() - 2];
+  }
+  ICHECK_GE(buf->shape.size(), 2U)
+      << "ValueError: gemm_at expects at least a 2D buffer, but got " << buf->name;
+  return buf->shape[buf->shape.size() - 1];
+}
+
 // ---------------------------------------------------------------------------
 // CacheReadAt:  main entry point
 // ---------------------------------------------------------------------------
@@ -414,12 +530,12 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
     square_stmt = BuildSquareInplaceStmt(dst, squeezed_shape);
   }
 
-  // ---- Step 6: Rewrite buffer references in the loop body -------------------
+  // ---- Step 6: Rewrite buffer references in the target consumer block -------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
   CacheBufferReplacer replacer(
       src, dst, region_mins, kept_dims, &block_sref_reuse,
-      /*target_block=*/do_square_transform ? block : nullptr);
+      /*target_block=*/block);
   for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
     Stmt old_stmt = subtrees[i];
     subtrees.Set(i, Stmt(nullptr));
@@ -469,7 +585,9 @@ static void CacheReadAt(ScheduleState self, const StmtSRef& loop_sref,
 // ---------------------------------------------------------------------------
 static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
                          const StmtSRef& block_sref, int write_buffer_index,
-                         const ffi::String& storage_scope, bool write_back) {
+                         const ffi::String& storage_scope, bool write_back,
+                         const ffi::String& reduce_type,
+                         const ffi::String& reducer_replication) {
   // ---- Step 1: Obtain destination buffer and loop ---------------------------
   const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -577,6 +695,26 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
              {cache_region_arg, orig_region_arg}));
   }
 
+  bool use_reducer = !reduce_type.empty();
+  Stmt fill_stmt;
+  Stmt finalize_stmt;
+  if (use_reducer) {
+    ICHECK(reduce_type == "sum")
+        << "ValueError: reducer-backed cache_write_at currently only supports "
+           "`sum` reductions";
+    ICHECK(reducer_replication == "all" || reducer_replication == "none")
+        << "ValueError: unsupported reducer replication `" << reducer_replication
+        << "`, expected one of {\"all\", \"none\"}";
+    PrimExpr reducer_region_arg =
+        MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
+    fill_stmt = Evaluate(
+        Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
+             {reducer_region_arg, make_const(src->dtype, 0.0)}));
+    finalize_stmt = Evaluate(
+        Call(DataType::Handle(), Op::Get("tl.tileop.finalize_reducer"),
+             {reducer_region_arg}));
+  }
+
   // ---- Step 6: Rewrite buffer references in the loop body -------------------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
@@ -588,6 +726,12 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   }
 
   // ---- Step 7: Append the optional write-back copy --------------------------
+  if (use_reducer) {
+    subtrees.insert(subtrees.begin(), fill_stmt);
+  }
+  if (use_reducer) {
+    subtrees.push_back(finalize_stmt);
+  }
   if (write_back) {
     subtrees.push_back(copy_stmt);
   }
@@ -600,6 +744,15 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
       /*body=*/subtrees.size() == 1 ? subtrees[0] : SeqStmt(subtrees),
       /*init=*/std::nullopt,
       /*alloc_buffers=*/{dst});
+  if (use_reducer) {
+    auto* block_ptr = alloc_block.CopyOnWrite();
+    ffi::Map<Var, ffi::Map<ffi::String, ffi::String>> reducer_info;
+    ffi::Map<ffi::String, ffi::String> reducer_meta;
+    reducer_meta.Set("op", reduce_type);
+    reducer_meta.Set("rep", reducer_replication);
+    reducer_info.Set(dst->data, reducer_meta);
+    block_ptr->annotations.Set(tvm::tl::attr::kReducerInfo, reducer_info);
+  }
   BlockRealize alloc_realize(
       /*values=*/{},
       /*predicate=*/const_true(),
@@ -637,6 +790,156 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef& loop_sref,
   self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
 }
 
+static void GemmAt(ScheduleState self, const StmtSRef& loop_sref,
+                   const StmtSRef& block_sref, bool transpose_a,
+                   bool transpose_b, bool clear_accum, int policy_type,
+                   bool use_py) {
+  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  Block block_ref = ffi::GetRef<Block>(block);
+  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+
+  ICHECK_EQ(block->reads.size(), 2U)
+      << "ValueError: gemm_at expects a matmul-like block with exactly two reads";
+  ICHECK_EQ(block->writes.size(), 1U)
+      << "ValueError: gemm_at expects a matmul-like block with exactly one write";
+
+  Buffer a = GetNthAccessBuffer(self, block_ref, 0, BufferIndexType::kRead);
+  Buffer b = GetNthAccessBuffer(self, block_ref, 1, BufferIndexType::kRead);
+  Buffer c = GetNthAccessBuffer(self, block_ref, 0, BufferIndexType::kWrite);
+
+  ffi::Array<Range> a_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, a, BufferIndexType::kRead,
+      runtime::StorageScope::Create(a.scope()));
+  ffi::Array<Range> b_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, b, BufferIndexType::kRead,
+      runtime::StorageScope::Create(b.scope()));
+  ffi::Array<Range> c_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, c, BufferIndexType::kWrite,
+      runtime::StorageScope::Create(c.scope()));
+
+  ICHECK_EQ(a_region.size(), 2U)
+      << "ValueError: gemm_at currently expects a 2D lhs tile, but got rank "
+      << a_region.size();
+  ICHECK_EQ(b_region.size(), 2U)
+      << "ValueError: gemm_at currently expects a 2D rhs tile, but got rank "
+      << b_region.size();
+  ICHECK_EQ(c_region.size(), 2U)
+      << "ValueError: gemm_at currently expects a 2D accumulator tile, but got rank "
+      << c_region.size();
+
+  int m = GetConstInt(c_region[0]->extent, "M extent");
+  int n = GetConstInt(c_region[1]->extent, "N extent");
+  int k = GetConstInt(
+      transpose_a ? a_region[0]->extent : a_region[1]->extent,
+      "K extent");
+
+  PrimExpr a_region_arg = MakeRegionCall(a, a_region, /*access_mask=*/1);
+  PrimExpr b_region_arg = MakeRegionCall(b, b_region, /*access_mask=*/1);
+  PrimExpr c_region_arg = MakeRegionCall(c, c_region, /*access_mask=*/3);
+
+  PrimExpr stride_a = GetMatrixStride(a);
+  PrimExpr stride_b = GetMatrixStride(b);
+  PrimExpr offset_a = a_region[a_region.size() - 1]->min;
+  PrimExpr offset_b = b_region[b_region.size() - 1]->min;
+  PrimExpr c_row = c_region[0]->min;
+  PrimExpr c_col = c_region[1]->min;
+
+  int stride_a_value = GetConstInt(stride_a, "lhs stride");
+  int stride_b_value = GetConstInt(stride_b, "rhs stride");
+  int offset_a_value = GetConstInt(offset_a, "lhs offset");
+  int offset_b_value = GetConstInt(offset_b, "rhs offset");
+  int c_row_value = GetConstInt(c_row, "accumulator row offset");
+  int c_col_value = GetConstInt(c_col, "accumulator column offset");
+
+  const char* op_name = use_py ? "tl.tileop.gemm_py" : "tl.tileop.gemm";
+  Stmt gemm_stmt = Evaluate(Call(
+      DataType::Handle(),
+      Op::Get(op_name),
+      {
+          a_region_arg,
+          b_region_arg,
+          c_region_arg,
+          Bool(transpose_a),
+          Bool(transpose_b),
+          IntImm(DataType::Int(32), m),
+          IntImm(DataType::Int(32), n),
+          IntImm(DataType::Int(32), k),
+          IntImm(DataType::Int(32), policy_type),
+          Bool(clear_accum),
+          IntImm(DataType::Int(32), stride_a_value),
+          IntImm(DataType::Int(32), stride_b_value),
+          IntImm(DataType::Int(32), offset_a_value),
+          IntImm(DataType::Int(32), offset_b_value),
+          IntImm(DataType::Int(32), 1),
+          IntImm(DataType::Int(32), 0),
+          make_zero(DataType::UInt(32)),
+          IntImm(DataType::Int(32), c_row_value),
+          IntImm(DataType::Int(32), c_col_value),
+      }));
+
+  ComputeNestReplacer replacer(block, gemm_stmt);
+  ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
+  new_loop_node->body = replacer(loop->body);
+  ICHECK(replacer.replaced())
+      << "ValueError: gemm_at failed to isolate the tiled compute nest";
+  For new_loop(new_loop_node);
+
+  StmtSRef scope_root_sref =
+      GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
+  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+
+  ffi::Map<Block, Block> block_sref_reuse;
+  Block new_scope_block = Downcast<Block>(
+      LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
+  block_sref_reuse.Set(ffi::GetRef<Block>(scope_block), new_scope_block);
+  self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
+}
+
+static void CopyAt(ScheduleState self, const StmtSRef& loop_sref,
+                   const StmtSRef& block_sref, int read_buffer_index,
+                   int write_buffer_index) {
+  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  Block block_ref = ffi::GetRef<Block>(block);
+  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+
+  Buffer src = GetNthAccessBuffer(self, block_ref, read_buffer_index,
+                                  BufferIndexType::kRead);
+  Buffer dst = GetNthAccessBuffer(self, block_ref, write_buffer_index,
+                                  BufferIndexType::kWrite);
+
+  ffi::Array<Range> src_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, src, BufferIndexType::kRead,
+      runtime::StorageScope::Create(src.scope()));
+  ffi::Array<Range> dst_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, dst, BufferIndexType::kWrite,
+      runtime::StorageScope::Create(dst.scope()));
+
+  Stmt copy_stmt = Evaluate(Call(
+      DataType::Handle(),
+      Op::Get("tl.tileop.copy"),
+      {
+          MakeRegionCall(src, src_region, /*access_mask=*/1),
+          MakeRegionCall(dst, dst_region, /*access_mask=*/2),
+      }));
+
+  ComputeNestReplacer replacer(block, copy_stmt);
+  ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
+  new_loop_node->body = replacer(loop->body);
+  ICHECK(replacer.replaced())
+      << "ValueError: copy_at failed to isolate the tiled compute nest";
+  For new_loop(new_loop_node);
+
+  StmtSRef scope_root_sref =
+      GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
+  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+
+  ffi::Map<Block, Block> block_sref_reuse;
+  Block new_scope_block = Downcast<Block>(
+      LoopReplacer(loop, new_loop)(ffi::GetRef<Block>(scope_block)));
+  block_sref_reuse.Set(ffi::GetRef<Block>(scope_block), new_scope_block);
+  self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
+}
+
 // ---------------------------------------------------------------------------
 // FFI Registration
 // ---------------------------------------------------------------------------
@@ -657,10 +960,29 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.schedule.ScheduleCacheWriteAt",
       [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
          int write_buffer_index, const ffi::String& storage_scope,
-         bool write_back) {
+         bool write_back, const ffi::String& reduce_type,
+         const ffi::String& reducer_replication) {
         CacheWriteAt(self->state(), self->GetSRef(loop_rv),
                      self->GetSRef(block_rv), write_buffer_index,
-                     storage_scope, write_back);
+                     storage_scope, write_back, reduce_type,
+                     reducer_replication);
+      });
+
+  refl::GlobalDef().def(
+      "tl.schedule.ScheduleGemmAt",
+      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
+         bool transpose_a, bool transpose_b, bool clear_accum,
+         int policy_type, bool use_py) {
+        GemmAt(self->state(), self->GetSRef(loop_rv), self->GetSRef(block_rv),
+               transpose_a, transpose_b, clear_accum, policy_type, use_py);
+      });
+
+  refl::GlobalDef().def(
+      "tl.schedule.ScheduleCopyAt",
+      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
+         int read_buffer_index, int write_buffer_index) {
+        CopyAt(self->state(), self->GetSRef(loop_rv), self->GetSRef(block_rv),
+               read_buffer_index, write_buffer_index);
       });
 }
 
