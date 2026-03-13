@@ -10,12 +10,8 @@ block_N = 16384
 
 scale = 1.44269504  # log2(e)
 
-@tilelang.jit(
-    pass_configs= {
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True
-    }
-)
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True, tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def softmax():
     @T.prim_func
     def softmax_kernel(
@@ -27,7 +23,7 @@ def softmax():
             input_frag = T.alloc_fragment((block_M, block_N), dtype)
             exp_frag = T.alloc_fragment((block_M, block_N), dtype)
             output_frag = T.alloc_fragment((block_M, block_N), dtype)
-            lse = T.alloc_fragment((block_M,), dtype)       # log-sum-exp per row
+            lse = T.alloc_fragment((block_M,), dtype)  # log-sum-exp per row
             local_max = T.alloc_fragment((block_M,), dtype)  # local max per tile
             local_sum = T.alloc_fragment((block_M,), dtype)  # local sum(exp) per tile
 
@@ -63,6 +59,7 @@ kernel = softmax()
 
 # print(kernel.get_kernel_source())
 import torch
+
 a = torch.randn((M, N)).cuda()
 c = torch.empty((M, N)).cuda()
 kernel(a, c)
@@ -72,12 +69,14 @@ kernel(a, c)
 def fn_torch(a):
     return torch.softmax(a, dim=1)
 
+
 ref_c = fn_torch(a)
 print(c, ref_c, sep="\n")
 torch.testing.assert_close(c, ref_c, rtol=1e-4, atol=1e-4)
 
 ## benchmark performance
 from tilelang.profiler import do_bench
+
 tilelang_time = do_bench(lambda: kernel(a, c), backend="cupti")
 torch_time = do_bench(lambda: fn_torch(a), backend="cupti")
 print(f"TileLang kernel time: {tilelang_time} ms")

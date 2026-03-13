@@ -69,25 +69,29 @@ void CodeGenCHost::Init(bool output_ssa, bool emit_asserts,
 
   decl_stream << "#include <torch/mps.h>\n";
   decl_stream << "#endif\n";
-  decl_stream << "static int TileLangBackendAnyListSetPackedArg(void* anylist, int index, "
+  decl_stream << "static int TileLangBackendAnyListSetPackedArg(void* anylist, "
+                 "int index, "
                  "void* args, int arg_offset) {\n";
   decl_stream << "  TVMFFIAny* list = (TVMFFIAny*)anylist;\n";
   decl_stream << "  TVMFFIAny* ffi_args = (TVMFFIAny*)args;\n";
   decl_stream << "  ffi_args[arg_offset] = list[index];\n";
   decl_stream << "  return 0;\n";
   decl_stream << "}\n";
-  decl_stream << "static int TileLangBackendAnyListResetItem(void* anylist, int index) {\n";
+  decl_stream << "static int TileLangBackendAnyListResetItem(void* anylist, "
+                 "int index) {\n";
   decl_stream << "  TVMFFIAny* list = (TVMFFIAny*)anylist;\n";
   decl_stream << "  list[index].type_index = kTVMFFINone;\n";
   decl_stream << "  list[index].zero_padding = 0;\n";
   decl_stream << "  list[index].v_int64 = 0;\n";
   decl_stream << "  return 0;\n";
   decl_stream << "}\n";
-  decl_stream << "static int TileLangBackendAnyListMoveFromPackedReturn(void* anylist, int index, "
+  decl_stream << "static int TileLangBackendAnyListMoveFromPackedReturn(void* "
+                 "anylist, int index, "
                  "void* args, int ret_offset) {\n";
   decl_stream << "  TVMFFIAny* list = (TVMFFIAny*)anylist;\n";
   decl_stream << "  TVMFFIAny* ffi_args = (TVMFFIAny*)args;\n";
-  decl_stream << "  if (TVMFFIAnyViewToOwnedAny(&ffi_args[ret_offset], &list[index]) != 0) {\n";
+  decl_stream << "  if (TVMFFIAnyViewToOwnedAny(&ffi_args[ret_offset], "
+                 "&list[index]) != 0) {\n";
   decl_stream << "    return -1;\n";
   decl_stream << "  }\n";
   decl_stream << "  ffi_args[ret_offset].type_index = kTVMFFINone;\n";
@@ -95,8 +99,10 @@ void CodeGenCHost::Init(bool output_ssa, bool emit_asserts,
   decl_stream << "  ffi_args[ret_offset].v_int64 = 0;\n";
   decl_stream << "  return 0;\n";
   decl_stream << "}\n";
-  decl_stream << "#define TVMBackendAnyListSetPackedArg TileLangBackendAnyListSetPackedArg\n";
-  decl_stream << "#define TVMBackendAnyListResetItem TileLangBackendAnyListResetItem\n";
+  decl_stream << "#define TVMBackendAnyListSetPackedArg "
+                 "TileLangBackendAnyListSetPackedArg\n";
+  decl_stream
+      << "#define TVMBackendAnyListResetItem TileLangBackendAnyListResetItem\n";
   decl_stream << "#define TVMBackendAnyListMoveFromPackedReturn "
                  "TileLangBackendAnyListMoveFromPackedReturn\n";
 
@@ -296,7 +302,8 @@ void CodeGenCHost::MaybeGenerateCPackedForwardDeclaration(
     return;
   }
   this->PrintFuncPrefix(fwd_decl_stream);
-  fwd_decl_stream << "int32_t " << ffi::symbol::tvm_ffi_symbol_prefix + func_name
+  fwd_decl_stream << "int32_t "
+                  << ffi::symbol::tvm_ffi_symbol_prefix + func_name
                   << "(void* self_handle, void* args, int32_t num_args, "
                      "void* result);\n";
 }
@@ -377,7 +384,8 @@ void CodeGenCHost::PrintCallPacked(const tvm::tir::CallNode *op) {
   }
 
   this->PrintIndent();
-  this->stream << "((TVMFFIAny*) " << args_stack << ")[" << end << "] = " << result << ";\n";
+  this->stream << "((TVMFFIAny*) " << args_stack << ")[" << end
+               << "] = " << result << ";\n";
 }
 
 std::string CodeGenCHost::GetPackedName(const tvm::tir::CallNode *op) {

@@ -3,7 +3,9 @@
 
 # pylint: disable=invalid-name
 """Reduction rule for operators including softmax, layer norm, RMS norm, etc"""
-from typing import List, Optional, Union
+
+from __future__ import annotations
+
 from functools import reduce
 
 from tvm import tir
@@ -27,13 +29,16 @@ from .reduction import (
 from .layernorm_like import LayerNormLike
 
 
-def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> List[tir.Buffer]:
-    buffers: List[tir.Buffer] = []
+def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[tir.Buffer]:
+    buffers: list[tir.Buffer] = []
 
     def _collect(expr):
-        if isinstance(expr, tir.BufferLoad) and (not expr.buffer.same_as(write_buffer)):
-            if not any(expr.buffer.same_as(buf) for buf in buffers):
-                buffers.append(expr.buffer)
+        if (
+            isinstance(expr, tir.BufferLoad)
+            and (not expr.buffer.same_as(write_buffer))
+            and not any(expr.buffer.same_as(buf) for buf in buffers)
+        ):
+            buffers.append(expr.buffer)
 
     tir.stmt_functor.post_order_visit(rhs, _collect)
     return buffers
@@ -58,7 +63,7 @@ def _contains_exp_like_call(expr: tir.PrimExpr) -> bool:
 def _is_same_buffer_load(
     lhs: tir.PrimExpr,
     rhs: tir.PrimExpr,
-    target_buffer: Optional[tir.Buffer] = None,
+    target_buffer: tir.Buffer | None = None,
 ) -> bool:
     if not isinstance(lhs, tir.BufferLoad) or not isinstance(rhs, tir.BufferLoad):
         return False
@@ -68,10 +73,7 @@ def _is_same_buffer_load(
         return False
     if len(lhs.indices) != len(rhs.indices):
         return False
-    return all(
-        tir.analysis.expr_deep_equal(a, b)
-        for a, b in zip(lhs.indices, rhs.indices)
-    )
+    return all(tir.analysis.expr_deep_equal(a, b) for a, b in zip(lhs.indices, rhs.indices))
 
 
 def _is_square_of_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> bool:
@@ -86,7 +88,7 @@ def _block_writes_buffer(block: tir.Block, target_buffer: tir.Buffer) -> bool:
 
 def _should_preserve_two_reduction_bridge(
     sch: TileSchedule,
-    block_infos: List[BlockInfo],
+    block_infos: list[BlockInfo],
 ) -> bool:
     """Keep injective bridge blocks between two reductions when needed.
 
@@ -100,8 +102,8 @@ def _should_preserve_two_reduction_bridge(
         return False
 
     first_reduction_idx, second_reduction_idx = reduction_indices
-    bridge_infos = block_infos[first_reduction_idx + 1:second_reduction_idx]
-    trailing_infos = block_infos[second_reduction_idx + 1:]
+    bridge_infos = block_infos[first_reduction_idx + 1 : second_reduction_idx]
+    trailing_infos = block_infos[second_reduction_idx + 1 :]
     if len(bridge_infos) == 0:
         return False
     if not all(info.is_injective() for info in bridge_infos):
@@ -109,10 +111,7 @@ def _should_preserve_two_reduction_bridge(
     if len(trailing_infos) == 0 or not all(info.is_injective() for info in trailing_infos):
         return False
 
-    output_block_names = {
-        sch.get(output_block).name_hint
-        for output_block in get_output_blocks(sch, block_infos)
-    }
+    output_block_names = {sch.get(output_block).name_hint for output_block in get_output_blocks(sch, block_infos)}
     if sch.get(trailing_infos[-1].block_rv).name_hint not in output_block_names:
         return False
 
@@ -128,7 +127,7 @@ def _should_preserve_two_reduction_bridge(
     if len(second_input_buffers) != 1:
         return False
 
-    bridge_output_buffers: List[tir.Buffer] = []
+    bridge_output_buffers: list[tir.Buffer] = []
     bridge_has_exp_like = False
     first_reduction_stmt = sch.get(block_infos[first_reduction_idx].block_rv)
     first_reduce_type_rhs = _analyze_reduction_update(first_reduction_stmt)
@@ -138,12 +137,16 @@ def _should_preserve_two_reduction_bridge(
         bridge_stmt = sch.get(bridge_info.block_rv)
         for write_region in bridge_stmt.writes:
             bridge_output_buffers.append(write_region.buffer)
-        if isinstance(bridge_stmt.body, tir.BufferStore):
-            if _contains_exp_like_call(bridge_stmt.body.value):
-                if first_output is None or _block_writes_buffer(bridge_stmt, first_output):
-                    bridge_has_exp_like = True
-                elif any(read_region.buffer.same_as(first_output) for read_region in bridge_stmt.reads):
-                    bridge_has_exp_like = True
+        if (
+            isinstance(bridge_stmt.body, tir.BufferStore)
+            and _contains_exp_like_call(bridge_stmt.body.value)
+            and (
+                first_output is None
+                or _block_writes_buffer(bridge_stmt, first_output)
+                or any(read_region.buffer.same_as(first_output) for read_region in bridge_stmt.reads)
+            )
+        ):
+            bridge_has_exp_like = True
 
     if not any(second_input_buffers[0].same_as(buf) for buf in bridge_output_buffers):
         return False
@@ -155,10 +158,7 @@ def _should_preserve_two_reduction_bridge(
 
     # Norm-like chains (e.g. layernorm variance) often rely on preserving a
     # centered bridge so sum(x*x) remains lowerable to tile-level reduce.
-    if second_reduce_type == "sum" and _is_square_of_buffer_load(second_rhs_expr, second_input_buffers[0]):
-        return True
-
-    return False
+    return bool(second_reduce_type == "sum" and _is_square_of_buffer_load(second_rhs_expr, second_input_buffers[0]))
 
 
 def _schedule_epilogue_block(
@@ -238,8 +238,8 @@ def _schedule_prologue_block(
         o_count = len(loops) - s_count - r_count
         if s_count > 0 and r_count > 0:
             s_loops = list(loops[:s_count])
-            r_loops = list(loops[s_count:s_count + r_count])
-            o_loops = list(loops[s_count + r_count:s_count + r_count + o_count])
+            r_loops = list(loops[s_count : s_count + r_count])
+            o_loops = list(loops[s_count + r_count : s_count + r_count + o_count])
             sch.reorder(*s_loops, *r_loops, *o_loops)
             loops = sch.get_loops(block)
             s_loops = list(loops[:s_count])
@@ -266,7 +266,7 @@ def _schedule_reduction_stage_at_bx(
     output_block_names: set[str],
     force_explicit_update: bool = False,
     cache_reduce_write_back: bool = True,
-) -> Optional[tir.PrimExpr]:
+) -> tir.PrimExpr | None:
     block = sch.get_block(block_name)
     block_stmt = sch.get(block)
     if len(block_stmt.writes) != 1 or len(block_stmt.reads) < 1:
@@ -286,7 +286,7 @@ def _schedule_reduction_stage_at_bx(
     if len(input_buffers) == 0:
         return None
 
-    read_buffer_indices: List[int] = []
+    read_buffer_indices: list[int] = []
     for input_buffer in input_buffers:
         read_index = _find_buffer_index(block_stmt.reads, input_buffer)
         if read_index is None:
@@ -295,10 +295,7 @@ def _schedule_reduction_stage_at_bx(
 
     is_single_source = len(set(read_buffer_indices)) == 1
     square_single_source = (
-        is_single_source
-        and len(input_buffers) == 1
-        and reduce_type == "sum"
-        and _is_square_of_buffer_load(rhs_expr, input_buffers[0])
+        is_single_source and len(input_buffers) == 1 and reduce_type == "sum" and _is_square_of_buffer_load(rhs_expr, input_buffers[0])
     )
     init_value = _infer_init_value(block_stmt, reduce_type)
 
@@ -311,7 +308,7 @@ def _schedule_reduction_stage_at_bx(
     if reduce_step is not None:
         ro, ri = sch.split(r_fused, factors=[None, reduce_step], preserve_unit_iters=True)
         cache_read_loop = ro
-        reduce_loop: Optional[tir.schedule.LoopRV] = ro
+        reduce_loop: tir.schedule.LoopRV | None = ro
         thread_extent_expr = sch.get(ri).extent
     else:
         cache_read_loop = bx
@@ -338,11 +335,7 @@ def _schedule_reduction_stage_at_bx(
             write_back=cache_reduce_write_back,
         )
 
-        can_lower_to_tile_reduce = (
-            is_single_source and (
-                _is_direct_buffer_load(rhs_expr, input_buffers[0]) or square_single_source
-            )
-        )
+        can_lower_to_tile_reduce = is_single_source and (_is_direct_buffer_load(rhs_expr, input_buffers[0]) or square_single_source)
         if reduce_loop is not None and can_lower_to_tile_reduce:
             read_buffer_index = read_buffer_indices[0]
             reduce_type_for_lower = "sumsq" if square_single_source else reduce_type
@@ -411,7 +404,7 @@ class GeneralReduction(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -455,26 +448,26 @@ class GeneralReduction(GPUScheduleRule):
         reduction_indices = [i for i, info in enumerate(block_infos) if info.is_reduction()]
         if len(reduction_indices) == 0:
             return None
-        output_block_names = {
-            sch.get(output_block).name_hint
-            for output_block in get_output_blocks(sch, block_infos)
-        }
+        output_block_names = {sch.get(output_block).name_hint for output_block in get_output_blocks(sch, block_infos)}
 
         if len(reduction_indices) > 1:
             if len(reduction_indices) == 2:
                 first_reduction_idx, second_reduction_idx = reduction_indices
-                trailing_infos = block_infos[second_reduction_idx + 1:]
+                trailing_infos = block_infos[second_reduction_idx + 1 :]
                 second_reduction_stmt = sch.get(block_infos[second_reduction_idx].block_rv)
                 second_update_info = _analyze_reduction_update(second_reduction_stmt)
                 if second_update_info is not None and second_update_info[0] == "sum":
                     second_rhs_expr = second_update_info[1]
-                    second_input_buffers = _collect_input_buffers(
-                        second_rhs_expr,
-                        second_reduction_stmt.writes[0].buffer,
-                    ) if len(second_reduction_stmt.writes) == 1 else []
-                    is_norm_like_second = (
-                        len(second_input_buffers) == 1 and
-                        _is_square_of_buffer_load(second_rhs_expr, second_input_buffers[0])
+                    second_input_buffers = (
+                        _collect_input_buffers(
+                            second_rhs_expr,
+                            second_reduction_stmt.writes[0].buffer,
+                        )
+                        if len(second_reduction_stmt.writes) == 1
+                        else []
+                    )
+                    is_norm_like_second = len(second_input_buffers) == 1 and _is_square_of_buffer_load(
+                        second_rhs_expr, second_input_buffers[0]
                     )
                     # Layernorm-like chains currently trigger unstable rewrite/codegen
                     # interactions in the two-reduction template path.
@@ -487,8 +480,8 @@ class GeneralReduction(GPUScheduleRule):
                 first_reduction_idx, second_reduction_idx = reduction_indices
                 first_reduction_info = block_infos[first_reduction_idx]
                 second_reduction_info = block_infos[second_reduction_idx]
-                bridge_infos = block_infos[first_reduction_idx + 1:second_reduction_idx]
-                trailing_infos = block_infos[second_reduction_idx + 1:]
+                bridge_infos = block_infos[first_reduction_idx + 1 : second_reduction_idx]
+                trailing_infos = block_infos[second_reduction_idx + 1 :]
                 if (
                     all(info.is_injective() for info in bridge_infos)
                     and len(trailing_infos) >= 1
@@ -508,24 +501,20 @@ class GeneralReduction(GPUScheduleRule):
 
                     first_reduction_name = sch.get(first_reduction_info.block_rv).name_hint
                     second_reduction_name = sch.get(second_reduction_info.block_rv).name_hint
-                    trailing_epilogue_names = [
-                        sch.get(info.block_rv).name_hint for info in trailing_infos[:-1]
-                    ]
+                    trailing_epilogue_names = [sch.get(info.block_rv).name_hint for info in trailing_infos[:-1]]
 
-                    output_s_fused = (
-                        sch.fuse(*output_bx_loops)
-                        if len(output_bx_loops) > 1 else output_bx_loops[0]
-                    )
+                    output_s_fused = sch.fuse(*output_bx_loops) if len(output_bx_loops) > 1 else output_bx_loops[0]
                     output_inner_fused = (
-                        sch.fuse(*output_inner_loops)
-                        if len(output_inner_loops) > 1 else output_inner_loops[0]
-                    ) if output_inner_loops else None
+                        (sch.fuse(*output_inner_loops) if len(output_inner_loops) > 1 else output_inner_loops[0])
+                        if output_inner_loops
+                        else None
+                    )
 
                     second_reduction_stmt = sch.get(second_reduction_info.block_rv)
                     second_update_info = _analyze_reduction_update(second_reduction_stmt)
                     is_second_multi_source = False
                     is_second_square_single_source = False
-                    second_input_buffers: List[tir.Buffer] = []
+                    second_input_buffers: list[tir.Buffer] = []
                     if second_update_info is not None and len(second_reduction_stmt.writes) == 1:
                         second_reduce_type, second_rhs_expr = second_update_info
                         second_input_buffers = _collect_input_buffers(
@@ -539,16 +528,18 @@ class GeneralReduction(GPUScheduleRule):
                             and _is_square_of_buffer_load(second_rhs_expr, second_input_buffers[0])
                         )
 
-                    bridge_meta: List[tuple[BlockInfo, str, List[tir.Buffer]]] = []
+                    bridge_meta: list[tuple[BlockInfo, str, list[tir.Buffer]]] = []
                     for info in bridge_infos:
                         bridge_stmt = sch.get(info.block_rv)
-                        bridge_meta.append((
-                            info,
-                            bridge_stmt.name_hint,
-                            [write_region.buffer for write_region in bridge_stmt.writes],
-                        ))
+                        bridge_meta.append(
+                            (
+                                info,
+                                bridge_stmt.name_hint,
+                                [write_region.buffer for write_region in bridge_stmt.writes],
+                            )
+                        )
 
-                    keep_bridge_names: List[str] = []
+                    keep_bridge_names: list[str] = []
                     if len(second_input_buffers) == 1:
                         second_src = second_input_buffers[0]
                         for _, name, write_buffers in bridge_meta:
@@ -711,16 +702,15 @@ class GeneralReduction(GPUScheduleRule):
             if (not info.is_reduction()) and (not info.is_injective()):
                 return None
 
-        for info in block_infos[reduction_index + 1:]:
+        for info in block_infos[reduction_index + 1 :]:
             if not info.is_injective():
                 return None
         prologue_names = [sch.get(info.block_rv).name_hint for info in block_infos[:reduction_index]]
-        epilogue_names = [sch.get(info.block_rv).name_hint for info in block_infos[reduction_index + 1:]]
+        epilogue_names = [sch.get(info.block_rv).name_hint for info in block_infos[reduction_index + 1 :]]
         reduction_info = block_infos[reduction_index]
         reduction_block = reduction_info.block_rv
         reduction_stmt = sch.get(reduction_block)
-        if (not reduction_info.is_reduction() or len(reduction_stmt.writes) != 1 or
-                len(reduction_stmt.reads) < 1):
+        if not reduction_info.is_reduction() or len(reduction_stmt.writes) != 1 or len(reduction_stmt.reads) < 1:
             return None
 
         update_info = _analyze_reduction_update(reduction_stmt)
@@ -736,7 +726,7 @@ class GeneralReduction(GPUScheduleRule):
         if len(input_buffers) == 0:
             return None
 
-        read_buffer_indices: List[int] = []
+        read_buffer_indices: list[int] = []
         for input_buffer in input_buffers:
             read_index = _find_buffer_index(reduction_stmt.reads, input_buffer)
             if read_index is None:
@@ -760,12 +750,8 @@ class GeneralReduction(GPUScheduleRule):
             return None
         reduction_dom_kind = reduction_info.dom_kind()
         num_leading_s = len(reduction_dom_kind) - len(reduction_dom_kind.lstrip("S"))
-        has_reduction_prologue = any(
-            info.is_reduction() for info in block_infos[:reduction_index]
-        )
-        use_output_epilogue_anchor = (
-            len(epilogue_names) > 0 and epilogue_names[-1] in output_block_names
-        )
+        has_reduction_prologue = any(info.is_reduction() for info in block_infos[:reduction_index])
+        use_output_epilogue_anchor = len(epilogue_names) > 0 and epilogue_names[-1] in output_block_names
 
         if use_output_epilogue_anchor:
             anchor_info = block_infos[-1]
@@ -778,10 +764,7 @@ class GeneralReduction(GPUScheduleRule):
 
             anchor_bx_loops = list(anchor_loops[:num_leading_s])
             anchor_inner_loops = list(anchor_loops[num_leading_s:])
-            anchor_s_fused = (
-                sch.fuse(*anchor_bx_loops)
-                if len(anchor_bx_loops) > 1 else anchor_bx_loops[0]
-            )
+            anchor_s_fused = sch.fuse(*anchor_bx_loops) if len(anchor_bx_loops) > 1 else anchor_bx_loops[0]
             anchor_tile = 1
             if has_reduction_prologue:
                 lead_extent = _as_const_int(sch.get(anchor_s_fused).extent)
@@ -798,10 +781,7 @@ class GeneralReduction(GPUScheduleRule):
             )
             if anchor_inner_loops:
                 sch.reorder(bx, anchor_inner, *anchor_inner_loops)
-                anchor_inner_fused = (
-                    sch.fuse(*anchor_inner_loops)
-                    if len(anchor_inner_loops) > 1 else anchor_inner_loops[0]
-                )
+                anchor_inner_fused = sch.fuse(*anchor_inner_loops) if len(anchor_inner_loops) > 1 else anchor_inner_loops[0]
                 sch.parallel(anchor_inner_fused)
             else:
                 sch.parallel(anchor_inner)
@@ -834,16 +814,16 @@ class GeneralReduction(GPUScheduleRule):
             if reduce_step is not None:
                 ro, ri = sch.split(r_fused, factors=[None, reduce_step], preserve_unit_iters=True)
                 cache_read_loop = ro
-                reduce_loop: Optional[tir.schedule.LoopRV] = ro
+                reduce_loop: tir.schedule.LoopRV | None = ro
                 thread_extent_expr = sch.get(ri).extent
             else:
                 cache_read_loop = bx
                 reduce_loop = None
                 thread_extent_expr = sch.get(r_fused).extent
         else:
-            s_loops: List[tir.schedule.LoopRV] = []
-            r_loops: List[tir.schedule.LoopRV] = []
-            o_loops: List[tir.schedule.LoopRV] = []
+            s_loops: list[tir.schedule.LoopRV] = []
+            r_loops: list[tir.schedule.LoopRV] = []
+            o_loops: list[tir.schedule.LoopRV] = []
             for iter_info in reduction_info.iters:
                 if iter_info.kind == "S":
                     s_loops.append(iter_info.loop_rv)
@@ -899,12 +879,9 @@ class GeneralReduction(GPUScheduleRule):
 
         # Lower to tile-level T.reduce only for single-source reductions.
         can_lower_main_reduce = (
-            len(read_buffer_indices) == 1 and
-            reduce_loop is not None and
-            (
-                _is_direct_buffer_load(rhs_expr, input_buffers[0]) or
-                single_source_square
-            )
+            len(read_buffer_indices) == 1
+            and reduce_loop is not None
+            and (_is_direct_buffer_load(rhs_expr, input_buffers[0]) or single_source_square)
         )
         if can_lower_main_reduce:
             read_buffer_index = read_buffer_indices[0]
@@ -1004,8 +981,7 @@ class GeneralReduction(GPUScheduleRule):
         num_last_block_iter = len(block_infos[-1].dom_kind())
         if num_last_block_iter < len(dom_kind):
             index_map = tir.IndexMap.from_func(
-                lambda *iters: ([tir.const(0, iters[0].dtype)] *
-                                (len(dom_kind) - num_last_block_iter) + list(iters)),
+                lambda *iters: ([tir.const(0, iters[0].dtype)] * (len(dom_kind) - num_last_block_iter) + list(iters)),
                 ndim=num_last_block_iter,
             )
             sch.transform_block_layout(block_infos[-1].block_rv, index_map)

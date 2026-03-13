@@ -19,7 +19,8 @@
 # Modifications Copyright (c) Microsoft.
 """A tile-primitive-first schedule rule for reductions."""
 
-from typing import List, Optional, Tuple, Union
+from __future__ import annotations
+
 
 from tvm import ir, tir
 from tvm.target import Target
@@ -30,13 +31,13 @@ from . import utils
 from .base import GPUScheduleRule
 
 
-def _as_const_int(expr: tir.PrimExpr) -> Optional[int]:
+def _as_const_int(expr: tir.PrimExpr) -> int | None:
     if isinstance(expr, tir.IntImm):
         return int(expr.value)
     return None
 
 
-def _as_const_float(expr: tir.PrimExpr) -> Optional[float]:
+def _as_const_float(expr: tir.PrimExpr) -> float | None:
     if isinstance(expr, tir.FloatImm):
         return float(expr.value)
     if isinstance(expr, tir.IntImm):
@@ -52,7 +53,7 @@ def _is_accumulator_term(store: tir.BufferStore, expr: tir.PrimExpr) -> bool:
     )
 
 
-def _analyze_reduction_update(block: tir.Block) -> Optional[Tuple[str, tir.PrimExpr]]:
+def _analyze_reduction_update(block: tir.Block) -> tuple[str, tir.PrimExpr] | None:
     """Infer reduction type and source expression from block update."""
     buffer_store = block.body
     if not isinstance(buffer_store, tir.BufferStore):
@@ -98,13 +99,16 @@ def _analyze_reduction_update(block: tir.Block) -> Optional[Tuple[str, tir.PrimE
     return None
 
 
-def _extract_single_input_buffer(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> Optional[tir.Buffer]:
-    buffers: List[tir.Buffer] = []
+def _extract_single_input_buffer(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> tir.Buffer | None:
+    buffers: list[tir.Buffer] = []
 
     def _collect(expr):
-        if isinstance(expr, tir.BufferLoad) and (not expr.buffer.same_as(write_buffer)):
-            if not any(expr.buffer.same_as(buf) for buf in buffers):
-                buffers.append(expr.buffer)
+        if (
+            isinstance(expr, tir.BufferLoad)
+            and (not expr.buffer.same_as(write_buffer))
+            and not any(expr.buffer.same_as(buf) for buf in buffers)
+        ):
+            buffers.append(expr.buffer)
 
     tir.stmt_functor.post_order_visit(rhs, _collect)
     if len(buffers) != 1:
@@ -117,7 +121,7 @@ def _is_direct_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> boo
     return isinstance(expr, tir.BufferLoad) and expr.buffer.same_as(target_buffer)
 
 
-def _find_buffer_index(regions, target_buffer: tir.Buffer) -> Optional[int]:
+def _find_buffer_index(regions, target_buffer: tir.Buffer) -> int | None:
     for idx, region in enumerate(regions):
         if region.buffer.same_as(target_buffer):
             return idx
@@ -190,7 +194,7 @@ def _choose_num_threads(target: Target, reduction_extent: tir.PrimExpr) -> int:
     return threads
 
 
-def _choose_reduction_step(target: Target, reduction_extent: tir.PrimExpr) -> Optional[int]:
+def _choose_reduction_step(target: Target, reduction_extent: tir.PrimExpr) -> int | None:
     """Choose reduction chunk size for very large K.
 
     Returns None when extent is dynamic, so the template falls back to
@@ -225,7 +229,7 @@ class Reduction(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -243,8 +247,7 @@ class Reduction(GPUScheduleRule):
         block = block_info.block_rv
         block_stmt = sch.get(block)
 
-        if (not block_info.is_reduction() or len(block_stmt.writes) != 1 or
-                len(block_stmt.reads) < 1):
+        if not block_info.is_reduction() or len(block_stmt.writes) != 1 or len(block_stmt.reads) < 1:
             return None
 
         update_info = _analyze_reduction_update(block_stmt)
@@ -265,8 +268,8 @@ class Reduction(GPUScheduleRule):
         init_value = _infer_init_value(block_stmt, reduce_type)
         block_name = block_stmt.name_hint
 
-        s_loops: List[tir.schedule.LoopRV] = []
-        r_loops: List[tir.schedule.LoopRV] = []
+        s_loops: list[tir.schedule.LoopRV] = []
+        r_loops: list[tir.schedule.LoopRV] = []
         for iter_info in block_info.iters:
             if iter_info.kind == "S":
                 s_loops.append(iter_info.loop_rv)

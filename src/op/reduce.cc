@@ -321,9 +321,8 @@ Stmt ReduceOpNode::Lower(const LowerArgs &T, arith::Analyzer *analyzer) const {
 
     auto require_init = this->clear;
     if (this->type->isSum() || this->type->isSumSq() ||
-        this->type->isAbsSum() ||
-        this->type->isBitAnd() || this->type->isBitOr() ||
-        this->type->isBitXor()) {
+        this->type->isAbsSum() || this->type->isBitAnd() ||
+        this->type->isBitOr() || this->type->isBitXor()) {
       require_init = true;
     }
 

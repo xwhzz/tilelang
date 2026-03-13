@@ -4,7 +4,8 @@
 # pylint: disable=invalid-name
 """LayerNorm-like reduction schedule using tile-level primitives."""
 
-from typing import List, Optional, Union
+from __future__ import annotations
+
 
 from tvm import tir
 from tvm.target import Target
@@ -25,13 +26,16 @@ from .reduction import (
 )
 
 
-def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> List[tir.Buffer]:
-    buffers: List[tir.Buffer] = []
+def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[tir.Buffer]:
+    buffers: list[tir.Buffer] = []
 
     def _collect(expr):
-        if isinstance(expr, tir.BufferLoad) and (not expr.buffer.same_as(write_buffer)):
-            if not any(expr.buffer.same_as(buf) for buf in buffers):
-                buffers.append(expr.buffer)
+        if (
+            isinstance(expr, tir.BufferLoad)
+            and (not expr.buffer.same_as(write_buffer))
+            and not any(expr.buffer.same_as(buf) for buf in buffers)
+        ):
+            buffers.append(expr.buffer)
 
     tir.stmt_functor.post_order_visit(rhs, _collect)
     return buffers
@@ -40,7 +44,7 @@ def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> List[
 def _is_same_buffer_load(
     lhs: tir.PrimExpr,
     rhs: tir.PrimExpr,
-    target_buffer: Optional[tir.Buffer] = None,
+    target_buffer: tir.Buffer | None = None,
 ) -> bool:
     if not isinstance(lhs, tir.BufferLoad) or not isinstance(rhs, tir.BufferLoad):
         return False
@@ -69,8 +73,8 @@ def _schedule_single_source_reduction(
     bx: tir.schedule.LoopRV,
     target: Target,
     write_back: bool = False,
-    force_reduce_type: Optional[str] = None,
-) -> Optional[tir.PrimExpr]:
+    force_reduce_type: str | None = None,
+) -> tir.PrimExpr | None:
     block = sch.get_block(block_name)
     block_stmt = sch.get(block)
     if len(block_stmt.writes) != 1:
@@ -176,7 +180,7 @@ class LayerNormLike(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -204,8 +208,8 @@ class LayerNormLike(GPUScheduleRule):
         first_reduction_idx, second_reduction_idx = reduction_indices
         first_reduction_info = block_infos[first_reduction_idx]
         second_reduction_info = block_infos[second_reduction_idx]
-        bridge_infos = block_infos[first_reduction_idx + 1:second_reduction_idx]
-        trailing_infos = block_infos[second_reduction_idx + 1:]
+        bridge_infos = block_infos[first_reduction_idx + 1 : second_reduction_idx]
+        trailing_infos = block_infos[second_reduction_idx + 1 :]
         if len(bridge_infos) == 0 or len(trailing_infos) == 0:
             return None
         if not all(info.is_injective() for info in bridge_infos):
@@ -213,10 +217,7 @@ class LayerNormLike(GPUScheduleRule):
         if not all(info.is_injective() for info in trailing_infos):
             return None
 
-        output_block_names = {
-            sch.get(output_block).name_hint
-            for output_block in get_output_blocks(sch, block_infos)
-        }
+        output_block_names = {sch.get(output_block).name_hint for output_block in get_output_blocks(sch, block_infos)}
         output_name = sch.get(trailing_infos[-1].block_rv).name_hint
         if output_name not in output_block_names:
             return None
@@ -243,7 +244,7 @@ class LayerNormLike(GPUScheduleRule):
         if not _is_square_of_buffer_load(second_rhs_expr, center_buffer):
             return None
 
-        center_name: Optional[str] = None
+        center_name: str | None = None
         for info in bridge_infos:
             block_stmt = sch.get(info.block_rv)
             if _block_writes_buffer(block_stmt, center_buffer):
@@ -266,9 +267,7 @@ class LayerNormLike(GPUScheduleRule):
         block_infos = normalize_prim_func(sch)
         if block_infos is None:
             return None
-        block_infos_by_name: dict[str, BlockInfo] = {
-            sch.get(info.block_rv).name_hint: info for info in block_infos
-        }
+        block_infos_by_name: dict[str, BlockInfo] = {sch.get(info.block_rv).name_hint: info for info in block_infos}
         if (
             first_reduction_name not in block_infos_by_name
             or second_reduction_name not in block_infos_by_name
@@ -289,10 +288,7 @@ class LayerNormLike(GPUScheduleRule):
 
         output_bx_loops = list(output_loops[:num_leading_s])
         output_inner_loops = list(output_loops[num_leading_s:])
-        output_s_fused = (
-            sch.fuse(*output_bx_loops)
-            if len(output_bx_loops) > 1 else output_bx_loops[0]
-        )
+        output_s_fused = sch.fuse(*output_bx_loops) if len(output_bx_loops) > 1 else output_bx_loops[0]
         bx, output_inner = sch.split(
             output_s_fused,
             factors=[None, 1],
@@ -300,10 +296,7 @@ class LayerNormLike(GPUScheduleRule):
         )
         if output_inner_loops:
             sch.reorder(bx, output_inner, *output_inner_loops)
-            output_parallel_loop = (
-                sch.fuse(*output_inner_loops)
-                if len(output_inner_loops) > 1 else output_inner_loops[0]
-            )
+            output_parallel_loop = sch.fuse(*output_inner_loops) if len(output_inner_loops) > 1 else output_inner_loops[0]
             sch.parallel(output_parallel_loop)
         else:
             sch.reorder(bx, output_inner)

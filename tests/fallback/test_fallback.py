@@ -11,7 +11,6 @@ Validates:
 from __future__ import annotations
 
 import argparse
-from typing import Tuple
 
 import tilelang
 import torch
@@ -29,7 +28,7 @@ def _lower_mod(mod):
     return mod
 
 
-def _dtype_tolerance(dtype: str) -> Tuple[float, float]:
+def _dtype_tolerance(dtype: str) -> tuple[float, float]:
     if dtype == "float16":
         return 1e-1, 1e-1
     return 1e-4, 1e-4

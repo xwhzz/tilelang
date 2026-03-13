@@ -61,15 +61,16 @@ using support::NDIntSet;
 // with `replacement_`, preserving other statements in the loop body.
 // ---------------------------------------------------------------------------
 class BlockRealizeReplacer : public StmtMutator {
- public:
-  BlockRealizeReplacer(const BlockNode* target, Stmt replacement)
-      : target_(target), replacement_(std::move(replacement)), replaced_(false) {}
+public:
+  BlockRealizeReplacer(const BlockNode *target, Stmt replacement)
+      : target_(target), replacement_(std::move(replacement)),
+        replaced_(false) {}
 
-  Stmt VisitStmt(const Stmt& stmt) final {
+  Stmt VisitStmt(const Stmt &stmt) final {
     return replaced_ ? stmt : StmtMutator::VisitStmt(stmt);
   }
 
-  Stmt VisitStmt_(const BlockRealizeNode* op) final {
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
     if (op->block.get() == target_) {
       replaced_ = true;
       return replacement_;
@@ -79,8 +80,8 @@ class BlockRealizeReplacer : public StmtMutator {
 
   bool replaced() const { return replaced_; }
 
- private:
-  const BlockNode* target_;
+private:
+  const BlockNode *target_;
   Stmt replacement_;
   bool replaced_;
 };
@@ -92,15 +93,16 @@ class BlockRealizeReplacer : public StmtMutator {
 // sibling statements in the outer loop body (e.g. cached T.copy).
 // ---------------------------------------------------------------------------
 class DirectBlockLoopReplacer : public StmtMutator {
- public:
-  DirectBlockLoopReplacer(const BlockNode* target, Stmt replacement)
-      : target_(target), replacement_(std::move(replacement)), replaced_(false) {}
+public:
+  DirectBlockLoopReplacer(const BlockNode *target, Stmt replacement)
+      : target_(target), replacement_(std::move(replacement)),
+        replaced_(false) {}
 
-  Stmt VisitStmt(const Stmt& stmt) final {
+  Stmt VisitStmt(const Stmt &stmt) final {
     return replaced_ ? stmt : StmtMutator::VisitStmt(stmt);
   }
 
-  Stmt VisitStmt_(const ForNode* op) final {
+  Stmt VisitStmt_(const ForNode *op) final {
     if (BodyDirectlyContainsTarget(op->body, target_)) {
       replaced_ = true;
       return replacement_;
@@ -110,23 +112,24 @@ class DirectBlockLoopReplacer : public StmtMutator {
 
   bool replaced() const { return replaced_; }
 
- private:
-  static bool BodyDirectlyContainsTarget(const Stmt& body,
-                                         const BlockNode* target) {
-    if (const auto* realize = body.as<BlockRealizeNode>()) {
+private:
+  static bool BodyDirectlyContainsTarget(const Stmt &body,
+                                         const BlockNode *target) {
+    if (const auto *realize = body.as<BlockRealizeNode>()) {
       return realize->block.get() == target;
     }
-    if (const auto* seq = body.as<SeqStmtNode>()) {
-      for (const Stmt& s : seq->seq) {
-        if (const auto* realize = s.as<BlockRealizeNode>()) {
-          if (realize->block.get() == target) return true;
+    if (const auto *seq = body.as<SeqStmtNode>()) {
+      for (const Stmt &s : seq->seq) {
+        if (const auto *realize = s.as<BlockRealizeNode>()) {
+          if (realize->block.get() == target)
+            return true;
         }
       }
     }
     return false;
   }
 
-  const BlockNode* target_;
+  const BlockNode *target_;
   Stmt replacement_;
   bool replaced_;
 };
@@ -134,34 +137,35 @@ class DirectBlockLoopReplacer : public StmtMutator {
 // ---------------------------------------------------------------------------
 // Helper: Compute the relaxed access region of a buffer within a loop.
 // ---------------------------------------------------------------------------
-static ffi::Array<Range> ComputeRelaxedRegion(
-    ScheduleState self, const StmtSRef& loop_sref,
-    const StmtSRef& block_sref, const Buffer& buf,
-    BufferIndexType buffer_type) {
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+static ffi::Array<Range> ComputeRelaxedRegion(ScheduleState self,
+                                              const StmtSRef &loop_sref,
+                                              const StmtSRef &block_sref,
+                                              const Buffer &buf,
+                                              BufferIndexType buffer_type) {
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
 
   BlockRealize realize = GetBlockRealize(self, block_sref);
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create("local");
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-      ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
-      loop_sref, scope));
+  ffi::Map<Var, arith::IntSet> var_dom =
+      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+          ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent), loop_sref,
+          scope));
 
-  const auto& regions = (buffer_type == BufferIndexType::kRead)
-                            ? block->reads : block->writes;
+  const auto &regions =
+      (buffer_type == BufferIndexType::kRead) ? block->reads : block->writes;
 
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion& buffer_region : regions) {
+  for (const BufferRegion &buffer_region : regions) {
     if (buffer_region->buffer.same_as(buf)) {
       ffi::Array<arith::IntSet> relaxed =
           arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
       relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
     }
   }
-  ICHECK(!relaxed_regions.empty())
-      << "ValueError: buffer " << buf->name
-      << " is not accessed in the specified block";
+  ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << buf->name
+                                   << " is not accessed in the specified block";
 
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
   int ndim = static_cast<int>(unified.size());
@@ -185,13 +189,12 @@ static ffi::Array<Range> ComputeRelaxedRegion(
 // body.  The source is a block's read buffer and the destination is the
 // block's write buffer.
 // ---------------------------------------------------------------------------
-static void ReduceAt(ScheduleState self, const StmtSRef& loop_sref,
-                     const StmtSRef& block_sref,
-                     int read_buffer_index, int write_buffer_index,
-                     const ffi::String& reduce_type, int dim, bool clear,
-                     bool replace_loop_body) {
+static void ReduceAt(ScheduleState self, const StmtSRef &loop_sref,
+                     const StmtSRef &block_sref, int read_buffer_index,
+                     int write_buffer_index, const ffi::String &reduce_type,
+                     int dim, bool clear, bool replace_loop_body) {
   // ---- Step 1: Obtain source and destination buffers -----------------------
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
 
   Buffer src = GetNthAccessBuffer(self, block_ref, read_buffer_index,
@@ -199,26 +202,22 @@ static void ReduceAt(ScheduleState self, const StmtSRef& loop_sref,
   Buffer dst = GetNthAccessBuffer(self, block_ref, write_buffer_index,
                                   BufferIndexType::kWrite);
 
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   // ---- Step 2: Compute the relaxed regions --------------------------------
-  ffi::Array<Range> src_region =
-      ComputeRelaxedRegion(self, loop_sref, block_sref, src,
-                           BufferIndexType::kRead);
-  ffi::Array<Range> dst_region =
-      ComputeRelaxedRegion(self, loop_sref, block_sref, dst,
-                           BufferIndexType::kWrite);
+  ffi::Array<Range> src_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, src, BufferIndexType::kRead);
+  ffi::Array<Range> dst_region = ComputeRelaxedRegion(
+      self, loop_sref, block_sref, dst, BufferIndexType::kWrite);
 
   // ---- Step 3: Build the T.reduce call ------------------------------------
   PrimExpr src_region_arg = MakeRegionCall(src, src_region, /*access_mask=*/1);
   PrimExpr dst_region_arg = MakeRegionCall(dst, dst_region, /*access_mask=*/2);
 
-  Stmt reduce_stmt = Evaluate(
-      Call(DataType::Handle(), Op::Get("tl.tileop.reduce"),
-           {src_region_arg, dst_region_arg,
-            StringImm(reduce_type),
-            IntImm(DataType::Int(32), dim),
-            Bool(clear)}));
+  Stmt reduce_stmt =
+      Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.reduce"),
+                    {src_region_arg, dst_region_arg, StringImm(reduce_type),
+                     IntImm(DataType::Int(32), dim), Bool(clear)}));
 
   // ---- Step 4: Update loop body -------------------------------------------
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
@@ -233,20 +232,21 @@ static void ReduceAt(ScheduleState self, const StmtSRef& loop_sref,
       BlockRealizeReplacer block_replacer(block, reduce_stmt);
       replaced_body = block_replacer(loop->body);
       // Final fallback: replace the whole loop body.
-      new_loop_node->body = block_replacer.replaced() ? replaced_body
-                                                      : reduce_stmt;
+      new_loop_node->body =
+          block_replacer.replaced() ? replaced_body : reduce_stmt;
     }
   } else {
     ffi::Array<Stmt> subtrees = AsArray(loop->body);
     subtrees.push_back(reduce_stmt);
-    new_loop_node->body = subtrees.size() == 1 ? subtrees[0] : SeqStmt(subtrees);
+    new_loop_node->body =
+        subtrees.size() == 1 ? subtrees[0] : SeqStmt(subtrees);
   }
   For new_loop(new_loop_node);
 
   // ---- Step 5: Replace in the scope root block ----------------------------
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   ffi::Map<Block, Block> block_sref_reuse;
   Block new_scope_block = Downcast<Block>(
@@ -263,16 +263,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def(
       "tl.schedule.ScheduleReduceAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int read_buffer_index, int write_buffer_index,
-         const ffi::String& reduce_type, int dim, bool clear,
+         const ffi::String &reduce_type, int dim, bool clear,
          bool replace_loop_body) {
-        ReduceAt(self->state(), self->GetSRef(loop_rv),
-                 self->GetSRef(block_rv), read_buffer_index,
-                 write_buffer_index, reduce_type, dim, clear,
+        ReduceAt(self->state(), self->GetSRef(loop_rv), self->GetSRef(block_rv),
+                 read_buffer_index, write_buffer_index, reduce_type, dim, clear,
                  replace_loop_body);
       });
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
