@@ -182,6 +182,19 @@ public:
 private:
   bool ShouldRewriteAccess() const { return !block_only_ || in_target_scope_; }
 
+  bool ValueUsesDstBuffer(const PrimExpr &expr) const {
+    bool found = false;
+    PostOrderVisit(expr, [this, &found](const ObjectRef &obj) {
+      if (found) {
+        return;
+      }
+      if (const auto *load = obj.as<BufferLoadNode>()) {
+        found = load->buffer.same_as(dst_);
+      }
+    });
+    return found;
+  }
+
   // Build squeezed indices: for each kept dim, compute (original_idx - min).
   ffi::Array<PrimExpr> SqueezedIndices(const ffi::Array<PrimExpr> &indices) {
     ffi::Array<PrimExpr> new_indices;
@@ -211,6 +224,10 @@ private:
           ffi::make_object<BufferStoreNode>(*store.get());
       n->buffer = dst_;
       n->indices = SqueezedIndices(n->indices);
+      if (!ValueUsesDstBuffer(n->value) && n->value.dtype() != dst_->dtype) {
+        arith::Analyzer analyzer;
+        n->value = analyzer.Simplify(Cast(dst_->dtype, n->value));
+      }
       return BufferStore(n);
     }
     return store;
@@ -412,7 +429,8 @@ static PrimExpr GetMatrixStride(const Buffer &buf) {
 static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
                         const StmtSRef &block_sref, int read_buffer_index,
                         const ffi::String &storage_scope,
-                        const ffi::String &transform) {
+                        const ffi::String &transform,
+                        const ffi::String &cache_dtype) {
   // ---- Step 1: Obtain source buffer and loop --------------------------------
   const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -498,6 +516,9 @@ static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
   {
     auto *w = dst.CopyOnWrite();
     w->shape = squeezed_shape;
+    if (!cache_dtype.empty()) {
+      w->dtype = DataType(ffi::StringToDLDataType(cache_dtype));
+    }
     // Produce a readable name: e.g. a_shared_dyn  or  a_local_fragment
     std::string scope_suffix = storage_scope;
     // Replace '.' with '_' for valid identifier
@@ -593,7 +614,8 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
                          const StmtSRef &block_sref, int write_buffer_index,
                          const ffi::String &storage_scope, bool write_back,
                          const ffi::String &reduce_type,
-                         const ffi::String &reducer_replication) {
+                         const ffi::String &reducer_replication,
+                         const ffi::String &cache_dtype) {
   // ---- Step 1: Obtain destination buffer and loop ---------------------------
   const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -677,6 +699,9 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
   {
     auto *w = dst.CopyOnWrite();
     w->shape = squeezed_shape;
+    if (!cache_dtype.empty()) {
+      w->dtype = DataType(ffi::StringToDLDataType(cache_dtype));
+    }
     std::string scope_suffix = storage_scope;
     for (auto &c : scope_suffix) {
       if (c == '.')
@@ -719,7 +744,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
         MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
     fill_stmt =
         Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
-                      {reducer_region_arg, make_const(src->dtype, 0.0)}));
+                      {reducer_region_arg, make_const(dst->dtype, 0.0)}));
     finalize_stmt =
         Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.finalize_reducer"),
                       {reducer_region_arg}));
@@ -959,10 +984,10 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.schedule.ScheduleCacheReadAt",
       [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int read_buffer_index, const ffi::String &storage_scope,
-         const ffi::String &transform) {
+         const ffi::String &transform, const ffi::String &cache_dtype) {
         CacheReadAt(self->state(), self->GetSRef(loop_rv),
                     self->GetSRef(block_rv), read_buffer_index, storage_scope,
-                    transform);
+                    transform, cache_dtype);
       });
 
   refl::GlobalDef().def(
@@ -970,10 +995,12 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int write_buffer_index, const ffi::String &storage_scope,
          bool write_back, const ffi::String &reduce_type,
-         const ffi::String &reducer_replication) {
+         const ffi::String &reducer_replication,
+         const ffi::String &cache_dtype) {
         CacheWriteAt(self->state(), self->GetSRef(loop_rv),
                      self->GetSRef(block_rv), write_buffer_index, storage_scope,
-                     write_back, reduce_type, reducer_replication);
+                     write_back, reduce_type, reducer_replication,
+                     cache_dtype);
       });
 
   refl::GlobalDef().def(

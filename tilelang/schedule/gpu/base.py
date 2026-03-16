@@ -20,9 +20,10 @@
 # The code below is mostly copied from apache/tvm base.py in dlight.
 """Base schedule rule for GPU operators."""
 
-from tvm.target import Target
+from tilelang import tvm
 
-from tvm.dlight import ScheduleRule
+Target = tvm.target.Target
+ScheduleRule = tvm.dlight.ScheduleRule
 
 
 class GPUScheduleRule(ScheduleRule):  # pylint: disable=too-few-public-methods

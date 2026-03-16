@@ -22,18 +22,18 @@
 
 from __future__ import annotations
 
+from tilelang import tvm
 
-from tvm import arith, tir
-from tvm.target import Target
-from tvm.tir import Schedule
-from tvm.tir.schedule import BlockRV
-
-from tvm.dlight.analysis import detect_dominant_read
-from tvm.dlight import (
-    normalize_prim_func,
-    try_inline_contiguous_spatial,
-)
 from .base import GPUScheduleRule
+
+arith = tvm.arith
+tir = tvm.tir
+Target = tvm.target.Target
+Schedule = tvm.tir.Schedule
+BlockRV = tvm.tir.schedule.BlockRV
+detect_dominant_read = tvm.dlight.analysis.detect_dominant_read
+normalize_prim_func = tvm.dlight.normalize_prim_func
+try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
 
 
 class Transpose(GPUScheduleRule):

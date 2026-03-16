@@ -129,13 +129,17 @@ void CodeGenCHost::AddFunction(const tvm::GlobalVar &gvar,
                                bool emit_fwd_func_decl) {
   auto global_symbol =
       func->GetAttr<tvm::ffi::String>(tvm::attr::kGlobalSymbol);
+  bool is_tvm_ffi_main =
+      global_symbol.has_value() &&
+      global_symbol.value() == tvm::ffi::symbol::tvm_ffi_main;
   if (global_symbol) {
     function_names_.push_back(global_symbol.value());
   }
 
   emit_fwd_func_decl_ = emit_fwd_func_decl;
   tvm::codegen::CodeGenC::AddFunction(gvar, func);
-  if (func->HasNonzeroAttr(tvm::tir::attr::kIsEntryFunc) && !has_main_func_) {
+  if (func->HasNonzeroAttr(tvm::tir::attr::kIsEntryFunc) && !has_main_func_ &&
+      !is_tvm_ffi_main) {
     ICHECK(global_symbol.has_value())
         << "CodeGenCHost: The entry func must have the global_symbol "
            "attribute, "

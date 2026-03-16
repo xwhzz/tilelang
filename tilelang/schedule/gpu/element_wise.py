@@ -23,13 +23,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from tvm import tir
-from tvm.target import Target
+from tilelang import tvm
 
 from .. import Schedule as TileSchedule
-from tvm.dlight import normalize_prim_func, try_inline
 from . import utils
 from .base import GPUScheduleRule
+
+tir = tvm.tir
+Target = tvm.target.Target
+normalize_prim_func = tvm.dlight.normalize_prim_func
+try_inline = tvm.dlight.try_inline
 
 
 def _as_const_int(expr: tir.PrimExpr) -> int | None:

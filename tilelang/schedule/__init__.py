@@ -1,6 +1,10 @@
+from tilelang import tvm
+
 from . import _ffi_api
-from tvm.tir import Schedule as TVMSchedule
-from tvm.tir.schedule import LoopRV, BlockRV
+
+TVMSchedule = tvm.tir.Schedule
+LoopRV = tvm.tir.schedule.LoopRV
+BlockRV = tvm.tir.schedule.BlockRV
 
 
 class Schedule(TVMSchedule):
@@ -58,7 +62,15 @@ class Schedule(TVMSchedule):
             write_buffer_index,
         )
 
-    def cache_read_at(self, loop: LoopRV, block: BlockRV, read_buffer_index: int, storage_scope: str, transform: str = "") -> None:
+    def cache_read_at(
+        self,
+        loop: LoopRV,
+        block: BlockRV,
+        read_buffer_index: int,
+        storage_scope: str,
+        transform: str = "",
+        cache_dtype: str = "",
+    ) -> None:
         """Insert a cached copy of a read buffer at the specified loop level.
 
         This creates a compact cache buffer inside the loop, inserts a T.copy
@@ -81,8 +93,19 @@ class Schedule(TVMSchedule):
             copy. Supported values:
             - "" (default): no transform
             - "square": dst = dst * dst
+        cache_dtype : str
+            Optional dtype for the cache buffer. Leave empty to preserve the
+            original read-buffer dtype.
         """
-        _ffi_api.ScheduleCacheReadAt(self, loop, block, read_buffer_index, storage_scope, transform)
+        _ffi_api.ScheduleCacheReadAt(
+            self,
+            loop,
+            block,
+            read_buffer_index,
+            storage_scope,
+            transform,
+            cache_dtype,
+        )
 
     def cache_write_at(
         self,
@@ -93,6 +116,7 @@ class Schedule(TVMSchedule):
         write_back: bool = True,
         reduce_type: str = "",
         reducer_replication: str = "none",
+        cache_dtype: str = "",
     ) -> None:
         """Insert a cached copy of a write buffer at the specified loop level.
 
@@ -121,8 +145,21 @@ class Schedule(TVMSchedule):
             as a TileLang reducer and finalized before write-back.
         reducer_replication : str
             Reducer replication strategy, either "none" (default) or "all".
+        cache_dtype : str
+            Optional dtype for the cache buffer. Leave empty to preserve the
+            original write-buffer dtype.
         """
-        _ffi_api.ScheduleCacheWriteAt(self, loop, block, write_buffer_index, storage_scope, write_back, reduce_type, reducer_replication)
+        _ffi_api.ScheduleCacheWriteAt(
+            self,
+            loop,
+            block,
+            write_buffer_index,
+            storage_scope,
+            write_back,
+            reduce_type,
+            reducer_replication,
+            cache_dtype,
+        )
 
     def fill_at(self, loop: LoopRV, block: BlockRV, write_buffer_index: int, value: float = 0.0) -> None:
         """Insert a T.fill to initialize a buffer at the specified loop level.
@@ -192,7 +229,14 @@ class Schedule(TVMSchedule):
         _ffi_api.ScheduleReduceAt(self, loop, block, read_buffer_index, write_buffer_index, reduce_type, dim, clear, replace_loop_body)
 
     def cache_reduce_at(
-        self, loop: LoopRV, block: BlockRV, write_buffer_index: int, storage_scope: str, init_value: float = 0.0, write_back: bool = True
+        self,
+        loop: LoopRV,
+        block: BlockRV,
+        write_buffer_index: int,
+        storage_scope: str,
+        init_value: float = 0.0,
+        write_back: bool = True,
+        cache_dtype: str = "",
     ) -> None:
         """Cache a write buffer for reduction with initialization.
 
@@ -228,5 +272,17 @@ class Schedule(TVMSchedule):
             Whether to emit a final T.copy from cache back to the original
             buffer (default: True). Set to False for purely intermediate
             tensors whose consumers are all rewritten to read the cache.
+        cache_dtype : str
+            Optional dtype for the cache buffer. Leave empty to preserve the
+            original write-buffer dtype.
         """
-        _ffi_api.ScheduleCacheReduceAt(self, loop, block, write_buffer_index, storage_scope, init_value, write_back)
+        _ffi_api.ScheduleCacheReduceAt(
+            self,
+            loop,
+            block,
+            write_buffer_index,
+            storage_scope,
+            init_value,
+            write_back,
+            cache_dtype,
+        )

@@ -175,3 +175,9 @@ if __name__ == "__main__":
             args.executor,
             args.dump_vm_code,
         )
+
+
+"""
+Usage:
+python tests/end2end/example_mlp.py --dim 4096 --dtype float16 --accum-dtype float32 --executor jit --arch sm_90a --bench-backend event
+"""

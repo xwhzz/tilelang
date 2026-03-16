@@ -22,13 +22,17 @@
 from __future__ import annotations
 
 
-from tvm import ir, tir
-from tvm.target import Target
+from tilelang import tvm
 
 from .. import Schedule as TileSchedule
-from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
 from . import utils
 from .base import GPUScheduleRule
+
+ir = tvm.ir
+tir = tvm.tir
+Target = tvm.target.Target
+normalize_prim_func = tvm.dlight.normalize_prim_func
+try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
 
 
 def _as_const_int(expr: tir.PrimExpr) -> int | None:
@@ -296,7 +300,7 @@ class Reduction(GPUScheduleRule):
         else:
             sch.reorder(bx, inner_s, r_fused)
             cache_read_loop = bx
-            reduce_loop = inner_s
+            reduce_loop = r_fused
             thread_extent_expr = sch.get(r_fused).extent
 
         # Stage input tile per reduction chunk.

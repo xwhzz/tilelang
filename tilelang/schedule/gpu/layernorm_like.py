@@ -6,12 +6,7 @@
 
 from __future__ import annotations
 
-
-from tvm import tir
-from tvm.target import Target
-
-from tvm.dlight import normalize_prim_func
-from tvm.dlight.analysis import BlockInfo
+from tilelang import tvm
 
 from .. import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
@@ -24,6 +19,11 @@ from .reduction import (
     _infer_init_value,
     _infer_reduce_dim,
 )
+
+tir = tvm.tir
+Target = tvm.target.Target
+normalize_prim_func = tvm.dlight.normalize_prim_func
+BlockInfo = tvm.dlight.analysis.BlockInfo
 
 
 def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[tir.Buffer]:

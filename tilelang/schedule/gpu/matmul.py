@@ -8,7 +8,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from tilelang import tvm
-from tvm.target import Target
 
 from tilelang.carver.analysis import get_reduction_blocks, get_root_block
 from tilelang.carver.matmul_analysis import auto_inline_producers, normalize_to_matmul
@@ -19,6 +18,7 @@ from .base import GPUScheduleRule
 from .element_wise import _resolve_target_from_config
 
 tir = tvm.tir
+Target = tvm.target.Target
 
 
 @dataclass(frozen=True)
@@ -52,7 +52,11 @@ def _choose_static_tile(candidates: list[int], extent: int | None) -> int:
     return candidates[-1]
 
 
-def _choose_tile_config(target: Target, block_stmt: tir.Block) -> _MatmulTileConfig:
+def _choose_tile_config(
+    target: Target,
+    block_stmt: tir.Block,
+    has_epilogue: bool,
+) -> _MatmulTileConfig:
     input_bits = max(tvm.DataType(region.buffer.dtype).bits for region in block_stmt.reads)
     max_threads = min(int(utils.max_threads_per_block(target)), 256)
     num_threads = max(1, _largest_power_of_two_at_most(max_threads))
@@ -60,11 +64,30 @@ def _choose_tile_config(target: Target, block_stmt: tir.Block) -> _MatmulTileCon
     m_extent = iter_extents[1] if len(iter_extents) >= 4 else None
     n_extent = iter_extents[2] if len(iter_extents) >= 4 else None
     k_extent = iter_extents[3] if len(iter_extents) >= 4 else None
+    sm_version = utils.get_sm_version(target)
+
+    if input_bits <= 16 and target.kind.name == "cuda" and sm_version >= 90:
+        if has_epilogue:
+            return _MatmulTileConfig(
+                block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
+                block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
+                block_k=_choose_static_tile([32, 16], k_extent),
+                num_stages=2,
+                num_threads=min(num_threads, 128),
+            )
+        return _MatmulTileConfig(
+            block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
+            block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
+            block_k=_choose_static_tile([32, 16], k_extent),
+            num_stages=2,
+            num_threads=min(num_threads, 128),
+        )
+
     if input_bits <= 16:
         num_stages = 2 if target.kind.name in {"cuda", "hip", "rocm"} else 0
         return _MatmulTileConfig(
-            block_m=_choose_static_tile([64, 32, 16], m_extent),
-            block_n=_choose_static_tile([64, 32, 16], n_extent),
+            block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
+            block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
             block_k=_choose_static_tile([32, 16], k_extent),
             num_stages=num_stages,
             num_threads=num_threads,
@@ -151,6 +174,26 @@ def _can_use_tile_gemm(
     return output_dtype in {"float16", "float32", "int32"}
 
 
+def _choose_accumulator_dtype(
+    original_block_stmt: tir.Block,
+    use_tile_gemm: bool,
+) -> str | None:
+    if not use_tile_gemm or len(original_block_stmt.writes) != 1:
+        return None
+
+    read_dtypes = {region.buffer.dtype for region in original_block_stmt.reads}
+    output_dtype = original_block_stmt.writes[0].buffer.dtype
+    if read_dtypes.issubset({"float16", "bfloat16"}) and output_dtype in {"float16", "bfloat16"}:
+        return "float32"
+    return None
+
+
+def _choose_epilogue_shared_scope(target: Target, use_tile_gemm: bool) -> str:
+    if use_tile_gemm and target.kind.name == "cuda" and utils.get_sm_version(target) >= 90:
+        return "shared.dyn"
+    return "shared"
+
+
 def _analyze_original_chain(sch: TileSchedule) -> tuple[str, list[str]] | None:
     root = get_root_block(sch)
     blocks = list(sch.get_child_blocks(root))
@@ -210,6 +253,7 @@ class Matmul(GPUScheduleRule):
             original_block_stmt = sch.get(main_block)
             transpose_a, transpose_b = _infer_transpose_flags(original_block_stmt)
             use_tile_gemm = _can_use_tile_gemm(target, original_block_stmt)
+            accum_dtype = _choose_accumulator_dtype(original_block_stmt, use_tile_gemm)
             sch = normalize_to_matmul(sch, main_block, layout=["a", "a", "n"])
             if sch is None:
                 return None
@@ -222,7 +266,8 @@ class Matmul(GPUScheduleRule):
             if len(loops) != 4:
                 return None
 
-            config = _choose_tile_config(target, block_stmt)
+            config = _choose_tile_config(target, block_stmt, has_epilogue=bool(epilogue_names))
+            epilogue_shared_scope = _choose_epilogue_shared_scope(target, use_tile_gemm)
 
             if epilogue_names:
                 for name in epilogue_names[:-1]:
@@ -279,6 +324,7 @@ class Matmul(GPUScheduleRule):
                 0,
                 "local.fragment",
                 write_back=False,
+                cache_dtype=accum_dtype or "",
             )
 
             main_block = sch.get_block(main_name)
@@ -308,7 +354,7 @@ class Matmul(GPUScheduleRule):
                         n_outer,
                         bridge_block,
                         0,
-                        "shared",
+                        epilogue_shared_scope,
                         write_back=False,
                     )
                     bridge_block = sch.get_block(materialize_block_name)
