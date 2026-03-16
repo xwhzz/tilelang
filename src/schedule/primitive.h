@@ -29,7 +29,7 @@ namespace tl {
 
 TVM_DLL void LaunchThread(ScheduleState self, int num_threads);
 
-}  // namespace tir
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm
 
-#endif  // TVM_TIR_SCHEDULE_PRIMITIVE_H_
+#endif // TVM_TIR_SCHEDULE_PRIMITIVE_H_

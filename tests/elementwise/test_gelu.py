@@ -9,11 +9,6 @@ This mirrors the reduction/transpose prototype scripts and validates:
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-import types
-from pathlib import Path
-from typing import Tuple
 
 import tilelang
 import torch
@@ -22,13 +17,23 @@ from tilelang.profiler import do_bench
 from tvm import te
 from tilelang.schedule.gpu.element_wise import ElementWise
 
+
 def _build_mod(m: int, n: int, k: int, arch: str):
     """Build and lower a scheduled element-wise module."""
-    a = te.placeholder((m, n,), name="a")
+    a = te.placeholder(
+        (
+            m,
+            n,
+        ),
+        name="a",
+    )
 
     ## implement gelu activation
     c = te.compute(
-        (m, n, ),
+        (
+            m,
+            n,
+        ),
         lambda i, j: a[i, j] * 0.5 * (1.0 + te.tanh(0.7978845608028654 * (a[i, j] + 0.044715 * a[i, j] * a[i, j] * a[i, j]))),
         name="c",
     )
@@ -62,7 +67,7 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     return mod
 
 
-def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tuple[float, float]:
+def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> tuple[float, float]:
     """Build an element-wise kernel, run correctness check, and benchmark."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -78,7 +83,7 @@ def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tupl
 
     @torch.compile()
     def fn_torch(a):
-        return torch.nn.functional.gelu(a, approximate='tanh')
+        return torch.nn.functional.gelu(a, approximate="tanh")
 
     torch.testing.assert_close(c_torch, fn_torch(a_torch), rtol=1e-4, atol=1e-4)
     print("\033[92mCorrectness check passed.\033[0m")

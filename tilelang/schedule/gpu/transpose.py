@@ -19,7 +19,9 @@
 # Modifications Copyright (c) Microsoft.
 # The code below is mostly copied from apache/tvm transpose.py in dlight.
 """Reduction rule for operators including softmax, layer norm, RMS norm, etc"""
-from typing import List, Union
+
+from __future__ import annotations
+
 
 from tvm import arith, tir
 from tvm.target import Target
@@ -53,7 +55,7 @@ class Transpose(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         # pylint: disable=invalid-name
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
@@ -82,7 +84,7 @@ class Transpose(GPUScheduleRule):
 
         prologue = None  # the optional decoding block
         if transpose_block_idx > 0:
-            spatials = try_inline_contiguous_spatial(sch, blocks[:transpose_block_idx - 1])
+            spatials = try_inline_contiguous_spatial(sch, blocks[: transpose_block_idx - 1])
             assert len(spatials) == 0
             prologue = blocks[transpose_block_idx - 1].block_rv
 

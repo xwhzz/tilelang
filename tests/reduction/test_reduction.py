@@ -13,11 +13,6 @@ It validates:
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-import types
-from pathlib import Path
-from typing import Tuple
 
 import tilelang
 import torch
@@ -28,13 +23,19 @@ from tvm import te
 from tilelang.schedule.gpu.reduction import Reduction  # pylint: disable=import-outside-toplevel
 
 
-
 def _build_mod(m: int, n: int, k: int, arch: str):
     """Build and lower a scheduled reduction module."""
     # Define TE reduction: c[i] = sum_j a[i, j]
     a = te.placeholder((m, n, k), name="a")
     rk = te.reduce_axis((0, k), name="rk")
-    c = te.compute((m, n, ), lambda i, j: te.max(a[i, j, rk], axis=rk), name="c")
+    c = te.compute(
+        (
+            m,
+            n,
+        ),
+        lambda i, j: te.max(a[i, j, rk], axis=rk),
+        name="c",
+    )
 
     func = te.create_prim_func([a, c])
 
@@ -67,7 +68,7 @@ def _build_mod(m: int, n: int, k: int, arch: str):
     return mod
 
 
-def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tuple[float, float]:
+def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> tuple[float, float]:
     """Build a reduction kernel, run correctness check, and benchmark."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -80,7 +81,7 @@ def build_and_run(m: int, n: int, k: int, arch: str, bench_backend: str) -> Tupl
     # b_torch = torch.randn((m, n, k), device="cuda", dtype=torch.float32)
     c_torch = torch.empty((m, n), device="cuda", dtype=torch.float32)
     kernel(a_torch, c_torch)
-    
+
     @torch.compile()
     def fntorch(a):
         return torch.max(a, dim=2)[0]

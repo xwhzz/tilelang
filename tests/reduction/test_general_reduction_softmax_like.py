@@ -9,10 +9,6 @@ Graph:
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-import types
-from pathlib import Path
 
 import tilelang
 import torch
@@ -62,8 +58,7 @@ def _build_mod(m: int, k: int, arch: str):
     has_tvm_style = "threadIdx" in lowered_ir or "shared" in lowered_ir
     if not has_tilelang and not has_tvm_style:
         raise RuntimeError(
-            "Expected either tilelang tile-level patterns or TVM-style "
-            "thread-cooperative patterns in the lowered IR, but found neither."
+            "Expected either tilelang tile-level patterns or TVM-style thread-cooperative patterns in the lowered IR, but found neither."
         )
 
     return mod
@@ -95,6 +90,7 @@ def build_and_run(m: int, k: int, arch: str):
 
     # Performance
     from tilelang.profiler import do_bench
+
     tilelang_time = do_bench(lambda: kernel(a_torch, out_torch))
     torch_time = do_bench(lambda: fn_torch(a_torch))
     print(f"TileLang time: {tilelang_time:.2f} ms")

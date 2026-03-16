@@ -54,39 +54,40 @@ using support::NDIntSet;
 // ---------------------------------------------------------------------------
 // FillAt: main entry point
 // ---------------------------------------------------------------------------
-static void FillAt(ScheduleState self, const StmtSRef& loop_sref,
-                   const StmtSRef& block_sref, int write_buffer_index,
+static void FillAt(ScheduleState self, const StmtSRef &loop_sref,
+                   const StmtSRef &block_sref, int write_buffer_index,
                    double value) {
   // ---- Step 1: Obtain the write buffer and loop ----------------------------
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
   Buffer buf = GetNthAccessBuffer(self, block_ref, write_buffer_index,
                                   BufferIndexType::kWrite);
 
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   // ---- Step 2: Gather inner-loop domains and block bindings ----------------
   BlockRealize realize = GetBlockRealize(self, block_sref);
   ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
 
   runtime::StorageScope scope = runtime::StorageScope::Create("local");
-  ffi::Map<Var, arith::IntSet> var_dom = arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-      /*low_inclusive=*/ffi::GetRef<StmtSRef>(self->stmt2ref.at(block)->parent),
-      /*high_exclusive=*/loop_sref,
-      /*extra_relax_scope=*/scope));
+  ffi::Map<Var, arith::IntSet> var_dom =
+      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+          /*low_inclusive=*/ffi::GetRef<StmtSRef>(
+              self->stmt2ref.at(block)->parent),
+          /*high_exclusive=*/loop_sref,
+          /*extra_relax_scope=*/scope));
 
   // ---- Step 3: Relax the buffer write region over the inner loops ----------
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion& buffer_region : block->writes) {
+  for (const BufferRegion &buffer_region : block->writes) {
     if (buffer_region->buffer.same_as(buf)) {
       ffi::Array<arith::IntSet> relaxed =
           arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
       relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
     }
   }
-  ICHECK(!relaxed_regions.empty())
-      << "ValueError: buffer " << buf->name
-      << " is not written in the specified block";
+  ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << buf->name
+                                   << " is not written in the specified block";
 
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
   int ndim = static_cast<int>(unified.size());
@@ -105,9 +106,8 @@ static void FillAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 4: Build the T.fill call ---------------------------------------
   PrimExpr region_arg = MakeRegionCall(buf, fill_region, /*access_mask=*/2);
   PrimExpr fill_value = make_const(buf->dtype, value);
-  Stmt fill_stmt = Evaluate(
-      Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
-           {region_arg, fill_value}));
+  Stmt fill_stmt = Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
+                                 {region_arg, fill_value}));
 
   // ---- Step 5: Insert the fill at the beginning of the loop body -----------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
@@ -120,7 +120,7 @@ static void FillAt(ScheduleState self, const StmtSRef& loop_sref,
   // ---- Step 6: Replace in the scope root block -----------------------------
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   ffi::Map<Block, Block> block_sref_reuse;
   Block new_scope_block = Downcast<Block>(
@@ -137,12 +137,12 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def(
       "tl.schedule.ScheduleFillAt",
-      [](Schedule self, const LoopRV& loop_rv, const BlockRV& block_rv,
+      [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int write_buffer_index, double value) {
-        FillAt(self->state(), self->GetSRef(loop_rv),
-               self->GetSRef(block_rv), write_buffer_index, value);
+        FillAt(self->state(), self->GetSRef(loop_rv), self->GetSRef(block_rv),
+               write_buffer_index, value);
       });
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

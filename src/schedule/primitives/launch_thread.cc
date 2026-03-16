@@ -34,16 +34,16 @@ using namespace tir;
 // Uses the sref-tree–aware Replace() method so that the schedule state
 // (stmt2ref, block_info, …) stays consistent for subsequent primitives.
 // ---------------------------------------------------------------------------
-static void LaunchThread(ScheduleState self, const StmtSRef& block_sref,
+static void LaunchThread(ScheduleState self, const StmtSRef &block_sref,
                          int num_threads) {
-  const BlockNode* block = TVM_SREF_TO_BLOCK(block_sref);
+  const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
 
   // Build the thread-bound loop wrapping the block body.
   Var tx("tx");
-  IterVar thread_iter(Range(nullptr), Var("threadIdx.x"),
-                      kThreadIndex, "threadIdx.x");
-  Stmt new_body = For(tx, 0, num_threads, ForKind::kThreadBinding,
-                      block->body, thread_iter, {}, std::nullopt);
+  IterVar thread_iter(Range(nullptr), Var("threadIdx.x"), kThreadIndex,
+                      "threadIdx.x");
+  Stmt new_body = For(tx, 0, num_threads, ForKind::kThreadBinding, block->body,
+                      thread_iter, {}, std::nullopt);
 
   // Copy the block, replace its body with the new loop.
   ObjectPtr<BlockNode> new_block_node = ffi::make_object<BlockNode>(*block);
@@ -56,8 +56,8 @@ static void LaunchThread(ScheduleState self, const StmtSRef& block_sref,
   self->Replace(block_sref, new_block, block_sref_reuse);
 }
 
-static void ParallelizeLoop(ScheduleState self, const StmtSRef& loop_sref) {
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+static void ParallelizeLoop(ScheduleState self, const StmtSRef &loop_sref) {
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
   new_loop_node->kind = ForKind::kParallel;
@@ -66,7 +66,7 @@ static void ParallelizeLoop(ScheduleState self, const StmtSRef& loop_sref) {
 
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   ffi::Map<Block, Block> block_sref_reuse;
   Block new_scope_block = Downcast<Block>(
@@ -76,18 +76,18 @@ static void ParallelizeLoop(ScheduleState self, const StmtSRef& loop_sref) {
   self->Replace(scope_root_sref, new_scope_block, block_sref_reuse);
 }
 
-static void PipelineLoop(ScheduleState self, const StmtSRef& loop_sref,
+static void PipelineLoop(ScheduleState self, const StmtSRef &loop_sref,
                          int num_stages) {
-  const ForNode* loop = TVM_SREF_TO_FOR(loop_sref);
+  const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
   ObjectPtr<ForNode> new_loop_node = ffi::make_object<ForNode>(*loop);
-  new_loop_node->annotations.Set(
-      "num_stages", IntImm(DataType::Int(32), num_stages));
+  new_loop_node->annotations.Set("num_stages",
+                                 IntImm(DataType::Int(32), num_stages));
   For new_loop(new_loop_node);
 
   StmtSRef scope_root_sref =
       GetScopeRoot(self, loop_sref, /*require_stage_pipeline=*/false);
-  const BlockNode* scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
+  const BlockNode *scope_block = TVM_SREF_TO_BLOCK(scope_root_sref);
 
   ffi::Map<Block, Block> block_sref_reuse;
   Block new_scope_block = Downcast<Block>(
@@ -104,20 +104,20 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def(
       "tl.schedule.ScheduleLaunchThread",
-      [](Schedule self, const BlockRV& block_rv, int num_threads) {
+      [](Schedule self, const BlockRV &block_rv, int num_threads) {
         LaunchThread(self->state(), self->GetSRef(block_rv), num_threads);
       });
-  refl::GlobalDef().def(
-      "tl.schedule.ScheduleParallelizeLoop",
-      [](Schedule self, const LoopRV& loop_rv) {
-        ParallelizeLoop(self->state(), self->GetSRef(loop_rv));
-      });
+  refl::GlobalDef().def("tl.schedule.ScheduleParallelizeLoop",
+                        [](Schedule self, const LoopRV &loop_rv) {
+                          ParallelizeLoop(self->state(),
+                                          self->GetSRef(loop_rv));
+                        });
   refl::GlobalDef().def(
       "tl.schedule.SchedulePipelineLoop",
-      [](Schedule self, const LoopRV& loop_rv, int num_stages) {
+      [](Schedule self, const LoopRV &loop_rv, int num_stages) {
         PipelineLoop(self->state(), self->GetSRef(loop_rv), num_stages);
       });
 }
 
-}  // namespace tl
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

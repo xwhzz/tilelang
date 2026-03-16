@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Union
 
 from tilelang import tvm
 from tvm import relax, tir
@@ -48,7 +47,7 @@ def _split_vm_entry_functions(tir_mod: tvm.IRModule) -> tuple[tvm.IRModule | Non
 
 def _build_with_tilelang(
     tir_mod: tvm.IRModule,
-    target: Optional[Union[str, Target]],
+    target: str | Target | None,
 ):
     from tilelang.engine.lower import (
         canon_target_host,
@@ -111,13 +110,13 @@ def default_tir_pipeline() -> tvm.transform.Pass:
 
 def build(
     mod: tvm.IRModule,
-    target: Optional[Union[str, Target]] = None,
-    params: Optional[Dict[str, list]] = None,
-    relax_pipeline: Union[None, str, tvm.transform.Pass] = "default_build",
-    tir_pipeline: Optional[Union[str, tvm.transform.Pass]] = None,
+    target: str | Target | None = None,
+    params: dict[str, list] | None = None,
+    relax_pipeline: None | str | tvm.transform.Pass = "default_build",
+    tir_pipeline: str | tvm.transform.Pass | None = None,
     exec_mode: str = "compiled",
     *,
-    system_lib: Optional[bool] = None,
+    system_lib: bool | None = None,
     use_tilelang_tir: bool = True,
 ) -> Executable:
     """Build a Relax module to VM executable using TileLang TIR lowering.

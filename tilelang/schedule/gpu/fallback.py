@@ -20,7 +20,6 @@
 # The code below is mostly copied from apache/tvm fallback.py in dlight.
 # pylint: disable=missing-docstring
 """A fallback schedule rule for GPU operators."""
-from typing import List
 
 from .. import Schedule as TileSchedule
 from tvm import tir
@@ -60,15 +59,13 @@ class Fallback(GPUScheduleRule):
         param_buffers = [func.buffer_map[param] for param in func.params]
         block_records = []
         for block in block_infos:
-            s_loops: List[tir.schedule.LoopRV] = []
-            r_loops: List[tir.schedule.LoopRV] = []
-            o_loops: List[tir.schedule.LoopRV] = []
+            s_loops: list[tir.schedule.LoopRV] = []
+            r_loops: list[tir.schedule.LoopRV] = []
+            o_loops: list[tir.schedule.LoopRV] = []
             dom_kind = block.dom_kind()
             block = block.block_rv
 
-            if (any([
-                    sch.get(loop_rv).thread_binding is not None for loop_rv in sch.get_loops(block)
-            ]) or len(sch.get_loops(block)) == 0):
+            if any([sch.get(loop_rv).thread_binding is not None for loop_rv in sch.get_loops(block)]) or len(sch.get_loops(block)) == 0:
                 continue
 
             for loop, iter_type in zip(sch.get_loops(block), dom_kind):
@@ -90,9 +87,7 @@ class Fallback(GPUScheduleRule):
                     "name": block_stmt.name_hint,
                     "bx": bx,
                     "intermediate_buffers": [
-                        write.buffer
-                        for write in block_stmt.writes
-                        if not any(buf.same_as(write.buffer) for buf in param_buffers)
+                        write.buffer for write in block_stmt.writes if not any(buf.same_as(write.buffer) for buf in param_buffers)
                     ],
                 }
             )
@@ -105,10 +100,7 @@ class Fallback(GPUScheduleRule):
             for consumer_record in reversed(block_records[idx + 1 :]):
                 consumer_block = sch.get_block(consumer_record["name"])
                 consumer_stmt = sch.get(consumer_block)
-                if not any(
-                    any(read.buffer.same_as(buf) for buf in record["intermediate_buffers"])
-                    for read in consumer_stmt.reads
-                ):
+                if not any(any(read.buffer.same_as(buf) for buf in record["intermediate_buffers"]) for read in consumer_stmt.reads):
                     continue
                 sch.reverse_compute_at(
                     consumer_block,

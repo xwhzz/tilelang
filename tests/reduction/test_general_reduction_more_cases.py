@@ -12,12 +12,9 @@ evaluate:
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-import types
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable
+from collections.abc import Iterable, Sequence
 
 import tilelang
 import torch
@@ -33,7 +30,8 @@ PASS_CONFIGS = {
 
 from tilelang.schedule.gpu.general_reduction import GeneralReduction  # pylint: disable=import-outside-toplevel
 
-def _shape_to_tuple(shape: Sequence[tir.PrimExpr]) -> Tuple[int, ...]:
+
+def _shape_to_tuple(shape: Sequence[tir.PrimExpr]) -> tuple[int, ...]:
     result = []
     for dim in shape:
         if isinstance(dim, tir.IntImm):
@@ -45,7 +43,7 @@ def _shape_to_tuple(shape: Sequence[tir.PrimExpr]) -> Tuple[int, ...]:
 
 @dataclass
 class CaseBuild:
-    inputs: List[te.Tensor]
+    inputs: list[te.Tensor]
     output: te.Tensor
     ref_fn: Callable[..., torch.Tensor]
     description: str
@@ -55,9 +53,9 @@ class CaseBuild:
 class CaseResult:
     name: str
     status: str
-    tilelang_ms: Optional[float]
-    torch_ms: Optional[float]
-    speedup: Optional[float]
+    tilelang_ms: float | None
+    torch_ms: float | None
+    speedup: float | None
     note: str
 
 
@@ -226,7 +224,7 @@ def _build_logsumexp_like_2d(args: argparse.Namespace) -> CaseBuild:
     )
 
 
-CASE_BUILDERS: Dict[str, Callable[[argparse.Namespace], CaseBuild]] = {
+CASE_BUILDERS: dict[str, Callable[[argparse.Namespace], CaseBuild]] = {
     "sum_relu_3d": _build_sum_relu_3d,
     "max_bias_relu_3d": _build_max_bias_relu_3d,
     "keepdim_sum_sigmoid_3d": _build_keepdim_sum_sigmoid_3d,
@@ -237,7 +235,7 @@ CASE_BUILDERS: Dict[str, Callable[[argparse.Namespace], CaseBuild]] = {
 }
 
 
-def _select_cases(case_arg: str) -> List[str]:
+def _select_cases(case_arg: str) -> list[str]:
     if case_arg == "all":
         return list(CASE_BUILDERS.keys())
     selected = [item.strip() for item in case_arg.split(",") if item.strip()]
@@ -297,10 +295,7 @@ def _run_case(
         out_shape = _shape_to_tuple(build.output.shape)
 
         torch.manual_seed(args.seed)
-        inputs_torch = [
-            torch.randn(shape, device="cuda", dtype=torch.float32)
-            for shape in input_shapes
-        ]
+        inputs_torch = [torch.randn(shape, device="cuda", dtype=torch.float32) for shape in input_shapes]
         out_torch = torch.empty(out_shape, device="cuda", dtype=torch.float32)
 
         kernel(*inputs_torch, out_torch)
@@ -324,10 +319,7 @@ def _run_case(
                 raise
             tilelang_ms = do_bench(lambda: kernel(*inputs_torch, out_torch))
             torch_ms = do_bench(lambda: ref_fn(*inputs_torch))
-            bench_note = (
-                f"{build.description}; fallback benchmark backend=default "
-                f"(requested={args.bench_backend})"
-            )
+            bench_note = f"{build.description}; fallback benchmark backend=default (requested={args.bench_backend})"
 
         return CaseResult(
             name=case_name,
@@ -366,9 +358,7 @@ def _print_summary(results: Iterable[CaseResult], check_only: bool) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Run multiple GeneralReduction workloads to evaluate generality and performance."
-    )
+    parser = argparse.ArgumentParser(description="Run multiple GeneralReduction workloads to evaluate generality and performance.")
     parser.add_argument("--cases", type=str, default="all", help="Comma-separated case names, or 'all'.")
     parser.add_argument("--arch", type=str, default="sm_90a", help='CUDA arch string, e.g. "sm_90a".')
     parser.add_argument("--m", type=int, default=1024, help="3D workloads: first dim.")
@@ -405,7 +395,7 @@ def main() -> None:
         raise RuntimeError("CUDA is required for correctness/performance execution.")
 
     print("Selected cases:", ", ".join(selected_cases))
-    results: List[CaseResult] = []
+    results: list[CaseResult] = []
     for case_name in selected_cases:
         print(f"\n[Case] {case_name}")
         result = _run_case(case_name, args, GeneralReduction)
@@ -425,10 +415,7 @@ def main() -> None:
         ok_status = {"lowered"} if args.check_only else {"passed"}
         failures = [r for r in results if r.status not in ok_status]
         if failures:
-            raise RuntimeError(
-                "Strict mode failed. Non-successful cases: "
-                + ", ".join(f"{r.name}({r.status})" for r in failures)
-            )
+            raise RuntimeError("Strict mode failed. Non-successful cases: " + ", ".join(f"{r.name}({r.status})" for r in failures))
 
 
 if __name__ == "__main__":

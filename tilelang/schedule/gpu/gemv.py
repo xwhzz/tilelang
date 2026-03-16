@@ -4,7 +4,9 @@
 # pylint: disable=invalid-name
 """A GEMV schedule rule for TileLang."""
 
-from typing import List, Optional, Sequence, Union
+from __future__ import annotations
+
+from collections.abc import Sequence
 
 import tilelang
 from tilelang import tvm
@@ -21,7 +23,7 @@ from .reduction import _find_buffer_index
 tir = tvm.tir
 
 
-def _as_const_int(expr: tir.PrimExpr) -> Optional[int]:
+def _as_const_int(expr: tir.PrimExpr) -> int | None:
     if isinstance(expr, tir.IntImm):
         return int(expr.value)
     return None
@@ -108,7 +110,7 @@ def _choose_launch_threads(target: Target, output_tile: int, reduction_tile: int
     return max(1, _largest_power_of_two_at_most(min(max_threads, max(output_tile, 1))))
 
 
-def _find_epilogue_name(block_infos: List[BlockInfo], sch: TileSchedule) -> Optional[str]:
+def _find_epilogue_name(block_infos: list[BlockInfo], sch: TileSchedule) -> str | None:
     if len(block_infos) == 1:
         return None
     if len(block_infos) != 2 or not block_infos[1].is_injective():
@@ -172,7 +174,7 @@ def _choose_splitk_schedule_params(
 
 def _can_use_splitk_schedule(
     target: Target,
-    epilogue_name: Optional[str],
+    epilogue_name: str | None,
     matrix_buffer: tir.Buffer,
     vector_buffer: tir.Buffer,
     output_buffer: tir.Buffer,
@@ -181,11 +183,7 @@ def _can_use_splitk_schedule(
         return False
     matrix_dtype = tvm.DataType(matrix_buffer.dtype)
     vector_dtype = tvm.DataType(vector_buffer.dtype)
-    if (
-        not _is_float_dtype(matrix_buffer.dtype)
-        or not _is_float_dtype(vector_buffer.dtype)
-        or not _is_float_dtype(output_buffer.dtype)
-    ):
+    if not _is_float_dtype(matrix_buffer.dtype) or not _is_float_dtype(vector_buffer.dtype) or not _is_float_dtype(output_buffer.dtype):
         return False
     if matrix_dtype.bits not in (16, 32) or vector_dtype.bits != matrix_dtype.bits:
         return False
@@ -193,9 +191,7 @@ def _can_use_splitk_schedule(
         return False
     if len(vector_buffer.shape) + 1 != len(matrix_buffer.shape):
         return False
-    if len(output_buffer.shape) + 1 != len(matrix_buffer.shape):
-        return False
-    return True
+    return len(output_buffer.shape) + 1 == len(matrix_buffer.shape)
 
 
 class GEMV(GPUScheduleRule):
@@ -205,11 +201,11 @@ class GEMV(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         target: Target,
-        epilogue_name: Optional[str],
+        epilogue_name: str | None,
         matrix_buffer: tir.Buffer,
         vector_buffer: tir.Buffer,
         output_buffer: tir.Buffer,
-    ) -> Optional[tir.Schedule]:
+    ) -> tir.Schedule | None:
         if not _can_use_splitk_schedule(
             target,
             epilogue_name,
@@ -247,9 +243,7 @@ class GEMV(GPUScheduleRule):
 
             bo, bi = sch.split(s, factors=[None, output_tile], preserve_unit_iters=True)
             if vec > 1:
-                ro, tx, vec_loop = sch.split(
-                    r, factors=[None, reduce_threads, vec], preserve_unit_iters=True
-                )
+                ro, tx, vec_loop = sch.split(r, factors=[None, reduce_threads, vec], preserve_unit_iters=True)
                 sch.reorder(batch, bo, bi, ro, tx, vec_loop, c)
                 sch.fuse(vec_loop, c, preserve_unit_iters=True)
             else:
@@ -278,13 +272,13 @@ class GEMV(GPUScheduleRule):
         self,
         func: tir.PrimFunc,
         target: Target,
-        epilogue_name: Optional[str],
-        block_infos: List[BlockInfo],
+        epilogue_name: str | None,
+        block_infos: list[BlockInfo],
         block: tir.schedule.BlockRV,
-        vector_input_buffers: List[tir.Buffer],
+        vector_input_buffers: list[tir.Buffer],
         matrix_buffer: tir.Buffer,
         vector_buffer: tir.Buffer,
-    ) -> Optional[tir.Schedule]:
+    ) -> tir.Schedule | None:
         sch = TileSchedule(func)
         block_infos = normalize_prim_func(sch)
         block_infos = try_inline_contiguous_spatial(sch, block_infos)
@@ -297,9 +291,7 @@ class GEMV(GPUScheduleRule):
         vector_read_index = _find_buffer_index(block_stmt.reads, vector_buffer)
         matrix_read_index = _find_buffer_index(block_stmt.reads, matrix_buffer)
         prefer_large_reduction_tile = (
-            vector_read_index is not None
-            and matrix_read_index is not None
-            and matrix_read_index < vector_read_index
+            vector_read_index is not None and matrix_read_index is not None and matrix_read_index < vector_read_index
         )
 
         batch, s, r, c = sch.get_loops(block)
@@ -333,14 +325,8 @@ class GEMV(GPUScheduleRule):
 
             matrix_read_index = _find_buffer_index(update_stmt.reads, matrix_buffer)
             vector_read_index = _find_buffer_index(update_stmt.reads, vector_buffer)
-            write_buffer_index = _find_buffer_index(
-                update_stmt.writes, update_stmt.writes[0].buffer
-            )
-            if (
-                matrix_read_index is None
-                or vector_read_index is None
-                or write_buffer_index is None
-            ):
+            write_buffer_index = _find_buffer_index(update_stmt.writes, update_stmt.writes[0].buffer)
+            if matrix_read_index is None or vector_read_index is None or write_buffer_index is None:
                 return None
 
             sch.cache_read_at(ro, update_block, matrix_read_index, "local.fragment")
@@ -395,7 +381,7 @@ class GEMV(GPUScheduleRule):
         func: tir.PrimFunc,
         target: Target,
         _: bool,
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -430,8 +416,6 @@ class GEMV(GPUScheduleRule):
 
         vector_buffer = vector_input_buffers[0]
         matrix_buffer = None
-        vector_read_index = None
-        matrix_read_index = None
         for read_region in block_stmt.reads:
             if not read_region.buffer.same_as(vector_buffer):
                 matrix_buffer = read_region.buffer
@@ -466,8 +450,6 @@ class GEMV(GPUScheduleRule):
 
         return None
 
-    def apply_config(
-        self, func: tir.PrimFunc, config
-    ) -> Union[None, tir.Schedule, List[tir.Schedule]]:
+    def apply_config(self, func: tir.PrimFunc, config) -> None | tir.Schedule | list[tir.Schedule]:
         target = _resolve_target_from_config(config)
         return self.apply(func, target, False)

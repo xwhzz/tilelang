@@ -35,18 +35,19 @@ using namespace tir;
  * \brief Remove Block to ensure that the TIR can not be scheduled again.
  */
 class RootBlockReserver : public StmtExprMutator {
- public:
+public:
   static Stmt Rewrite(Stmt body) {
     RootBlockReserver reserver;
     reserver.storage_align_ = CollectStorageAlignAnnotation(body);
     return reserver(std::move(body));
   }
 
- private:
-  Stmt VisitStmt_(const BlockRealizeNode* op) final {
+private:
+  Stmt VisitStmt_(const BlockRealizeNode *op) final {
     // We have convert blocks into opaque blocks in previous passes.
-    ICHECK(op->iter_values.empty()) << "Non-opaque blocks are not allowed in FlattenBuffer. Please "
-                                       "call pass ConvertBlocksToOpaque before.";
+    ICHECK(op->iter_values.empty())
+        << "Non-opaque blocks are not allowed in FlattenBuffer. Please "
+           "call pass ConvertBlocksToOpaque before.";
     // Step 1. Visit the body
     block_level_++;
     Block new_block = Downcast<Block>(this->VisitStmt(op->block));
@@ -62,7 +63,8 @@ class RootBlockReserver : public StmtExprMutator {
       allocated_buffers_.insert(new_block->alloc_buffers[i]);
     }
 
-    // Step 4. Handle annotations, block annotations are not preserved by default.
+    // Step 4. Handle annotations, block annotations are not preserved by
+    // default.
     std::vector<std::pair<std::string, PrimExpr>> pragma_attrs;
     HandleAnnotations(new_block->annotations, &pragma_attrs, /*is_block=*/true);
     for (auto it = pragma_attrs.rbegin(); it != pragma_attrs.rend(); ++it) {
@@ -72,25 +74,33 @@ class RootBlockReserver : public StmtExprMutator {
     if (block_level_ == 0) {
       auto p_block = new_block.CopyOnWrite();
       p_block->name_hint = "tilelang_root";
-      p_block->alloc_buffers = ffi::Array<Buffer>(allocated_buffers_.begin(), allocated_buffers_.end());
+      p_block->alloc_buffers = ffi::Array<Buffer>(allocated_buffers_.begin(),
+                                                  allocated_buffers_.end());
       p_block->body = std::move(body);
-      Stmt block_realize = BlockRealize(ffi::Array<PrimExpr>(), std::move(predicate), std::move(new_block));
-      
-      std::sort(thread_bindings_.begin(), thread_bindings_.end(),
-                [](const auto& t1, const auto& t2) { return std::get<3>(t1) < std::get<3>(t2); });
+      Stmt block_realize = BlockRealize(
+          ffi::Array<PrimExpr>(), std::move(predicate), std::move(new_block));
 
-      for (auto it = thread_bindings_.rbegin(); it != thread_bindings_.rend(); ++it) {
-        block_realize = MakeLaunchThread(std::get<0>(*it), std::get<1>(*it), std::get<2>(*it),
-                                        std::get<3>(*it), std::move(block_realize));
+      std::sort(thread_bindings_.begin(), thread_bindings_.end(),
+                [](const auto &t1, const auto &t2) {
+                  return std::get<3>(t1) < std::get<3>(t2);
+                });
+
+      for (auto it = thread_bindings_.rbegin(); it != thread_bindings_.rend();
+           ++it) {
+        block_realize = MakeLaunchThread(std::get<0>(*it), std::get<1>(*it),
+                                         std::get<2>(*it), std::get<3>(*it),
+                                         std::move(block_realize));
       }
-      Block root_block = Block(ffi::Array<IterVar>(), {}, {}, {}, block_realize);
-      return BlockRealize(ffi::Array<PrimExpr>(), const_true(), std::move(root_block));
+      Block root_block =
+          Block(ffi::Array<IterVar>(), {}, {}, {}, block_realize);
+      return BlockRealize(ffi::Array<PrimExpr>(), const_true(),
+                          std::move(root_block));
     }
 
     return body;
   }
 
-  Stmt VisitStmt_(const ForNode* op) final {
+  Stmt VisitStmt_(const ForNode *op) final {
     // Step 1. Update unit loop info.
     PrimExpr min = this->VisitExpr(op->min);
     PrimExpr extent = this->VisitExpr(op->extent);
@@ -119,8 +129,8 @@ class RootBlockReserver : public StmtExprMutator {
       return body;
     } else {
       // Case 3. An ordinary loop
-      body = For(op->loop_var, std::move(min), std::move(extent), op->kind, std::move(body),
-                 std::nullopt, new_annotations, op->step);
+      body = For(op->loop_var, std::move(min), std::move(extent), op->kind,
+                 std::move(body), std::nullopt, new_annotations, op->step);
     }
     // Step 5. Insert nested attrs
     for (auto it = pragma_attrs.rbegin(); it != pragma_attrs.rend(); ++it) {
@@ -129,7 +139,7 @@ class RootBlockReserver : public StmtExprMutator {
     return body;
   }
 
-  PrimExpr VisitExpr_(const VarNode* op) final {
+  PrimExpr VisitExpr_(const VarNode *op) final {
     Var var = ffi::GetRef<Var>(op);
     auto it = unit_loop_vars_.find(var);
     if (it == unit_loop_vars_.end()) {
@@ -144,16 +154,17 @@ class RootBlockReserver : public StmtExprMutator {
     }
   }
 
-  static Stmt MakeLaunchThread(PrimExpr min, PrimExpr extent, Var var, ffi::String thread_tag,
-                               Stmt body) {
+  static Stmt MakeLaunchThread(PrimExpr min, PrimExpr extent, Var var,
+                               ffi::String thread_tag, Stmt body) {
     IterVar iter_var(/*dom=*/Range::FromMinExtent(min, extent),
                      /*var=*/std::move(var),
                      /*iter_type=*/IterVarType::kThreadIndex,
                      /*thread_tag=*/thread_tag);
-    ffi::String attr_key = (thread_tag == "vthread" || thread_tag == "vthread.x" ||
-                            thread_tag == "vthread.y" || thread_tag == "vthread.z")
-                               ? ::tvm::tir::attr::virtual_thread
-                               : ::tvm::tir::attr::thread_extent;
+    ffi::String attr_key =
+        (thread_tag == "vthread" || thread_tag == "vthread.x" ||
+         thread_tag == "vthread.y" || thread_tag == "vthread.z")
+            ? ::tvm::tir::attr::virtual_thread
+            : ::tvm::tir::attr::thread_extent;
     return AttrStmt(/*node=*/std::move(iter_var),
                     /*attr_key=*/std::move(attr_key),
                     /*value=*/std::move(extent),
@@ -161,7 +172,7 @@ class RootBlockReserver : public StmtExprMutator {
   }
 
   /*! \brief Convert attr value from annotation map into PrimExpr. */
-  PrimExpr ConvertAttrValue(const ffi::String& key, const Any& obj) {
+  PrimExpr ConvertAttrValue(const ffi::String &key, const Any &obj) {
     if (obj == nullptr) {
       return PrimExpr();
     } else if (auto expr = obj.try_cast<PrimExpr>()) {
@@ -169,8 +180,8 @@ class RootBlockReserver : public StmtExprMutator {
     } else if (auto str = obj.try_cast<ffi::String>()) {
       return std::move(StringImm(str.value()));
     } else {
-      LOG(FATAL) << "Illegal attribute of key " << key << ", value type " << obj.GetTypeKey()
-                 << " not supported";
+      LOG(FATAL) << "Illegal attribute of key " << key << ", value type "
+                 << obj.GetTypeKey() << " not supported";
       return PrimExpr();
     }
   }
@@ -181,15 +192,17 @@ class RootBlockReserver : public StmtExprMutator {
    * are lowered to `AttrStmt` by legacy TE schedule convention.
    * (2) the non-pragma loop annotations are preserved
    * (3) the non-pragma block annotations are dropped
-   * \return New annotation dict with preserved keys. Also update pragma attr pairs ordered by key.
+   * \return New annotation dict with preserved keys. Also update pragma attr
+   * pairs ordered by key.
    */
-  ffi::Map<ffi::String, ffi::Any> HandleAnnotations(
-      const ffi::Map<ffi::String, ffi::Any>& annotations,
-      std::vector<std::pair<std::string, PrimExpr>>* pragma_attrs, bool is_block) {
+  ffi::Map<ffi::String, ffi::Any>
+  HandleAnnotations(const ffi::Map<ffi::String, ffi::Any> &annotations,
+                    std::vector<std::pair<std::string, PrimExpr>> *pragma_attrs,
+                    bool is_block) {
     ffi::Map<ffi::String, ffi::Any> preserved_annotations;
     pragma_attrs->clear();
-    for (const auto& kv : annotations) {
-      const ffi::String& key = kv.first;
+    for (const auto &kv : annotations) {
+      const ffi::String &key = kv.first;
       if (::tvm::tir::attr::IsPragmaKey(key)) {
         pragma_attrs->emplace_back(key, ConvertAttrValue(key, kv.second));
       } else if (!is_block) {
@@ -197,12 +210,14 @@ class RootBlockReserver : public StmtExprMutator {
         preserved_annotations.Set(key, kv.second);
       }
     }
-    std::sort(pragma_attrs->begin(), pragma_attrs->end(),
-              [](const auto& p1, const auto& p2) { return p1.first < p2.first; });
+    std::sort(
+        pragma_attrs->begin(), pragma_attrs->end(),
+        [](const auto &p1, const auto &p2) { return p1.first < p2.first; });
     return preserved_annotations;
   }
 
-  /*! \brief Record the loop_var and loop start value of unit loops, whose extent is one. */
+  /*! \brief Record the loop_var and loop start value of unit loops, whose
+   * extent is one. */
   std::unordered_map<Var, PrimExpr> unit_loop_vars_;
 
   /*! \brief Attr keys to preserve into loop annotations. */
@@ -213,7 +228,8 @@ class RootBlockReserver : public StmtExprMutator {
 
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> allocated_buffers_;
 
-  std::vector<std::tuple<PrimExpr, PrimExpr, Var, ffi::String>> thread_bindings_;
+  std::vector<std::tuple<PrimExpr, PrimExpr, Var, ffi::String>>
+      thread_bindings_;
   int block_level_ = 0;
 };
 
@@ -236,7 +252,7 @@ TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.ReserveRootBlock", ReserveRootBlock);
 }
-}  // namespace transform
+} // namespace transform
 
-}  // namespace tir
-}  // namespace tvm
+} // namespace tl
+} // namespace tvm

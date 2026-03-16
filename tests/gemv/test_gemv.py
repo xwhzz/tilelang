@@ -9,7 +9,6 @@ Validates:
 from __future__ import annotations
 
 import argparse
-from typing import Tuple
 
 import tilelang
 import torch
@@ -29,7 +28,7 @@ def _lower_mod(mod):
     return mod
 
 
-def _dtype_tolerance(dtype: str) -> Tuple[float, float]:
+def _dtype_tolerance(dtype: str) -> tuple[float, float]:
     if dtype == "float16":
         return 1e-1, 1e-1
     return 1e-3, 1e-3
@@ -39,14 +38,10 @@ def _assert_lowered_ir(lowered_ir: str, label: str) -> None:
     has_tilelang = "T.copy(" in lowered_ir and "local.fragment" in lowered_ir
     has_thread_allreduce = "tvm_thread_allreduce" in lowered_ir
     if not has_tilelang and not has_thread_allreduce:
-        raise RuntimeError(
-            f"Expected either tile-style staging or tvm_thread_allreduce in {label} lowered IR, "
-            "but found neither."
-        )
+        raise RuntimeError(f"Expected either tile-style staging or tvm_thread_allreduce in {label} lowered IR, but found neither.")
     if not has_thread_allreduce and "T.parallel(" not in lowered_ir and 'launch_thread("threadIdx.x"' not in lowered_ir:
         raise RuntimeError(
-            f"Expected either tile-level T.parallel loops or thread-bound lowering in {label} lowered IR, "
-            "but found neither."
+            f"Expected either tile-level T.parallel loops or thread-bound lowering in {label} lowered IR, but found neither."
         )
 
 
@@ -136,6 +131,7 @@ def _build_mod_batched(B: int, M: int, N: int, arch: str, dtype: str):
 
     return mod
 
+
 def _build_mod_epilog(B: int, M: int, N: int, arch: str, dtype: str):
     """Build batched GEMV: C[b, i] = sum_k A[b, i, k] * X[b, k]."""
     A_t = te.placeholder((B, M, N), name="A", dtype=dtype)
@@ -165,7 +161,8 @@ def _build_mod_epilog(B: int, M: int, N: int, arch: str, dtype: str):
 
     return mod
 
-def build_and_run(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> Tuple[float, float]:
+
+def build_and_run(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> tuple[float, float]:
     """Build a GEMV kernel, run correctness check, and benchmark."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -205,8 +202,7 @@ def build_and_run(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> 
     return tilelang_time, torch_time
 
 
-
-def build_and_run_transposed(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> Tuple[float, float]:
+def build_and_run_transposed(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> tuple[float, float]:
     """Build transposed GEMV: y = W @ x where W is [M, N], x is [N]."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -244,7 +240,8 @@ def build_and_run_transposed(M: int, N: int, arch: str, bench_backend: str, dtyp
     print(f"Speedup (torch/tilelang): {torch_time / tilelang_time:.4f}x")
     return tilelang_time, torch_time
 
-def build_and_run_epilog(B: int, M: int, N: int, arch: str, bench_backend: str, dtype: str) -> Tuple[float, float]:
+
+def build_and_run_epilog(B: int, M: int, N: int, arch: str, bench_backend: str, dtype: str) -> tuple[float, float]:
     """Build and run batched GEMV with epilog: D[b, i] = sum_k A[b, i, k] * X[b, k] + 1.0."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -281,6 +278,7 @@ def build_and_run_epilog(B: int, M: int, N: int, arch: str, bench_backend: str, 
     print(f"Torch   time: {torch_time:.6f} ms, BW: {torch_gbps:.2f} GB/s")
     print(f"Speedup (torch/tilelang): {torch_time / tilelang_time:.4f}x")
     return tilelang_time, torch_time
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Check GEMV template correctness and performance.")
@@ -336,4 +334,3 @@ if __name__ == "__main__":
         print()
         print("=== Batched GEMV with Epilog ===")
         build_and_run_epilog(2, args.m, args.n, args.arch, args.bench_backend, args.dtype)
-        

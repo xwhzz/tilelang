@@ -8,12 +8,8 @@ dtype = T.float32
 block_M = 2
 block_N = 16384
 
-@tilelang.jit(
-    pass_configs= {
-        tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
-        tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True
-    }
-)
+
+@tilelang.jit(pass_configs={tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True, tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True})
 def softmax():
     @T.prim_func
     def softmax_kernel(
@@ -33,16 +29,16 @@ def softmax():
                 T.copy(input[bx * block_M : bx * block_M + block_M, i * block_N : (i + 1) * block_N], input_shared_dyn)
                 for ii, jj in T.Parallel(block_M, block_N):
                     rmax_shared[ii] = T.max(rmax_shared[ii], input_shared_dyn[ii, jj])
-            
+
             T.finalize_reducer(rmax_shared)
-            
+
             for i in range(N // block_N):
                 T.copy(input[bx * block_M : bx * block_M + block_M, i * block_N : (i + 1) * block_N], input_shared_dyn)
                 for ii, jj in T.Parallel(block_M, block_N):
                     rsum_shared[ii] = rsum_shared[ii] + T.exp(input_shared_dyn[ii, jj] - rmax_shared[ii])
-            
+
             T.finalize_reducer(rsum_shared)
-            
+
             for i in range(N // block_N):
                 T.copy(input[bx * block_M : bx * block_M + block_M, i * block_N : (i + 1) * block_N], input_shared_dyn)
                 for ii, jj in T.Parallel(block_M, block_N):
@@ -55,6 +51,7 @@ kernel = softmax()
 
 # print(kernel.get_kernel_source())
 import torch
+
 a = torch.randn((M, N)).cuda()
 c = torch.empty((M, N)).cuda()
 kernel(a, c)
@@ -64,12 +61,14 @@ kernel(a, c)
 def fn_torch(a):
     return torch.softmax(a, dim=1)
 
+
 ref_c = fn_torch(a)
 print(c, ref_c, sep="\n")
 torch.testing.assert_close(c, ref_c, rtol=1e-4, atol=1e-4)
 
 ## benchmark performance
 from tilelang.profiler import do_bench
+
 tilelang_time = do_bench(lambda: kernel(a, c), backend="cupti")
 torch_time = do_bench(lambda: fn_torch(a), backend="cupti")
 print(f"TileLang kernel time: {tilelang_time} ms")

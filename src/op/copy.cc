@@ -480,9 +480,8 @@ bool CopyNode::CheckBulkLoad(Target target, arith::Analyzer *analyzer,
   PrimExpr alignment = make_const(index_dtype, 16);
   PrimExpr zero = make_zero(index_dtype);
   if (check_last_dim &&
-      analyzer->CanProve(
-          FloorMod(last_extent * bytes, alignment) != zero,
-          arith::ProofStrength::kSymbolicBound)) {
+      analyzer->CanProve(FloorMod(last_extent * bytes, alignment) != zero,
+                         arith::ProofStrength::kSymbolicBound)) {
     LOG(WARNING)
         << "src range must have last dim multiple of 16 for tma bulk load "
         << src->name << " range " << src_range[src_range.size() - 1]->extent
@@ -596,9 +595,8 @@ bool CopyNode::CheckBulkStore(Target target, arith::Analyzer *analyzer,
   PrimExpr alignment = make_const(index_dtype, 16);
   PrimExpr zero = make_zero(index_dtype);
   if (check_last_dim &&
-      analyzer->CanProve(
-          FloorMod(last_extent * bytes, alignment) != zero,
-          arith::ProofStrength::kSymbolicBound)) {
+      analyzer->CanProve(FloorMod(last_extent * bytes, alignment) != zero,
+                         arith::ProofStrength::kSymbolicBound)) {
     LOG(WARNING)
         << "dst range must have last dim multiple of 16 for tma bulk store "
         << dst->name << " range " << dst_range[dst_range.size() - 1]->extent
