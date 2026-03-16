@@ -10,17 +10,20 @@ from collections.abc import Sequence
 
 import tilelang
 from tilelang import tvm
-from tvm.target import Target
 
 from .. import Schedule as TileSchedule
-from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
-from tvm.dlight.analysis import BlockInfo, is_gemv, normalize
 from . import utils
 from .base import GPUScheduleRule
 from .element_wise import _resolve_target_from_config
 from .reduction import _find_buffer_index
 
 tir = tvm.tir
+Target = tvm.target.Target
+normalize_prim_func = tvm.dlight.normalize_prim_func
+try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
+BlockInfo = tvm.dlight.analysis.BlockInfo
+is_gemv = tvm.dlight.analysis.is_gemv
+normalize = tvm.dlight.analysis.normalize
 
 
 def _as_const_int(expr: tir.PrimExpr) -> int | None:
@@ -110,6 +113,17 @@ def _choose_launch_threads(target: Target, output_tile: int, reduction_tile: int
     return max(1, _largest_power_of_two_at_most(min(max_threads, max(output_tile, 1))))
 
 
+def _choose_accumulator_dtype(
+    matrix_buffer: tir.Buffer,
+    vector_buffer: tir.Buffer,
+    output_buffer: tir.Buffer,
+) -> str | None:
+    read_dtypes = {matrix_buffer.dtype, vector_buffer.dtype}
+    if read_dtypes.issubset({"float16", "bfloat16"}) and output_buffer.dtype in {"float16", "bfloat16"}:
+        return "float32"
+    return None
+
+
 def _find_epilogue_name(block_infos: list[BlockInfo], sch: TileSchedule) -> str | None:
     if len(block_infos) == 1:
         return None
@@ -122,14 +136,27 @@ def _choose_splitk_schedule_params(
     target: Target,
     spatial_extent: tir.PrimExpr,
     reduction_extent: tir.PrimExpr,
-    dtype: str,
+    matrix_dtype: str,
+    output_dtype: str,
 ) -> Sequence[int]:
-    bits = tvm.DataType(dtype).bits
+    bits = tvm.DataType(matrix_dtype).bits
+    output_bits = tvm.DataType(output_dtype).bits
     max_threads = min(int(utils.max_threads_per_block(target)), 256)
     if max_threads <= 0:
         return 1, 1, 1
 
-    if bits <= 16:
+    # Hopper mixed-precision GEMV prefers more reduction lanes and fewer
+    # spatial lanes when accumulating into fp32 outputs.
+    if (
+        target.kind.name == "cuda"
+        and utils.get_sm_version(target) >= 90
+        and bits <= 16
+        and output_bits > bits
+    ):
+        output_candidate = 1
+        thread_candidate = 128
+        vec_candidate = 2
+    elif bits <= 16:
         output_candidate = 4
         thread_candidate = 64
         vec_candidate = 2
@@ -183,9 +210,14 @@ def _can_use_splitk_schedule(
         return False
     matrix_dtype = tvm.DataType(matrix_buffer.dtype)
     vector_dtype = tvm.DataType(vector_buffer.dtype)
+    output_dtype = tvm.DataType(output_buffer.dtype)
     if not _is_float_dtype(matrix_buffer.dtype) or not _is_float_dtype(vector_buffer.dtype) or not _is_float_dtype(output_buffer.dtype):
         return False
-    if matrix_dtype.bits not in (16, 32) or vector_dtype.bits != matrix_dtype.bits:
+    if matrix_dtype.bits not in (16, 32) or vector_dtype.bits not in (16, 32) or output_dtype.bits not in (16, 32):
+        return False
+    if output_dtype.bits < max(matrix_dtype.bits, vector_dtype.bits):
+        return False
+    if _choose_accumulator_dtype(matrix_buffer, vector_buffer, output_buffer) is not None:
         return False
     if len(matrix_buffer.shape) not in (2, 3):
         return False
@@ -239,21 +271,32 @@ class GEMV(GPUScheduleRule):
                 sch.get(s).extent,
                 sch.get(r).extent,
                 matrix_buffer.dtype,
+                output_buffer.dtype,
             )
 
-            bo, bi = sch.split(s, factors=[None, output_tile], preserve_unit_iters=True)
+            if output_tile > 1:
+                bo, bi = sch.split(s, factors=[None, output_tile], preserve_unit_iters=True)
+            else:
+                bo, bi = s, None
             if vec > 1:
                 ro, tx, vec_loop = sch.split(r, factors=[None, reduce_threads, vec], preserve_unit_iters=True)
-                sch.reorder(batch, bo, bi, ro, tx, vec_loop, c)
+                if bi is not None:
+                    sch.reorder(batch, bo, bi, ro, tx, vec_loop, c)
+                else:
+                    sch.reorder(batch, bo, ro, tx, vec_loop, c)
                 sch.fuse(vec_loop, c, preserve_unit_iters=True)
             else:
                 ro, tx = sch.split(r, factors=[None, reduce_threads], preserve_unit_iters=True)
-                sch.reorder(batch, bo, bi, ro, tx, c)
+                if bi is not None:
+                    sch.reorder(batch, bo, bi, ro, tx, c)
+                else:
+                    sch.reorder(batch, bo, ro, tx, c)
                 tx = sch.fuse(tx, c, preserve_unit_iters=True)
 
             block_outer = sch.fuse(batch, bo)
             sch.bind(block_outer, "blockIdx.x")
-            sch.bind(bi, "threadIdx.y")
+            if bi is not None:
+                sch.bind(bi, "threadIdx.y")
             sch.bind(tx, "threadIdx.x")
 
             if epilogue is not None:
@@ -302,6 +345,8 @@ class GEMV(GPUScheduleRule):
             prefer_large_reduction_tile,
         )
         output_tile = _choose_output_tile(target, sch.get(s).extent, reduction_tile, matrix_buffer.dtype)
+        output_buffer = block_stmt.writes[0].buffer
+        accum_dtype = _choose_accumulator_dtype(matrix_buffer, vector_buffer, output_buffer)
 
         bo, bi = sch.split(s, factors=[None, output_tile], preserve_unit_iters=True)
         ro, ri = sch.split(r, factors=[None, reduction_tile], preserve_unit_iters=True)
@@ -329,13 +374,25 @@ class GEMV(GPUScheduleRule):
             if matrix_read_index is None or vector_read_index is None or write_buffer_index is None:
                 return None
 
-            sch.cache_read_at(ro, update_block, matrix_read_index, "local.fragment")
+            sch.cache_read_at(
+                ro,
+                update_block,
+                matrix_read_index,
+                "local.fragment",
+                cache_dtype=accum_dtype or "",
+            )
             update_block = sch.get_block(update_name)
             update_stmt = sch.get(update_block)
             vector_read_index = _find_buffer_index(update_stmt.reads, vector_buffer)
             if vector_read_index is None:
                 return None
-            sch.cache_read_at(ro, update_block, vector_read_index, "local.fragment")
+            sch.cache_read_at(
+                ro,
+                update_block,
+                vector_read_index,
+                "local.fragment",
+                cache_dtype=accum_dtype or "",
+            )
 
             sch.cache_reduce_at(
                 block_outer,
@@ -344,31 +401,64 @@ class GEMV(GPUScheduleRule):
                 "shared.dyn",
                 0.0,
                 write_back=True,
+                cache_dtype=accum_dtype or "",
             )
         else:
             sch.decompose_reduction(block, ro)
             update_name = block_name + "_update"
             update_block = sch.get_block(update_name)
             update_stmt = sch.get(update_block)
+            epilogue = sch.get_block(epilogue_name)
+            epilogue_stmt = sch.get(epilogue)
+            epilogue_accum_read_index = _find_buffer_index(epilogue_stmt.reads, update_stmt.writes[0].buffer)
 
             matrix_read_index = _find_buffer_index(update_stmt.reads, matrix_buffer)
             vector_read_index = _find_buffer_index(update_stmt.reads, vector_buffer)
             if matrix_read_index is None or vector_read_index is None:
                 return None
 
-            sch.cache_read_at(ro, update_block, matrix_read_index, "local.fragment")
+            sch.cache_read_at(
+                ro,
+                update_block,
+                matrix_read_index,
+                "local.fragment",
+                cache_dtype=accum_dtype or "",
+            )
             update_block = sch.get_block(update_name)
             update_stmt = sch.get(update_block)
             vector_read_index = _find_buffer_index(update_stmt.reads, vector_buffer)
             if vector_read_index is None:
                 return None
-            sch.cache_read_at(ro, update_block, vector_read_index, "local.fragment")
+            sch.cache_read_at(
+                ro,
+                update_block,
+                vector_read_index,
+                "local.fragment",
+                cache_dtype=accum_dtype or "",
+            )
 
-            epilogue = sch.get_block(epilogue_name)
             sch.reverse_compute_at(epilogue, block_outer, preserve_unit_loops=True)
             update_block = sch.get_block(update_name)
-            sch.cache_write_at(block_outer, update_block, 0, "shared", write_back=False)
+            sch.cache_write_at(
+                block_outer,
+                update_block,
+                0,
+                "shared",
+                write_back=False,
+                cache_dtype=accum_dtype or "",
+            )
             epilogue = sch.get_block(epilogue_name)
+            if accum_dtype is not None and epilogue_accum_read_index is not None:
+                epilogue_loops = sch.get_loops(epilogue)
+                epilogue_cache_loop = epilogue_loops[-2] if len(epilogue_loops) >= 2 else epilogue_loops[-1]
+                sch.cache_read_at(
+                    epilogue_cache_loop,
+                    epilogue,
+                    epilogue_accum_read_index,
+                    "shared",
+                    cache_dtype=str(update_stmt.writes[0].buffer.dtype),
+                )
+                epilogue = sch.get_block(epilogue_name)
             epilogue_loops = sch.get_loops(epilogue)
             if epilogue_loops:
                 sch.parallel(epilogue_loops[-1])

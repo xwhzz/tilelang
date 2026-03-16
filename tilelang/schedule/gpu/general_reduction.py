@@ -8,13 +8,10 @@ from __future__ import annotations
 
 from functools import reduce
 
-from tvm import tir
-from tvm.target import Target
+from tilelang import tvm
 
 from .. import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
-from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
-from tvm.dlight.analysis import BlockInfo
 from .base import GPUScheduleRule
 from .reduction import (
     _as_const_int,
@@ -27,6 +24,12 @@ from .reduction import (
     _is_direct_buffer_load,
 )
 from .layernorm_like import LayerNormLike
+
+tir = tvm.tir
+Target = tvm.target.Target
+normalize_prim_func = tvm.dlight.normalize_prim_func
+try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
+BlockInfo = tvm.dlight.analysis.BlockInfo
 
 
 def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[tir.Buffer]:
@@ -312,7 +315,7 @@ def _schedule_reduction_stage_at_bx(
         thread_extent_expr = sch.get(ri).extent
     else:
         cache_read_loop = bx
-        reduce_loop = None
+        reduce_loop = r_fused
         thread_extent_expr = sch.get(r_fused).extent
 
     if is_single_source and not force_explicit_update:
@@ -818,7 +821,7 @@ class GeneralReduction(GPUScheduleRule):
                 thread_extent_expr = sch.get(ri).extent
             else:
                 cache_read_loop = bx
-                reduce_loop = None
+                reduce_loop = r_fused
                 thread_extent_expr = sch.get(r_fused).extent
         else:
             s_loops: list[tir.schedule.LoopRV] = []
@@ -855,7 +858,7 @@ class GeneralReduction(GPUScheduleRule):
             else:
                 sch.reorder(bx, inner_s, r_fused, *o_loops)
                 cache_read_loop = bx
-                reduce_loop = inner_s
+                reduce_loop = r_fused
                 thread_extent_expr = sch.get(r_fused).extent
 
         # Stage all input regions used by the reduction update expression.

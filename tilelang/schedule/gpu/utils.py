@@ -7,8 +7,10 @@
 from __future__ import annotations
 
 
-from tvm import tir
-from tvm.target import Target
+from tilelang import tvm
+
+tir = tvm.tir
+Target = tvm.target.Target
 
 
 def max_threads_per_block(target: Target) -> int:
@@ -82,5 +84,14 @@ def get_sm_version(target: Target) -> int:
     if target.kind.name != "cuda":
         return -1
     arch = target.arch
-    sm_version = arch.replace("sm_", "")
-    return int(sm_version) if sm_version.isdigit() else -1
+    if not arch.startswith("sm_"):
+        return -1
+    suffix = arch[len("sm_") :]
+    digits: list[str] = []
+    for char in suffix:
+        if not char.isdigit():
+            break
+        digits.append(char)
+    if not digits:
+        return -1
+    return int("".join(digits))

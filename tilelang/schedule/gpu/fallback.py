@@ -21,13 +21,17 @@
 # pylint: disable=missing-docstring
 """A fallback schedule rule for GPU operators."""
 
-from .. import Schedule as TileSchedule
-from tvm import tir
-from tvm.target import Target
+from tilelang import tvm
 
-from tvm.dlight import normalize_prim_func, try_inline
+from .. import Schedule as TileSchedule
+
 from . import utils
 from .base import GPUScheduleRule
+
+tir = tvm.tir
+Target = tvm.target.Target
+normalize_prim_func = tvm.dlight.normalize_prim_func
+try_inline = tvm.dlight.try_inline
 
 
 class Fallback(GPUScheduleRule):

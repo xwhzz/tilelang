@@ -27,11 +27,28 @@ def _dtype_tolerance(dtype: str) -> tuple[float, float]:
     return 1e-4, 1e-4
 
 
-def _assert_lowered_ir(lowered_ir: str, label: str, expect_gemm: bool = False) -> None:
+def _assert_lowered_ir(
+    lowered_ir: str,
+    label: str,
+    expect_gemm: bool = False,
+    expect_accum_dtype: str | None = None,
+) -> None:
     if "T.copy(" not in lowered_ir:
         raise RuntimeError(f"Expected tiled copies in {label}, but none were found.")
     if "local.fragment" not in lowered_ir:
         raise RuntimeError(f"Expected fragment accumulation in {label}, but none was found.")
+    if expect_accum_dtype is not None:
+        if expect_accum_dtype == "float32":
+            has_expected_accum = (
+                '"float32", scope="local.fragment"' in lowered_ir
+                or ('scope="local.fragment"' in lowered_ir and "T.float32(0.0)" in lowered_ir)
+            )
+        else:
+            has_expected_accum = f'"{expect_accum_dtype}", scope="local.fragment"' in lowered_ir
+        if not has_expected_accum:
+            raise RuntimeError(
+                f"Expected {expect_accum_dtype} fragment accumulation in {label}, but none was found."
+            )
     if 'scope="shared"' not in lowered_ir and "shared" not in lowered_ir:
         raise RuntimeError(f"Expected shared-memory staging in {label}, but none was found.")
     if expect_gemm and "T.gemm(" not in lowered_ir and "T.gemm_py(" not in lowered_ir:
@@ -127,10 +144,16 @@ def _build_mod(
         label_parts.append("epilogue")
     label = " ".join(label_parts)
     expect_gemm = dtype != "float32"
+    expect_accum_dtype = "float32" if dtype == "float16" else None
 
     print(f"=== Lowered IR ({label}) ===")
     print(mod)
-    _assert_lowered_ir(lowered_ir, label, expect_gemm=expect_gemm)
+    _assert_lowered_ir(
+        lowered_ir,
+        label,
+        expect_gemm=expect_gemm,
+        expect_accum_dtype=expect_accum_dtype,
+    )
     return mod
 
 
@@ -143,7 +166,12 @@ def _build_with_default_rules(m: int, n: int, k_extent: int, arch: str, dtype: s
     with target:
         mod = tvm.dlight.ApplyDefaultSchedule(*rules)(tvm.IRModule({"main": func}))
     mod = _lower_mod(mod)
-    _assert_lowered_ir(str(mod), "default-rule matmul", expect_gemm=dtype != "float32")
+    _assert_lowered_ir(
+        str(mod),
+        "default-rule matmul",
+        expect_gemm=dtype != "float32",
+        expect_accum_dtype="float32" if dtype == "float16" else None,
+    )
     return mod
 
 
