@@ -35,6 +35,9 @@ normalize_prim_func = tvm.dlight.normalize_prim_func
 try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
 
 
+_MIN_ELEMS_PER_THREAD = 4
+
+
 def _as_const_int(expr: tir.PrimExpr) -> int | None:
     if isinstance(expr, tir.IntImm):
         return int(expr.value)
@@ -181,7 +184,12 @@ def _infer_init_value(block: tir.Block, reduce_type: str) -> float:
 
 
 def _choose_num_threads(target: Target, reduction_extent: tir.PrimExpr) -> int:
-    """Pick cooperative thread count for one-block-per-output reduction."""
+    """Pick cooperative thread count for one-block-per-output reduction.
+
+    Ensures each thread handles at least ``_MIN_ELEMS_PER_THREAD`` elements
+    so that local accumulation amortises the cost of the cross-thread tree
+    reduction (warp shuffles + shared-memory sync).
+    """
 
     max_threads = int(utils.max_threads_per_block(target))
     max_threads = min(max_threads, 256)
@@ -192,10 +200,12 @@ def _choose_num_threads(target: Target, reduction_extent: tir.PrimExpr) -> int:
     if extent is None or extent <= 0:
         return max_threads
 
+    # Cap so that each thread has at least 4 elements worth of work.
+    effective_max = min(max_threads, max(1, extent // _MIN_ELEMS_PER_THREAD))
     threads = 1
-    while (threads << 1) <= max_threads and (threads << 1) <= extent:
+    while (threads << 1) <= effective_max and (threads << 1) <= extent:
         threads <<= 1
-    return threads
+    return max(threads, 1)
 
 
 def _choose_reduction_step(target: Target, reduction_extent: tir.PrimExpr) -> int | None:

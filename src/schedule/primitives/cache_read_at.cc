@@ -430,7 +430,8 @@ static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
                         const StmtSRef &block_sref, int read_buffer_index,
                         const ffi::String &storage_scope,
                         const ffi::String &transform,
-                        const ffi::String &cache_dtype) {
+                        const ffi::String &cache_dtype,
+                        bool disable_tma = false) {
   // ---- Step 1: Obtain source buffer and loop --------------------------------
   const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -545,8 +546,13 @@ static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
       MakeRegionCall(src, cache_region, /*access_mask=*/1);
   PrimExpr dst_region_arg = MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
 
+  ffi::Map<ffi::String, ObjectRef> copy_annotations;
+  if (disable_tma) {
+    copy_annotations.Set("disable_tma", Bool(true));
+  }
   Stmt copy_stmt = Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.copy"),
-                                 {src_region_arg, dst_region_arg}));
+                                 {src_region_arg, dst_region_arg},
+                                 copy_annotations));
 
   std::string transform_mode = transform;
   ICHECK(transform_mode.empty() || transform_mode == "square")
@@ -984,10 +990,11 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       "tl.schedule.ScheduleCacheReadAt",
       [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int read_buffer_index, const ffi::String &storage_scope,
-         const ffi::String &transform, const ffi::String &cache_dtype) {
+         const ffi::String &transform, const ffi::String &cache_dtype,
+         bool disable_tma) {
         CacheReadAt(self->state(), self->GetSRef(loop_rv),
                     self->GetSRef(block_rv), read_buffer_index, storage_scope,
-                    transform, cache_dtype);
+                    transform, cache_dtype, disable_tma);
       });
 
   refl::GlobalDef().def(

@@ -17,119 +17,118 @@
 # under the License.
 #
 # Modifications Copyright (c) Microsoft.
-# The code below is mostly copied from apache/tvm transpose.py in dlight.
-"""Reduction rule for operators including softmax, layer norm, RMS norm, etc"""
+"""Tile-based transpose schedule rule."""
 
 from __future__ import annotations
 
 from tilelang import tvm
+from tilelang import _ffi_api as tl_ffi
 
+from .. import Schedule as TileSchedule
+from . import utils
 from .base import GPUScheduleRule
 
-arith = tvm.arith
 tir = tvm.tir
 Target = tvm.target.Target
-Schedule = tvm.tir.Schedule
-BlockRV = tvm.tir.schedule.BlockRV
-detect_dominant_read = tvm.dlight.analysis.detect_dominant_read
 normalize_prim_func = tvm.dlight.normalize_prim_func
-try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
+
+
+def _largest_power_of_two_at_most(value: int) -> int:
+    result = 1
+    while (result << 1) <= value:
+        result <<= 1
+    return result
 
 
 class Transpose(GPUScheduleRule):
-    """Schedule rule for transpose"""
+    """Tile-based transpose schedule using shared-memory staging."""
 
-    def is_transpose(self, sch: Schedule, block_rv: BlockRV):
+    @staticmethod
+    def _is_transpose(sch, block_rv) -> bool:
         block = sch.get(block_rv)
-        if isinstance(block.body, tir.BufferStore):
-            rhs = block.body.value
-            if isinstance(rhs, tir.BufferLoad):
-                lhs_indices = block.body.indices
-                rhs_indices = rhs.indices
-                if list(lhs_indices) != list(rhs_indices) and set(lhs_indices) == set(rhs_indices):
-                    return True
-        return False
+        if not isinstance(block.body, tir.BufferStore):
+            return False
+        rhs = block.body.value
+        if not isinstance(rhs, tir.BufferLoad):
+            return False
+        lhs_indices = block.body.indices
+        rhs_indices = rhs.indices
+        return list(lhs_indices) != list(rhs_indices) and set(lhs_indices) == set(rhs_indices)
 
-    def apply(  # pylint: disable=too-many-locals
+    def is_transpose(self, sch, block_rv):
+        return Transpose._is_transpose(sch, block_rv)
+
+    def apply(
         self,
         func: tir.PrimFunc,
         target: Target,
         _: bool,
     ) -> None | tir.Schedule | list[tir.Schedule]:
-        # pylint: disable=invalid-name
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
-        if target.kind.name == "cuda":
-            len_tx = 16
-            len_ty = 8
-            unroll_depth = 256
-        else:
-            len_tx = 8
-            len_ty = 4
-            unroll_depth = 64
-        len_vec = 4
 
-        sch = tir.Schedule(func)
-        blocks = normalize_prim_func(sch)
-        transpose_block_idx = -1
-        for idx, block in reversed(list(enumerate(blocks))):
-            if self.is_transpose(sch, block.block_rv):
-                transpose_block_idx = idx
-                break
-            if not block.is_injective():
-                return None
-        if transpose_block_idx == -1:
+        sch = TileSchedule(func)
+        block_infos = normalize_prim_func(sch)
+        if block_infos is None:
             return None
-        transpose_block = blocks[transpose_block_idx].block_rv
 
-        prologue = None  # the optional decoding block
-        if transpose_block_idx > 0:
-            spatials = try_inline_contiguous_spatial(sch, blocks[: transpose_block_idx - 1])
-            assert len(spatials) == 0
-            prologue = blocks[transpose_block_idx - 1].block_rv
+        # Find the last transpose block (scan from end).
+        transpose_idx = -1
+        for idx, info in reversed(list(enumerate(block_infos))):
+            if self._is_transpose(sch, info.block_rv):
+                transpose_idx = idx
+                break
+            if not info.is_injective():
+                return None
+        if transpose_idx == -1:
+            return None
 
+        transpose_block = block_infos[transpose_idx].block_rv
         loops = sch.get_loops(transpose_block)
         if len(loops) != 2:
-            # transpose with more than 2 axes is not supported
             return None
 
-        c_factor = 1
-        if prologue is not None:
-            block_stmt = sch.get(prologue)
-            result = arith.normalize_to_iter_sum(
-                detect_dominant_read(block_stmt),
-                input_iters={i.var: i.dom.extent for i in block_stmt.iter_vars},
-            )
-            if len(result.args) > 0:
-                c_factor = int(result.args[0].lower_factor)
+        # Inline injective producers before the transpose block.
+        for info in block_infos[:transpose_idx]:
+            sch.compute_inline(info.block_rv)
+
+        # Inline injective consumers after the transpose block (reversed).
+        for info in reversed(block_infos[transpose_idx + 1:]):
+            sch.compute_inline(info.block_rv)
+
+        tile_size = 128
+        max_threads = min(int(utils.max_threads_per_block(target)), 512)
+        num_threads = _largest_power_of_two_at_most(max_threads)
+
+        # Get the read buffer name to construct shared cache buffer name.
+        block_stmt = sch.get(transpose_block)
+        read_buf = block_stmt.reads[0].buffer
+        element_bits = int(tvm.DataType(read_buf.dtype).bits)
+        shared_buf_name = read_buf.name + "_shared_dyn"
 
         i, j = loops
-        i, vi = sch.split(i, factors=[None, c_factor], preserve_unit_iters=True)
-        bi, ti = sch.split(i, factors=[None, len_ty], preserve_unit_iters=True)
-        bj, tj = sch.split(j, factors=[None, len_tx], preserve_unit_iters=True)
-        sch.reorder(bi, bj, ti, tj, vi)
-        sch.bind(bi, "blockIdx.y")
-        sch.bind(bj, "blockIdx.x")
-        sch.bind(ti, "threadIdx.y")
-        sch.bind(tj, "threadIdx.x")
-        len_vec = min(len_vec, c_factor)
-        _, vi = sch.split(vi, factors=[None, len_vec])
-        if len_vec > 1:
-            sch.vectorize(vi)
+        bi, ii = sch.split(i, factors=[None, tile_size], preserve_unit_iters=True)
+        bj, jj = sch.split(j, factors=[None, tile_size], preserve_unit_iters=True)
+        sch.reorder(bi, bj, ii, jj)
 
-        cache_read = sch.cache_read(transpose_block, read_buffer_index=0, storage_scope="shared")
-        sch.compute_at(cache_read, bj)
-        loops = sch.get_loops(cache_read)[2:]
-        fused = sch.fuse(*loops)
-        _, ty, tx, v = sch.split(fused, factors=[None, len_ty, len_tx, c_factor])
-        sch.bind(ty, "threadIdx.y")
-        sch.bind(tx, "threadIdx.x")
-        sch.unroll(v)
-        sch.storage_align(block=cache_read, buffer_index=0, axis=0, factor=32, offset=1)
+        # Stage input through shared memory for coalesced global reads;
+        # the transposed read from shared avoids uncoalesced global access.
+        # SIMT copy with swizzled layout outperforms TMA for transpose.
+        sch.cache_read_at(bj, transpose_block, 0, "shared.dyn", disable_tma=True)
+        # Stage output through registers.
+        sch.cache_write_at(bj, transpose_block, 0, "local.fragment")
 
-        sch.annotate(bi, ann_key="pragma_auto_unroll_max_step", ann_val=unroll_depth)
-        sch.annotate(bi, ann_key="pragma_unroll_explicit", ann_val=1)
+        # Annotate the shared buffer with a swizzled layout to avoid
+        # bank conflicts on the transposed read.
+        swizzle_layout = tl_ffi.make_swizzled_layout(
+            tile_size, tile_size, element_bits, True, True,
+        )
+        sch.annotate_layout(sch.get_block("root"), shared_buf_name, swizzle_layout)
 
-        if prologue is not None:
-            sch.compute_inline(prologue)
+        sch.parallel(ii)
+        sch.parallel(jj)
+        sch.bind(bi, "blockIdx.x")
+        sch.bind(bj, "blockIdx.y")
+
+        sch.launch_thread(sch.get_block("root"), num_threads)
         return sch

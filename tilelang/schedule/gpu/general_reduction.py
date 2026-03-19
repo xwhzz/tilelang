@@ -211,6 +211,13 @@ def _cache_elementwise_block(
         for read_buffer_index, read_region in enumerate(block_stmt.reads):
             if any(read_region.buffer.same_as(write_buffer) for write_buffer in block_writes):
                 continue
+            # Skip buffers already in fast memory (local.fragment, shared, etc.).
+            # These are intermediate results from preceding stages in the same
+            # CTA. Re-caching them inserts a T.copy at the beginning of the
+            # loop body, before the producer has written the data.
+            buf_scope = read_region.buffer.scope()
+            if buf_scope and buf_scope != "global":
+                continue
             block = sch.get_block(block_name)
             sch.cache_read_at(bx, block, read_buffer_index, "local.fragment")
 
