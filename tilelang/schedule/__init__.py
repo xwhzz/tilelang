@@ -70,6 +70,7 @@ class Schedule(TVMSchedule):
         storage_scope: str,
         transform: str = "",
         cache_dtype: str = "",
+        disable_tma: bool = False,
     ) -> None:
         """Insert a cached copy of a read buffer at the specified loop level.
 
@@ -96,6 +97,11 @@ class Schedule(TVMSchedule):
         cache_dtype : str
             Optional dtype for the cache buffer. Leave empty to preserve the
             original read-buffer dtype.
+        disable_tma : bool
+            If True, annotate the generated T.copy with ``disable_tma``
+            so that the lowering pipeline uses SIMT copy instead of TMA
+            even on Hopper targets.  Useful when SIMT copy with swizzled
+            shared memory outperforms TMA (e.g. transpose).
         """
         _ffi_api.ScheduleCacheReadAt(
             self,
@@ -105,6 +111,7 @@ class Schedule(TVMSchedule):
             storage_scope,
             transform,
             cache_dtype,
+            disable_tma,
         )
 
     def cache_write_at(
@@ -286,3 +293,26 @@ class Schedule(TVMSchedule):
             write_back,
             cache_dtype,
         )
+
+    def annotate_layout(self, block: BlockRV, buffer_name: str, layout) -> None:
+        """Annotate a buffer with a layout for the LayoutInference pass.
+
+        This adds a ``layout_map`` entry to the specified block's
+        annotations, mapping the buffer's data variable to the given
+        layout.  The LayoutInference pass reads this as the initial seed
+        for BFS-based layout propagation, enabling swizzled shared-memory
+        access patterns that avoid bank conflicts.
+
+        Parameters
+        ----------
+        block : BlockRV
+            The block whose annotations should be updated (typically the
+            root block).
+        buffer_name : str
+            Name of the buffer to annotate.  The buffer must exist in
+            ``alloc_buffers`` of some block within the subtree of the
+            specified block.
+        layout : tl.Layout
+            The layout object (e.g. from ``make_swizzled_layout``).
+        """
+        _ffi_api.ScheduleAnnotateLayout(self, block, buffer_name, layout)

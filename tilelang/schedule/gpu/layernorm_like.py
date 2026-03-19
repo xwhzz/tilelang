@@ -161,6 +161,11 @@ def _schedule_center_bridge(
     for read_buffer_index, read_region in enumerate(block_stmt.reads):
         if read_region.buffer.same_as(write_buffer):
             continue
+        # Skip buffers already in fast memory scope (produced by preceding
+        # reduction stages in the same CTA).
+        buf_scope = read_region.buffer.scope()
+        if buf_scope and buf_scope != "global":
+            continue
         sch.cache_read_at(bx, block, read_buffer_index, "local.fragment")
         block = sch.get_block(block_name)
 
@@ -352,6 +357,10 @@ class LayerNormLike(GPUScheduleRule):
         output_writes = [region.buffer for region in output_stmt.writes]
         for read_buffer_index, read_region in enumerate(output_stmt.reads):
             if any(read_region.buffer.same_as(write_buffer) for write_buffer in output_writes):
+                continue
+            # Skip buffers already in fast memory (produced by preceding stages).
+            buf_scope = read_region.buffer.scope()
+            if buf_scope and buf_scope != "global":
                 continue
             sch.cache_read_at(bx, output_block, read_buffer_index, "local.fragment")
             output_block = sch.get_block(output_name)
