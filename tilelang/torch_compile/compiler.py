@@ -230,6 +230,11 @@ def _validate_tensor_args(args: tuple[Any, ...]) -> tuple[torch.Tensor, ...]:
             raise TypeError(f"Only tensor inputs are supported now. Arg#{idx} has type {type(arg)}.")
         if arg.device.type != "cuda":
             raise RuntimeError("Only CUDA tensors are supported now.")
+        if not arg.is_contiguous():
+            raise ValueError(
+                f"Only contiguous CUDA tensors are supported now. "
+                f"Arg#{idx} has shape {tuple(arg.shape)} and stride {tuple(arg.stride())}."
+            )
         tensors.append(arg)
     return tuple(tensors)
 
@@ -312,14 +317,15 @@ class CompiledTorchRunner:
             return jit_runner(*args)
 
     def __call__(self, *args: torch.Tensor) -> torch.Tensor:
+        tensors = _validate_tensor_args(args)
         if self.active_executor == "vm":
-            out = self._run_vm_raw_with_fallback(*args)
+            out = self._run_vm_raw_with_fallback(*tensors)
             if self.active_executor == "vm":
                 return _normalize_vm_output_to_torch(out, self.device)
             return out
 
         jit_runner = self._ensure_jit_runner()
-        return jit_runner(*args)
+        return jit_runner(*tensors)
 
 
 class TorchCompileImpl:
