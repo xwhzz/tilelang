@@ -53,7 +53,7 @@ def _assert_lowered_ir(
         raise RuntimeError(f"Expected shared-memory staging in {label}, but none was found.")
     if expect_gemm and "T.gemm(" not in lowered_ir and "T.gemm_py(" not in lowered_ir:
         raise RuntimeError(f"Expected a tile-level GEMM op in {label}, but none was found.")
-    if expect_gemm and '"num_stages": 2' not in lowered_ir and "'num_stages': 2" not in lowered_ir:
+    if expect_gemm and '"num_stages":' not in lowered_ir and "'num_stages':" not in lowered_ir:
         raise RuntimeError(f"Expected a pipelined K loop in {label}, but none was found.")
     if not expect_gemm and "T.parallel(" not in lowered_ir:
         raise RuntimeError(f"Expected tile-parallel loops in {label}, but none were found.")
@@ -70,6 +70,9 @@ def _build_primfunc(
     transposed_b: bool = False,
     epilogue: bool = False,
 ):
+    need_fp32_accum = dtype in ("float16", "bfloat16")
+    accum_dtype = "float32" if need_fp32_accum else dtype
+
     if batch == 1:
         a = te.placeholder((m, k_extent), name="A", dtype=dtype)
         if transposed_b:
@@ -77,7 +80,9 @@ def _build_primfunc(
             k = te.reduce_axis((0, k_extent), name="k")
             c = te.compute(
                 (m, n),
-                lambda i, j: te.sum(a[i, k] * b[j, k], axis=k),
+                lambda i, j: te.sum(
+                    a[i, k].astype(accum_dtype) * b[j, k].astype(accum_dtype), axis=k
+                ),
                 name="C",
             )
         else:
@@ -85,7 +90,9 @@ def _build_primfunc(
             k = te.reduce_axis((0, k_extent), name="k")
             c = te.compute(
                 (m, n),
-                lambda i, j: te.sum(a[i, k] * b[k, j], axis=k),
+                lambda i, j: te.sum(
+                    a[i, k].astype(accum_dtype) * b[k, j].astype(accum_dtype), axis=k
+                ),
                 name="C",
             )
     else:
@@ -95,7 +102,10 @@ def _build_primfunc(
             k = te.reduce_axis((0, k_extent), name="k")
             c = te.compute(
                 (batch, m, n),
-                lambda batch_idx, i, j: te.sum(a[batch_idx, i, k] * b[batch_idx, j, k], axis=k),
+                lambda batch_idx, i, j: te.sum(
+                    a[batch_idx, i, k].astype(accum_dtype) * b[batch_idx, j, k].astype(accum_dtype),
+                    axis=k,
+                ),
                 name="C",
             )
         else:
@@ -103,17 +113,31 @@ def _build_primfunc(
             k = te.reduce_axis((0, k_extent), name="k")
             c = te.compute(
                 (batch, m, n),
-                lambda batch_idx, i, j: te.sum(a[batch_idx, i, k] * b[batch_idx, k, j], axis=k),
+                lambda batch_idx, i, j: te.sum(
+                    a[batch_idx, i, k].astype(accum_dtype) * b[batch_idx, k, j].astype(accum_dtype),
+                    axis=k,
+                ),
                 name="C",
             )
 
     if epilogue:
-        d = te.compute(
-            c.shape,
-            lambda *idx: tir.max(c[idx], tir.const(0.0, dtype)),
-            name="D",
-        )
+        if need_fp32_accum:
+            d = te.compute(
+                c.shape,
+                lambda *idx: tir.max(c[idx], tir.const(0.0, accum_dtype)).astype(dtype),
+                name="D",
+            )
+        else:
+            d = te.compute(
+                c.shape,
+                lambda *idx: tir.max(c[idx], tir.const(0.0, dtype)),
+                name="D",
+            )
         return te.create_prim_func([a, b, d])
+
+    if need_fp32_accum:
+        c_cast = te.compute(c.shape, lambda *idx: c[idx].astype(dtype), name="C_cast")
+        return te.create_prim_func([a, b, c_cast])
     return te.create_prim_func([a, b, c])
 
 

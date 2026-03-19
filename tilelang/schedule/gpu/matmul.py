@@ -66,21 +66,26 @@ def _choose_tile_config(
     k_extent = iter_extents[3] if len(iter_extents) >= 4 else None
     sm_version = utils.get_sm_version(target)
 
+    # Hopper (sm_90): larger K tile + aggressive pipelining
+    # Shared budget: 128*64*2*4 + 128*64*2*4 = 128 KB (fits 228 KB)
     if input_bits <= 16 and target.kind.name == "cuda" and sm_version >= 90:
-        if has_epilogue:
-            return _MatmulTileConfig(
-                block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
-                block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
-                block_k=_choose_static_tile([32, 16], k_extent),
-                num_stages=2,
-                num_threads=min(num_threads, 128),
-            )
         return _MatmulTileConfig(
             block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
             block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
-            block_k=_choose_static_tile([32, 16], k_extent),
-            num_stages=2,
+            block_k=_choose_static_tile([64, 32, 16], k_extent),
+            num_stages=4,
             num_threads=min(num_threads, 128),
+        )
+
+    # Ampere (sm_80): larger K tile
+    # Shared budget: 128*64*2*2 + 128*64*2*2 = 64 KB (fits 163 KB)
+    if input_bits <= 16 and target.kind.name == "cuda" and sm_version >= 80:
+        return _MatmulTileConfig(
+            block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
+            block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
+            block_k=_choose_static_tile([64, 32, 16], k_extent),
+            num_stages=2,
+            num_threads=num_threads,
         )
 
     if input_bits <= 16:
@@ -91,6 +96,17 @@ def _choose_tile_config(
             block_k=_choose_static_tile([32, 16], k_extent),
             num_stages=num_stages,
             num_threads=num_threads,
+        )
+
+    # fp32: larger tiles + pipelining on GPU
+    # Shared budget: 64*32*4*2 + 32*64*4*2 = 32 KB per stage pair
+    if target.kind.name in {"cuda", "hip", "rocm"}:
+        return _MatmulTileConfig(
+            block_m=_choose_static_tile([64, 32, 16, 8], m_extent),
+            block_n=_choose_static_tile([64, 32, 16, 8], n_extent),
+            block_k=_choose_static_tile([32, 16, 8], k_extent),
+            num_stages=2,
+            num_threads=min(num_threads, 128),
         )
     return _MatmulTileConfig(
         block_m=_choose_static_tile([32, 16, 8], m_extent),
@@ -103,6 +119,16 @@ def _choose_tile_config(
 
 def _is_injective_block(block_stmt: tir.Block) -> bool:
     return all(iter_var.iter_type == tir.IterVar.DataPar for iter_var in block_stmt.iter_vars)
+
+
+def _is_simple_copy_block(block_stmt: tir.Block) -> bool:
+    """True when the block body is a plain buffer store from a (possibly cast) buffer load."""
+    if not isinstance(block_stmt.body, tir.BufferStore):
+        return False
+    value = block_stmt.body.value
+    if isinstance(value, tir.BufferLoad):
+        return True
+    return isinstance(value, tir.Cast) and isinstance(value.value, tir.BufferLoad)
 
 
 def _has_block(sch: TileSchedule, name: str) -> bool:
@@ -174,20 +200,6 @@ def _can_use_tile_gemm(
     return output_dtype in {"float16", "float32", "int32"}
 
 
-def _choose_accumulator_dtype(
-    original_block_stmt: tir.Block,
-    use_tile_gemm: bool,
-) -> str | None:
-    if not use_tile_gemm or len(original_block_stmt.writes) != 1:
-        return None
-
-    read_dtypes = {region.buffer.dtype for region in original_block_stmt.reads}
-    output_dtype = original_block_stmt.writes[0].buffer.dtype
-    if read_dtypes.issubset({"float16", "bfloat16"}) and output_dtype in {"float16", "bfloat16"}:
-        return "float32"
-    return None
-
-
 def _choose_epilogue_shared_scope(target: Target, use_tile_gemm: bool) -> str:
     if use_tile_gemm and target.kind.name == "cuda" and utils.get_sm_version(target) >= 90:
         return "shared.dyn"
@@ -253,7 +265,6 @@ class Matmul(GPUScheduleRule):
             original_block_stmt = sch.get(main_block)
             transpose_a, transpose_b = _infer_transpose_flags(original_block_stmt)
             use_tile_gemm = _can_use_tile_gemm(target, original_block_stmt)
-            accum_dtype = _choose_accumulator_dtype(original_block_stmt, use_tile_gemm)
             sch = normalize_to_matmul(sch, main_block, layout=["a", "a", "n"])
             if sch is None:
                 return None
@@ -273,6 +284,19 @@ class Matmul(GPUScheduleRule):
                 for name in epilogue_names[:-1]:
                     if _has_block(sch, name):
                         sch.compute_inline(sch.get_block(name))
+
+            # Fold the last epilogue into the materialize block via
+            # reverse_compute_inline so the epilogue computation (cast,
+            # relu, etc.) lives in the output block and can be applied
+            # directly on the fragment accumulator without shared staging.
+            if epilogue_names:
+                last_name = epilogue_names[-1]
+                if _has_block(sch, last_name):
+                    try:
+                        sch.reverse_compute_inline(sch.get_block(last_name))
+                        epilogue_names = []
+                    except Exception:  # pylint: disable=broad-except
+                        pass
 
             sch.pad_einsum(
                 main_block,
@@ -324,21 +348,15 @@ class Matmul(GPUScheduleRule):
                 0,
                 "local.fragment",
                 write_back=False,
-                cache_dtype=accum_dtype or "",
             )
 
             main_block = sch.get_block(main_name)
             if use_tile_gemm:
                 sch.fill_at(n_outer, main_block, 0, 0.0)
                 main_block = sch.get_block(main_name)
-            sch.cache_read_at(k_outer, main_block, 0, "shared")
+            sch.cache_read_at(k_outer, main_block, 0, "shared.dyn")
             main_block = sch.get_block(main_name)
-            sch.cache_read_at(k_outer, main_block, 1, "shared")
-
-            output_block = sch.get_block(output_block_name)
-            output_loops = sch.get_loops(output_block)
-            if output_loops and (has_epilogue or not use_tile_gemm):
-                sch.parallel(output_loops[-1])
+            sch.cache_read_at(k_outer, main_block, 1, "shared.dyn")
 
             if use_tile_gemm:
                 main_block = sch.get_block(main_name)
@@ -347,6 +365,7 @@ class Matmul(GPUScheduleRule):
                     main_block,
                     transpose_a=transpose_a,
                     transpose_b=transpose_b,
+                    use_py=True,
                 )
                 if has_epilogue:
                     bridge_block = sch.get_block(materialize_block_name)
@@ -359,9 +378,40 @@ class Matmul(GPUScheduleRule):
                     )
                     bridge_block = sch.get_block(materialize_block_name)
                     sch.copy_at(n_outer, bridge_block)
+                    output_block = sch.get_block(output_block_name)
+                    if _is_simple_copy_block(sch.get(output_block)):
+                        sch.copy_at(n_outer, output_block)
+                    else:
+                        for loop in sch.get_loops(output_block):
+                            sch.parallel(loop)
                 else:
-                    sch.copy_at(n_outer, sch.get_block(output_block_name))
+                    output_block = sch.get_block(output_block_name)
+                    if _is_simple_copy_block(sch.get(output_block)):
+                        sch.copy_at(n_outer, output_block)
+                    else:
+                        for loop in sch.get_loops(output_block):
+                            sch.parallel(loop)
             else:
+                if has_epilogue:
+                    bridge_block = sch.get_block(materialize_block_name)
+                    sch.cache_write_at(
+                        n_outer,
+                        bridge_block,
+                        0,
+                        "shared.dyn",
+                        write_back=False,
+                    )
+                    bridge_block = sch.get_block(materialize_block_name)
+                    for loop in sch.get_loops(bridge_block):
+                        sch.parallel(loop)
+                    output_block = sch.get_block(output_block_name)
+                    for loop in sch.get_loops(output_block):
+                        sch.parallel(loop)
+                else:
+                    output_block = sch.get_block(output_block_name)
+                    output_loops = sch.get_loops(output_block)
+                    if output_loops:
+                        sch.parallel(output_loops[-1])
                 main_block = sch.get_block(main_name)
                 main_loops = sch.get_loops(main_block)
                 if len(main_loops) < 3:
