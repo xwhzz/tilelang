@@ -128,6 +128,28 @@ def _is_direct_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> boo
     return isinstance(expr, tir.BufferLoad) and expr.buffer.same_as(target_buffer)
 
 
+def _is_same_buffer_load(
+    lhs: tir.PrimExpr,
+    rhs: tir.PrimExpr,
+    target_buffer: tir.Buffer | None = None,
+) -> bool:
+    if not isinstance(lhs, tir.BufferLoad) or not isinstance(rhs, tir.BufferLoad):
+        return False
+    if not lhs.buffer.same_as(rhs.buffer):
+        return False
+    if target_buffer is not None and not lhs.buffer.same_as(target_buffer):
+        return False
+    if len(lhs.indices) != len(rhs.indices):
+        return False
+    return all(tir.analysis.expr_deep_equal(a, b) for a, b in zip(lhs.indices, rhs.indices))
+
+
+def _is_square_of_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> bool:
+    if not isinstance(expr, tir.Mul):
+        return False
+    return _is_same_buffer_load(expr.a, expr.b, target_buffer)
+
+
 def _find_buffer_index(regions, target_buffer: tir.Buffer) -> int | None:
     for idx, region in enumerate(regions):
         if region.buffer.same_as(target_buffer):
@@ -327,22 +349,27 @@ class Reduction(GPUScheduleRule):
             block_stmt.writes[write_buffer_index].buffer,
         )
 
-        # Replace explicit inner reduction loop by tile-level T.reduce.
-        # Only safe for direct-load reductions like: C += A.
-        # For transformed RHS (e.g. C += A * A), keep the explicit update loop.
-        if _is_direct_buffer_load(rhs_expr, input_buffer):
+        # Replace the explicit inner reduction loop by tile-level T.reduce
+        # when the update can be lowered as a single-source reduction.
+        square_single_source = reduce_type == "sum" and _is_square_of_buffer_load(rhs_expr, input_buffer)
+        can_lower_to_tile_reduce = _is_direct_buffer_load(rhs_expr, input_buffer) or square_single_source
+        if can_lower_to_tile_reduce:
+            reduce_type_for_lower = "sumsq" if square_single_source else reduce_type
             sch.reduce_at(
                 reduce_loop,
                 block,
                 read_buffer_index=read_buffer_index,
                 write_buffer_index=write_buffer_index,
-                reduce_type=reduce_type,
+                reduce_type=reduce_type_for_lower,
                 dim=reduce_dim,
                 clear=False,
                 replace_loop_body=True,
             )
 
-        num_threads = _choose_num_threads(target, thread_extent_expr)
+        # Explicit-update reductions do not introduce a thread-bound loop in
+        # this template, so keep them single-threaded to avoid duplicating the
+        # full reduction in every CTA lane.
+        num_threads = _choose_num_threads(target, thread_extent_expr) if can_lower_to_tile_reduce else 1
         sch.bind(bx, "blockIdx.x")
         sch.launch_thread(sch.get_block("root"), num_threads)
         return sch

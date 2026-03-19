@@ -22,6 +22,7 @@ from .reduction import (
     _infer_init_value,
     _infer_reduce_dim,
     _is_direct_buffer_load,
+    _is_square_of_buffer_load,
 )
 from .layernorm_like import LayerNormLike
 
@@ -61,28 +62,6 @@ def _contains_exp_like_call(expr: tir.PrimExpr) -> bool:
 
     tir.stmt_functor.post_order_visit(expr, _collect)
     return has_exp_like
-
-
-def _is_same_buffer_load(
-    lhs: tir.PrimExpr,
-    rhs: tir.PrimExpr,
-    target_buffer: tir.Buffer | None = None,
-) -> bool:
-    if not isinstance(lhs, tir.BufferLoad) or not isinstance(rhs, tir.BufferLoad):
-        return False
-    if not lhs.buffer.same_as(rhs.buffer):
-        return False
-    if target_buffer is not None and not lhs.buffer.same_as(target_buffer):
-        return False
-    if len(lhs.indices) != len(rhs.indices):
-        return False
-    return all(tir.analysis.expr_deep_equal(a, b) for a, b in zip(lhs.indices, rhs.indices))
-
-
-def _is_square_of_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> bool:
-    if not isinstance(expr, tir.Mul):
-        return False
-    return _is_same_buffer_load(expr.a, expr.b, target_buffer)
 
 
 def _block_writes_buffer(block: tir.Block, target_buffer: tir.Buffer) -> bool:
