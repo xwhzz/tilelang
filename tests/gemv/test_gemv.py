@@ -50,7 +50,16 @@ def _build_mod(M: int, N: int, arch: str, dtype: str):
     A = te.placeholder((M, N), name="A", dtype=dtype)
     B = te.placeholder((N,), name="B", dtype=dtype)
     k = te.reduce_axis((0, N), name="k")
-    C = te.compute((M,), lambda i: te.sum(A[i, k] * B[k], axis=k), name="C")
+
+    if dtype in ("float16", "bfloat16"):
+        C_accum = te.compute(
+            (M,),
+            lambda i: te.sum(A[i, k].astype("float32") * B[k].astype("float32"), axis=k),
+            name="C",
+        )
+        C = te.compute((M,), lambda i: C_accum[i].astype(dtype), name="C_cast")
+    else:
+        C = te.compute((M,), lambda i: te.sum(A[i, k] * B[k], axis=k), name="C")
 
     func = te.create_prim_func([A, B, C])
 
@@ -79,7 +88,16 @@ def _build_mod_transposed(M: int, N: int, arch: str, dtype: str):
     A = te.placeholder((N,), name="A", dtype=dtype)
     B = te.placeholder((M, N), name="B", dtype=dtype)
     k = te.reduce_axis((0, N), name="k")
-    C = te.compute((M,), lambda i: te.sum(A[k] * B[i, k], axis=k), name="C")
+
+    if dtype in ("float16", "bfloat16"):
+        C_accum = te.compute(
+            (M,),
+            lambda i: te.sum(A[k].astype("float32") * B[i, k].astype("float32"), axis=k),
+            name="C",
+        )
+        C = te.compute((M,), lambda i: C_accum[i].astype(dtype), name="C_cast")
+    else:
+        C = te.compute((M,), lambda i: te.sum(A[k] * B[i, k], axis=k), name="C")
 
     func = te.create_prim_func([A, B, C])
 
@@ -108,7 +126,16 @@ def _build_mod_batched(B: int, M: int, N: int, arch: str, dtype: str):
     A_t = te.placeholder((B, M, N), name="A", dtype=dtype)
     X_t = te.placeholder((B, N), name="X", dtype=dtype)
     k = te.reduce_axis((0, N), name="k")
-    C_t = te.compute((B, M), lambda b, i: te.sum(A_t[b, i, k] * X_t[b, k], axis=k), name="C")
+
+    if dtype in ("float16", "bfloat16"):
+        C_accum = te.compute(
+            (B, M),
+            lambda b, i: te.sum(A_t[b, i, k].astype("float32") * X_t[b, k].astype("float32"), axis=k),
+            name="C",
+        )
+        C_t = te.compute((B, M), lambda b, i: C_accum[b, i].astype(dtype), name="C_cast")
+    else:
+        C_t = te.compute((B, M), lambda b, i: te.sum(A_t[b, i, k] * X_t[b, k], axis=k), name="C")
 
     func = te.create_prim_func([A_t, X_t, C_t])
 
@@ -133,12 +160,25 @@ def _build_mod_batched(B: int, M: int, N: int, arch: str, dtype: str):
 
 
 def _build_mod_epilog(B: int, M: int, N: int, arch: str, dtype: str):
-    """Build batched GEMV: C[b, i] = sum_k A[b, i, k] * X[b, k]."""
+    """Build batched GEMV with epilog: D[b, i] = sum_k A[b, i, k] * X[b, k] + 1.0."""
     A_t = te.placeholder((B, M, N), name="A", dtype=dtype)
     X_t = te.placeholder((B, N), name="X", dtype=dtype)
     k = te.reduce_axis((0, N), name="k")
-    C_t = te.compute((B, M), lambda b, i: te.sum(A_t[b, i, k] * X_t[b, k], axis=k), name="C")
-    D_t = te.compute((B, M), lambda b, i: C_t[b, i] + tir.const(1.0, dtype), name="D")
+
+    if dtype in ("float16", "bfloat16"):
+        C_t = te.compute(
+            (B, M),
+            lambda b, i: te.sum(A_t[b, i, k].astype("float32") * X_t[b, k].astype("float32"), axis=k),
+            name="C",
+        )
+        D_t = te.compute(
+            (B, M),
+            lambda b, i: C_t[b, i].astype(dtype) + tir.const(1.0, dtype),
+            name="D",
+        )
+    else:
+        C_t = te.compute((B, M), lambda b, i: te.sum(A_t[b, i, k] * X_t[b, k], axis=k), name="C")
+        D_t = te.compute((B, M), lambda b, i: C_t[b, i] + tir.const(1.0, dtype), name="D")
 
     func = te.create_prim_func([A_t, X_t, D_t])
 
