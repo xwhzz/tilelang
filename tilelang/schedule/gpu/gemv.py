@@ -102,25 +102,28 @@ def _choose_splitk_schedule_params(
     if max_threads <= 0:
         return 1, 1, 1
 
-    # Hopper mixed-precision GEMV prefers fewer reduction threads (single
-    # warp avoids cross-warp sync) with larger vectorization for coalesced
-    # 128-bit loads and more work per thread.
-    if (
-        target.kind.name == "cuda"
-        and utils.get_sm_version(target) >= 90
-        and bits <= 16
-        and output_bits > bits
-    ):
+    sm = utils.get_sm_version(target) if target.kind.name == "cuda" else 0
+
+    # Maximize reduction thread count for memory latency hiding.
+    # More warps per block → more outstanding memory requests → higher
+    # effective HBM bandwidth utilization.
+    if sm >= 90 and bits <= 16 and output_bits > bits:
+        # Hopper mixed-precision (fp16 in, fp32 out)
         output_candidate = 1
+        thread_candidate = 256
+        vec_candidate = 2
+    elif sm >= 90:
+        # Hopper fp32
+        output_candidate = 1
+        thread_candidate = 256
+        vec_candidate = 1
+    elif bits <= 16:
+        output_candidate = 2
         thread_candidate = 128
         vec_candidate = 2
-    elif bits <= 16:
-        output_candidate = 4
-        thread_candidate = 64
-        vec_candidate = 2
     else:
-        output_candidate = 2
-        thread_candidate = 64
+        output_candidate = 1
+        thread_candidate = 256
         vec_candidate = 1
 
     const_spatial = _as_const_int(spatial_extent)
