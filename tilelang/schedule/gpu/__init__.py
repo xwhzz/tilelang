@@ -33,8 +33,7 @@ def default_schedule_rules():
     return [
         Matmul(),
         GEMV(),
-        Reduction(),
-        GeneralReduction(),
+        GeneralReduction(),  # Subsumes former Reduction
         Transpose(),
         ElementWise(),
         Fallback(),

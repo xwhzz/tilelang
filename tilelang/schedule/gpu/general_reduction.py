@@ -13,11 +13,13 @@ from tilelang import tvm
 from .. import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
 from .base import GPUScheduleRule
-from .reduction import (
+from .reduction_utils import (
     _as_const_int,
     _analyze_reduction_update,
     _choose_num_threads,
     _choose_reduction_step,
+    _collect_input_buffers,
+    _block_writes_buffer,
     _find_buffer_index,
     _infer_init_value,
     _infer_reduce_dim,
@@ -31,21 +33,6 @@ Target = tvm.target.Target
 normalize_prim_func = tvm.dlight.normalize_prim_func
 try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
 BlockInfo = tvm.dlight.analysis.BlockInfo
-
-
-def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[tir.Buffer]:
-    buffers: list[tir.Buffer] = []
-
-    def _collect(expr):
-        if (
-            isinstance(expr, tir.BufferLoad)
-            and (not expr.buffer.same_as(write_buffer))
-            and not any(expr.buffer.same_as(buf) for buf in buffers)
-        ):
-            buffers.append(expr.buffer)
-
-    tir.stmt_functor.post_order_visit(rhs, _collect)
-    return buffers
 
 
 def _contains_exp_like_call(expr: tir.PrimExpr) -> bool:
@@ -62,10 +49,6 @@ def _contains_exp_like_call(expr: tir.PrimExpr) -> bool:
 
     tir.stmt_functor.post_order_visit(expr, _collect)
     return has_exp_like
-
-
-def _block_writes_buffer(block: tir.Block, target_buffer: tir.Buffer) -> bool:
-    return any(write_region.buffer.same_as(target_buffer) for write_region in block.writes)
 
 
 def _should_preserve_two_reduction_bridge(
@@ -930,7 +913,14 @@ class GeneralReduction(GPUScheduleRule):
                 sch.set_scope(block, write_buffer_index, "local.fragment")
                 block = sch.get_block(block_name)
 
-        num_threads = _choose_num_threads(target, thread_extent_expr)
+        # Explicit-update reductions (where reduce_at was NOT applied) do not
+        # introduce a thread-bound reduction loop.  Keep single-threaded for
+        # single-block patterns to avoid duplicating the full reduction in
+        # every CTA lane.
+        if can_lower_main_reduce or has_reduction_prologue or use_output_epilogue_anchor:
+            num_threads = _choose_num_threads(target, thread_extent_expr)
+        else:
+            num_threads = 1
         sch.bind(bx, "blockIdx.x")
         launch_block = sch.get_block("root")
         if has_reduction_prologue:

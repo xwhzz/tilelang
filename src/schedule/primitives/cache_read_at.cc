@@ -46,8 +46,8 @@
 #include "tir/schedule/utils.h"
 
 // TileLang headers
-#include "../../op/region.h"
 #include "../../transform/layout_reducer.h"
+#include "utils.h"
 
 #include <string>
 #include <vector>
@@ -57,61 +57,6 @@ namespace tl {
 
 using namespace tir;
 using support::NDIntSet;
-
-// ---------------------------------------------------------------------------
-// Helper: construct a tl.region() Call that encodes a BufferRegion as a
-// PrimExpr so it can be passed as an argument to tl.tileop.copy.
-// ---------------------------------------------------------------------------
-static PrimExpr MakeRegionCall(const Buffer &buf,
-                               const ffi::Array<Range> &ranges,
-                               int access_mask) {
-  ffi::Array<PrimExpr> args;
-  // arg 0: BufferLoad whose indices are the per-axis minima
-  ffi::Array<PrimExpr> min_indices;
-  for (const auto &range : ranges) {
-    min_indices.push_back(range->min);
-  }
-  args.push_back(BufferLoad(buf, min_indices));
-  // arg 1: access mask (1=read, 2=write)
-  args.push_back(IntImm(DataType::Int(32), access_mask));
-  // args 2+i: per-axis extents
-  for (const auto &range : ranges) {
-    args.push_back(range->extent);
-  }
-  return Call(DataType::Handle(), RegionOp::Get(), args);
-}
-
-static ffi::Map<Var, Range> LoopDomainOfSRefTreePathSkipBlocks(
-    const StmtSRef &low_inclusive,
-    const ffi::Optional<StmtSRef> &high_exclusive,
-    const runtime::StorageScope &extra_relax_scope) {
-  ffi::Map<Var, Range> result;
-  const StmtSRefNode *p = low_inclusive.get();
-  const StmtSRefNode *limit =
-      static_cast<const StmtSRefNode *>(high_exclusive.get());
-  for (; p != limit; p = p->parent) {
-    if (const ForNode *loop = p->StmtAs<ForNode>()) {
-      result.Set(loop->loop_var, Range::FromMinExtent(loop->min, loop->extent));
-    }
-  }
-  if (extra_relax_scope.rank != runtime::StorageRank::kGlobal) {
-    for (; p; p = p->parent) {
-      if (const ForNode *loop = p->StmtAs<ForNode>()) {
-        if (loop->kind == ForKind::kThreadBinding) {
-          const ffi::String &thread_tag =
-              loop->thread_binding.value()->thread_tag;
-          if (CanRelaxStorageUnderThread(
-                  extra_relax_scope,
-                  runtime::ThreadScope::Create(thread_tag))) {
-            result.Set(loop->loop_var,
-                       Range::FromMinExtent(loop->min, loop->extent));
-          }
-        }
-      }
-    }
-  }
-  return result;
-}
 
 // Detect whether the loop body already contains tl.tileop.region calls that
 // reference `buf`. In that case, squeezing dimensions would require rewriting
@@ -278,31 +223,6 @@ private:
   const BlockNode *target_block_;
   bool block_only_;
   bool in_target_scope_;
-};
-
-// ---------------------------------------------------------------------------
-// Simple rewriter that replaces a specific ForNode in the AST with a new one.
-// ---------------------------------------------------------------------------
-class LoopReplacer : public StmtMutator {
-public:
-  LoopReplacer(const ForNode *old_loop, For new_loop)
-      : old_loop_(old_loop), new_loop_(std::move(new_loop)), found_(false) {}
-
-  Stmt VisitStmt(const Stmt &stmt) final {
-    return found_ ? stmt : StmtMutator::VisitStmt(stmt);
-  }
-  Stmt VisitStmt_(const ForNode *loop) final {
-    if (loop == old_loop_) {
-      found_ = true;
-      return new_loop_;
-    }
-    return StmtMutator::VisitStmt_(loop);
-  }
-
-private:
-  const ForNode *old_loop_;
-  For new_loop_;
-  bool found_;
 };
 
 static ffi::Array<Range>

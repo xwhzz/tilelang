@@ -11,60 +11,23 @@ from tilelang import tvm
 from .. import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
 from .base import GPUScheduleRule
-from .reduction import (
+from .reduction_utils import (
     _analyze_reduction_update,
+    _block_writes_buffer,
     _choose_num_threads,
     _choose_reduction_step,
+    _collect_input_buffers,
     _find_buffer_index,
     _infer_init_value,
     _infer_reduce_dim,
+    _is_same_buffer_load,
+    _is_square_of_buffer_load,
 )
 
 tir = tvm.tir
 Target = tvm.target.Target
 normalize_prim_func = tvm.dlight.normalize_prim_func
 BlockInfo = tvm.dlight.analysis.BlockInfo
-
-
-def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[tir.Buffer]:
-    buffers: list[tir.Buffer] = []
-
-    def _collect(expr):
-        if (
-            isinstance(expr, tir.BufferLoad)
-            and (not expr.buffer.same_as(write_buffer))
-            and not any(expr.buffer.same_as(buf) for buf in buffers)
-        ):
-            buffers.append(expr.buffer)
-
-    tir.stmt_functor.post_order_visit(rhs, _collect)
-    return buffers
-
-
-def _is_same_buffer_load(
-    lhs: tir.PrimExpr,
-    rhs: tir.PrimExpr,
-    target_buffer: tir.Buffer | None = None,
-) -> bool:
-    if not isinstance(lhs, tir.BufferLoad) or not isinstance(rhs, tir.BufferLoad):
-        return False
-    if not lhs.buffer.same_as(rhs.buffer):
-        return False
-    if target_buffer is not None and not lhs.buffer.same_as(target_buffer):
-        return False
-    if len(lhs.indices) != len(rhs.indices):
-        return False
-    return all(tir.analysis.expr_deep_equal(a, b) for a, b in zip(lhs.indices, rhs.indices))
-
-
-def _is_square_of_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> bool:
-    if not isinstance(expr, tir.Mul):
-        return False
-    return _is_same_buffer_load(expr.a, expr.b, target_buffer)
-
-
-def _block_writes_buffer(block: tir.Block, target_buffer: tir.Buffer) -> bool:
-    return any(write_region.buffer.same_as(target_buffer) for write_region in block.writes)
 
 
 def _schedule_single_source_reduction(
