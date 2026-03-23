@@ -289,6 +289,8 @@ def build_and_run_epilog(B: int, M: int, N: int, arch: str, bench_backend: str, 
     mod = _build_mod_epilog(B, M, N, arch, dtype)
     kernel = tilelang.compile(mod["main"])
 
+    print(kernel.get_kernel_source())
+
     torch_dtype = getattr(torch, dtype)
     rtol, atol = _dtype_tolerance(dtype)
 
