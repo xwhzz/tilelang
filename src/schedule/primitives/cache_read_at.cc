@@ -657,7 +657,7 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
   }
 
   bool use_reducer = !reduce_type.empty();
-  Stmt fill_stmt;
+  PrimExpr reducer_region_arg;
   Stmt finalize_stmt;
   if (use_reducer) {
     ICHECK(reduce_type == "sum")
@@ -666,11 +666,8 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
     ICHECK(reducer_replication == "all" || reducer_replication == "none")
         << "ValueError: unsupported reducer replication `"
         << reducer_replication << "`, expected one of {\"all\", \"none\"}";
-    PrimExpr reducer_region_arg =
+    reducer_region_arg =
         MakeRegionCall(dst, dst_ranges, /*access_mask=*/2);
-    fill_stmt =
-        Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
-                      {reducer_region_arg, make_const(dst->dtype, 0.0)}));
     finalize_stmt =
         Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.finalize_reducer"),
                       {reducer_region_arg}));
@@ -687,12 +684,77 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
     subtrees.Set(i, replacer(std::move(old_stmt)));
   }
 
-  // ---- Step 7: Append the optional write-back copy --------------------------
+  // ---- Step 7: Insert fill/finalize/write-back at correct positions ----------
   if (use_reducer) {
-    subtrees.insert(subtrees.begin(), fill_stmt);
+    // Look for an init subtree (from decompose_reduction) that writes only a
+    // constant to dst.  Replace it in-place with T.fill so the tile pipeline
+    // handles initialization.  If no init block is found, insert T.fill(0) at
+    // the beginning as a fallback.
+    int init_idx = -1;
+    double init_const = 0.0;
+    for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
+      bool has_dst_store = false;
+      bool all_const = true;
+      bool has_dst_load = false;
+      double found_const = 0.0;
+      PostOrderVisit(subtrees[i], [&](const ObjectRef &obj) {
+        if (!all_const) return;
+        if (auto *store = obj.as<BufferStoreNode>()) {
+          if (store->buffer.same_as(dst)) {
+            has_dst_store = true;
+            if (auto *fimm = store->value.as<FloatImmNode>()) {
+              found_const = fimm->value;
+            } else if (auto *iimm = store->value.as<IntImmNode>()) {
+              found_const = static_cast<double>(iimm->value);
+            } else {
+              all_const = false;
+            }
+          }
+        }
+        if (auto *load = obj.as<BufferLoadNode>()) {
+          if (load->buffer.same_as(dst)) {
+            has_dst_load = true;
+          }
+        }
+      });
+      if (has_dst_store && all_const && !has_dst_load) {
+        init_idx = i;
+        init_const = found_const;
+        break;
+      }
+    }
+    if (init_idx >= 0) {
+      subtrees.Set(init_idx,
+          Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
+                        {reducer_region_arg, make_const(dst->dtype, init_const)})));
+    } else {
+      subtrees.insert(subtrees.begin(),
+          Evaluate(Call(DataType::Handle(), Op::Get("tl.tileop.fill"),
+                        {reducer_region_arg, make_const(dst->dtype, 0.0)})));
+    }
   }
   if (use_reducer) {
-    subtrees.push_back(finalize_stmt);
+    // Insert finalize_reducer BEFORE any epilogue subtrees that read from
+    // the cache buffer but do not write to it.  This ensures the AllReduce
+    // completes before the epilogue uses the reduced value.
+    int finalize_pos = static_cast<int>(subtrees.size());
+    for (int i = static_cast<int>(subtrees.size()) - 1; i >= 0; --i) {
+      bool writes_dst = false;
+      PostOrderVisit(subtrees[i], [&writes_dst, &dst](const ObjectRef &obj) {
+        if (writes_dst)
+          return;
+        if (auto *store = obj.as<BufferStoreNode>()) {
+          if (store->buffer.same_as(dst)) {
+            writes_dst = true;
+          }
+        }
+      });
+      if (writes_dst) {
+        finalize_pos = i + 1;
+        break;
+      }
+    }
+    subtrees.insert(subtrees.begin() + finalize_pos, finalize_stmt);
   }
   if (write_back) {
     subtrees.push_back(copy_stmt);
