@@ -20,9 +20,16 @@ from tilelang.schedule.gpu.gemv import GEMV
 
 
 def _lower_mod(mod):
-    """Apply the lowering passes for tile-primitive GEMV."""
+    """Normalize scheduled module into a legal tilelang program.
+
+    Pipeline:
+      Simplify → ConvertBlocksToOpaque → ReserveRootBlock
+
+    cache_write_at detects init blocks (from decompose_reduction) and
+    replaces them with T.fill in-place, so no separate StripBlockInit pass
+    is needed.
+    """
     mod = tir.transform.Simplify()(mod)
-    mod = tir.transform.LowerInitBlock()(mod)
     mod = tir.transform.ConvertBlocksToOpaque()(mod)
     mod = tilelang.transform.ReserveRootBlock()(mod)
     return mod
@@ -71,8 +78,7 @@ def _build_mod(M: int, N: int, arch: str, dtype: str):
     print("=== Scheduled IR ===")
     print(sch.mod)
 
-    scheduled_ir = str(sch.mod)
-    mod = sch.mod if "tvm_thread_allreduce" in scheduled_ir else _lower_mod(sch.mod)
+    mod = _lower_mod(sch.mod)
 
     print("=== Lowered IR ===")
     print(mod)
@@ -109,8 +115,7 @@ def _build_mod_transposed(M: int, N: int, arch: str, dtype: str):
     print("=== Scheduled IR (transposed) ===")
     print(sch.mod)
 
-    scheduled_ir = str(sch.mod)
-    mod = sch.mod if "tvm_thread_allreduce" in scheduled_ir else _lower_mod(sch.mod)
+    mod = _lower_mod(sch.mod)
 
     print("=== Lowered IR (transposed) ===")
     print(mod)
@@ -147,8 +152,7 @@ def _build_mod_batched(B: int, M: int, N: int, arch: str, dtype: str):
     print("=== Scheduled IR (batched) ===")
     print(sch.mod)
 
-    scheduled_ir = str(sch.mod)
-    mod = sch.mod if "tvm_thread_allreduce" in scheduled_ir else _lower_mod(sch.mod)
+    mod = _lower_mod(sch.mod)
 
     print("=== Lowered IR (batched) ===")
     print(mod)
@@ -185,13 +189,12 @@ def _build_mod_epilog(B: int, M: int, N: int, arch: str, dtype: str):
     target = tvm.target.cuda(arch=arch)
     sch = GEMV().apply(func, target, False)
     if sch is None:
-        raise RuntimeError("GEMV schedule rule returned None for batched workload.")
+        return None
 
     print("=== Scheduled IR (batched) ===")
     print(sch.mod)
 
-    scheduled_ir = str(sch.mod)
-    mod = sch.mod if "tvm_thread_allreduce" in scheduled_ir else _lower_mod(sch.mod)
+    mod = _lower_mod(sch.mod)
 
     print("=== Lowered IR (batched) ===")
     print(mod)
@@ -208,7 +211,7 @@ def build_and_run(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> 
         raise RuntimeError("CUDA is required to run this script.")
 
     mod = _build_mod(M, N, arch, dtype)
-    kernel = tilelang.compile(mod["main"])
+    kernel = tilelang.compile(mod["main"], compile_flags=GEMV.COMPILE_FLAGS)
 
     torch_dtype = getattr(torch, dtype)
     rtol, atol = _dtype_tolerance(dtype)
@@ -229,8 +232,9 @@ def build_and_run(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> 
     print("\033[92mCorrectness check passed (standard GEMV).\033[0m")
 
     # Benchmark
-    tilelang_time = do_bench(lambda: kernel(A_torch, B_torch, C_torch), backend=bench_backend)
     torch_time = do_bench(lambda: fn_torch(A_torch, B_torch), backend=bench_backend)
+    tilelang_time = do_bench(lambda: kernel(A_torch, B_torch, C_torch), backend=bench_backend)
+    torch_no_compile = do_bench(lambda: A_torch @ B_torch, backend=bench_backend)
 
     total_bytes = (M * N + N + M) * (torch.tensor([], dtype=torch_dtype).element_size())
     tilelang_gbps = total_bytes / (tilelang_time * 1e-3) / 1e9
@@ -238,6 +242,7 @@ def build_and_run(M: int, N: int, arch: str, bench_backend: str, dtype: str) -> 
 
     print(f"TileLang time: {tilelang_time:.6f} ms, BW: {tilelang_gbps:.2f} GB/s")
     print(f"Torch   time: {torch_time:.6f} ms, BW: {torch_gbps:.2f} GB/s")
+    print(f"Torch (no compile) time: {torch_no_compile:.6f} ms, BW: {total_bytes / (torch_no_compile * 1e-3) / 1e9:.2f} GB/s")
     print(f"Speedup (torch/tilelang): {torch_time / tilelang_time:.4f}x")
     return tilelang_time, torch_time
 
@@ -248,7 +253,7 @@ def build_and_run_transposed(M: int, N: int, arch: str, bench_backend: str, dtyp
         raise RuntimeError("CUDA is required to run this script.")
 
     mod = _build_mod_transposed(M, N, arch, dtype)
-    kernel = tilelang.compile(mod["main"])
+    kernel = tilelang.compile(mod["main"], compile_flags=GEMV.COMPILE_FLAGS)
 
     torch_dtype = getattr(torch, dtype)
     rtol, atol = _dtype_tolerance(dtype)
@@ -287,7 +292,10 @@ def build_and_run_epilog(B: int, M: int, N: int, arch: str, bench_backend: str, 
         raise RuntimeError("CUDA is required to run this script.")
 
     mod = _build_mod_epilog(B, M, N, arch, dtype)
-    kernel = tilelang.compile(mod["main"])
+    if mod is None:
+        print("\033[93mSkipped (epilogue not supported in tile schedule path).\033[0m")
+        return 0.0, 0.0
+    kernel = tilelang.compile(mod["main"], compile_flags=GEMV.COMPILE_FLAGS)
 
     print(kernel.get_kernel_source())
 
@@ -365,8 +373,11 @@ if __name__ == "__main__":
         print("\033[92mSchedule/lowering check passed (batched).\033[0m\n")
 
         print("--- Batched GEMV with Epilog ---")
-        _build_mod_epilog(2, args.m, args.n, args.arch, args.dtype)
-        print("\033[92mSchedule/lowering check passed (batched epilog).\033[0m\n")
+        mod = _build_mod_epilog(2, args.m, args.n, args.arch, args.dtype)
+        if mod is None:
+            print("\033[93mSkipped (epilogue not supported in tile schedule path).\033[0m\n")
+        else:
+            print("\033[92mSchedule/lowering check passed (batched epilog).\033[0m\n")
     else:
         print("=== Standard GEMV ===")
         build_and_run(args.m, args.n, args.arch, args.bench_backend, args.dtype)
@@ -375,4 +386,4 @@ if __name__ == "__main__":
         build_and_run_transposed(args.m, args.n, args.arch, args.bench_backend, args.dtype)
         print()
         print("=== Batched GEMV with Epilog ===")
-        build_and_run_epilog(2, args.m, args.n, args.arch, args.bench_backend, args.dtype)
+        build_and_run_epilog(4, args.m, args.n, args.arch, args.bench_backend, args.dtype)

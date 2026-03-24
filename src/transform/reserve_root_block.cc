@@ -25,6 +25,7 @@
 #include <tvm/tir/stmt_functor.h>
 #include <tvm/tir/transform.h>
 
+#include "layout_reducer.h"
 #include "tir/transforms/ir_utils.h"
 
 namespace tvm {
@@ -77,6 +78,10 @@ private:
       p_block->alloc_buffers = ffi::Array<Buffer>(allocated_buffers_.begin(),
                                                   allocated_buffers_.end());
       p_block->body = std::move(body);
+      // Merge preserved block annotations (e.g. reducer_info) into root block.
+      for (const auto &kv : root_annotations_) {
+        p_block->annotations.Set(kv.first, kv.second);
+      }
       Stmt block_realize = BlockRealize(
           ffi::Array<PrimExpr>(), std::move(predicate), std::move(new_block));
 
@@ -208,6 +213,9 @@ private:
       } else if (!is_block) {
         // the loop annotation is preserved
         preserved_annotations.Set(key, kv.second);
+      } else if (key == attr::kReducerInfo) {
+        // Preserve reducer_info so LayoutReducer can find it on the root block.
+        root_annotations_.Set(key, kv.second);
       }
     }
     std::sort(
@@ -228,6 +236,9 @@ private:
 
   std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> allocated_buffers_;
 
+  /*! \brief Block annotations (e.g. reducer_info) to propagate to the root block. */
+  ffi::Map<ffi::String, ffi::Any> root_annotations_;
+
   std::vector<std::tuple<PrimExpr, PrimExpr, Var, ffi::String>>
       thread_bindings_;
   int block_level_ = 0;
@@ -240,6 +251,33 @@ PrimFunc ReserveRootBlock(PrimFunc f) {
 }
 using namespace tir::transform;
 
+/*! \brief Strip T.init() from all blocks.
+ *
+ * When cache_write_at(reduce_type="sum") adds T.fill for accumulator
+ * initialization, any T.init() on the original TE block is redundant.
+ * decompose_reduction lifts T.init() into a standalone init block, but that
+ * block is still present in the IR.  This pass simply removes T.init() from
+ * every block so that (a) the redundant init statement disappears and
+ * (b) ConvertBlocksToOpaque (which requires init==nullptr) succeeds.
+ */
+class BlockInitStripper : public StmtExprMutator {
+public:
+  Stmt VisitStmt_(const BlockNode *op) final {
+    Block new_block = Downcast<Block>(StmtExprMutator::VisitStmt_(op));
+    if (new_block->init.defined()) {
+      auto ptr = new_block.CopyOnWrite();
+      ptr->init = std::nullopt;
+    }
+    return std::move(new_block);
+  }
+};
+
+static PrimFunc StripBlockInit(PrimFunc f) {
+  auto fptr = f.CopyOnWrite();
+  fptr->body = BlockInitStripper()(std::move(fptr->body));
+  return f;
+}
+
 namespace transform {
 Pass ReserveRootBlock() {
   auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
@@ -248,9 +286,17 @@ Pass ReserveRootBlock() {
   return CreatePrimFuncPass(pass_func, 0, "tl.ReserveRootBlock", {});
 }
 
+Pass StripBlockInit() {
+  auto pass_func = [=](PrimFunc f, IRModule m, PassContext ctx) {
+    return ::tvm::tl::StripBlockInit(std::move(f));
+  };
+  return CreatePrimFuncPass(pass_func, 0, "tl.StripBlockInit", {});
+}
+
 TVM_FFI_STATIC_INIT_BLOCK() {
   namespace refl = tvm::ffi::reflection;
   refl::GlobalDef().def("tl.transform.ReserveRootBlock", ReserveRootBlock);
+  refl::GlobalDef().def("tl.transform.StripBlockInit", StripBlockInit);
 }
 } // namespace transform
 

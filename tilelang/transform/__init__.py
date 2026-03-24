@@ -567,3 +567,13 @@ def LowerLDGSTG():
 def ReserveRootBlock():
     """ReserveRootBlock"""
     return _ffi_api.ReserveRootBlock()  # type: ignore
+
+
+def StripBlockInit():
+    """Remove T.init() from all blocks.
+
+    Use before ConvertBlocksToOpaque when cache_write_at(reduce_type=...)
+    already adds T.fill for accumulator initialization, making T.init()
+    redundant.
+    """
+    return _ffi_api.StripBlockInit()  # type: ignore
