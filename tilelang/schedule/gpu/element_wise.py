@@ -214,6 +214,9 @@ class ElementWise(GPUScheduleRule):
             for read_buffer_index, region in enumerate(block_stmt.reads):
                 if any(region.buffer.same_as(write_buffer) for write_buffer in write_buffers):
                     continue
+                # Skip 0-dim (scalar) buffers — cache_read_at requires ≥1-D.
+                if len(region.buffer.shape) == 0:
+                    continue
                 block = sch.get_block(block_name)
                 sch.cache_read_at(bx, block, read_buffer_index, "local.fragment")
 
