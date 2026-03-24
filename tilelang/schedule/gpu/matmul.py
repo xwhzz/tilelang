@@ -254,6 +254,23 @@ class Matmul(GPUScheduleRule):
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
+        # First attempt: try with reverse_compute_inline for the last
+        # epilogue.  This avoids an extra shared-memory staging step for
+        # simple epilogues (cast, relu, …).  However, the inlined epilogue
+        # may break pad_einsum (e.g. Cast ops from bf16/fp16 legalization
+        # produce non-trivial buffer indices that pad_einsum rejects).
+        # In that case we retry without reverse_compute_inline.
+        result = self._apply_impl(func, target, try_reverse_inline=True)
+        if result is not None:
+            return result
+        return self._apply_impl(func, target, try_reverse_inline=False)
+
+    def _apply_impl(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        try_reverse_inline: bool = True,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         try:
             sch = TileSchedule(func)
             chain = _analyze_original_chain(sch)
@@ -269,8 +286,6 @@ class Matmul(GPUScheduleRule):
             if sch is None:
                 return None
 
-            main_block = sch.get_block(main_name)
-            auto_inline_producers(sch, main_block)
             main_block = sch.get_block(main_name)
             block_stmt = sch.get(main_block)
             loops = sch.get_loops(main_block)
@@ -289,7 +304,7 @@ class Matmul(GPUScheduleRule):
             # reverse_compute_inline so the epilogue computation (cast,
             # relu, etc.) lives in the output block and can be applied
             # directly on the fragment accumulator without shared staging.
-            if epilogue_names:
+            if try_reverse_inline and epilogue_names:
                 last_name = epilogue_names[-1]
                 if _has_block(sch, last_name):
                     try:
@@ -298,10 +313,16 @@ class Matmul(GPUScheduleRule):
                     except Exception:  # pylint: disable=broad-except
                         pass
 
+            # pad_einsum before inlining reindex producers — the main block
+            # reads from reindex buffers with simple Var indices so
+            # CheckTrivialBufferAccess succeeds.  Inlining afterwards is
+            # safe because pad_einsum has already been applied.
             sch.pad_einsum(
                 main_block,
                 [1, config.block_m, config.block_n, config.block_k],
             )
+            main_block = sch.get_block(main_name)
+            auto_inline_producers(sch, main_block)
             main_block = sch.get_block(main_name)
             post_chain = _collect_injective_consumer_chain(sch, main_block)
             if not post_chain:

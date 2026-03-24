@@ -12,6 +12,7 @@ from typing import (
     Any,
     Callable,
     Generic,
+    TYPE_CHECKING,
     TypeVar,
     overload,
     Literal,
@@ -43,9 +44,21 @@ _KP = ParamSpec("_KP")
 _T = TypeVar("_T")
 _Ret = TypeVar("_Ret")
 
+if TYPE_CHECKING:
+    from tilelang.jit.graph import GraphRunner
+
+
+GraphMode = Literal["kernel", "graph"]
+
+
+def _graph_arch_from_target(target: str | Target | None) -> str | None:
+    if isinstance(target, str) and target.startswith("sm_"):
+        return target
+    return None
+
 
 def compile(
-    func: PrimFunc[_KP, _T] = None,
+    func: PrimFunc[_KP, _T] | Callable[..., Any] = None,
     out_idx: list[int] | int | None = None,
     execution_backend: Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"] | None = None,
     target: str | Target | None = None,
@@ -53,14 +66,20 @@ def compile(
     verbose: bool | None = None,
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
-) -> JITKernel[_KP, _T]:
+    mode: GraphMode = "kernel",
+    example_args: tuple[Any, ...] | None = None,
+    custom_kernels: dict[str, PrimFunc] | None = None,
+    cuda_graph: bool = False,
+    native: bool = False,
+) -> JITKernel[_KP, _T] | GraphRunner:
     """
-    Compile the given TileLang PrimFunc with TVM and build a JITKernel.
+    Compile either a TileLang PrimFunc or a graph-mode PyTorch function.
 
     Parameters
     ----------
-    func : tvm.tir.PrimFunc, optional
-        The TileLang TIR function to compile and wrap.
+    func : tvm.tir.PrimFunc or Callable, optional
+        The TileLang TIR function to compile and wrap, or a PyTorch function
+        to trace when ``mode="graph"``.
     out_idx : Union[List[int], int], optional
         Index(es) of the output tensors to return (default: None).
     execution_backend : Literal["auto", "dlpack", "tvm_ffi", "cython", "nvrtc", "torch", "cutedsl"], optional
@@ -68,7 +87,8 @@ def compile(
         TILELANG_EXECUTION_BACKEND environment variable (defaults to "auto").
     target : Union[str, Target], optional
         Compilation target, either as a string or a TVM Target object. If None, reads from
-        TILELANG_TARGET environment variable (defaults to "auto").
+        TILELANG_TARGET environment variable (defaults to "auto"). In graph
+        mode, a string like ``"sm_90a"`` overrides CUDA arch auto-detection.
     target_host : Union[str, Target], optional
         Target host for cross-compilation (default: None).
     verbose : bool, optional
@@ -77,6 +97,21 @@ def compile(
     pass_configs : dict, optional
         Additional keyword arguments to pass to the Compiler PassContext.
         Refer to `tilelang.transform.PassConfigKey` for supported options.
+    mode : {"kernel", "graph"}
+        Compilation mode. ``"kernel"`` compiles a TileLang ``PrimFunc`` into a
+        ``JITKernel``. ``"graph"`` traces and compiles a plain PyTorch function
+        into a ``GraphRunner``.
+    example_args : tuple[Any, ...], optional
+        Example tensor inputs used to trace a PyTorch function when
+        ``mode="graph"``.
+    custom_kernels : dict[str, PrimFunc], optional
+        Optional fused-op overrides for ``mode="graph"``.
+    cuda_graph : bool, optional
+        When True (and ``mode="graph"``), enable CUDA graph capture on the
+        returned ``GraphRunner``.
+    native : bool, optional
+        When True (and ``mode="graph"``), enable native dispatch on the
+        returned ``GraphRunner``.
 
     Environment Variables
     ---------------------
@@ -87,6 +122,41 @@ def compile(
     TILELANG_VERBOSE : str
         Set to "1", "true", "yes", or "on" to enable verbose compilation by default.
     """
+
+    if mode == "graph":
+        from tilelang.jit.graph import GraphJITImpl
+
+        if not callable(func):
+            raise TypeError(f"graph mode expects a callable PyTorch function but got {type(func)}")
+        if example_args is None:
+            raise ValueError("example_args must be provided when mode='graph'")
+        if out_idx is not None:
+            raise ValueError("out_idx is not supported when mode='graph'")
+        if execution_backend is not None:
+            raise ValueError("execution_backend is not supported when mode='graph'")
+        if target_host is not None:
+            raise ValueError("target_host is not supported when mode='graph'")
+        if verbose is not None:
+            raise ValueError("verbose is not supported when mode='graph'")
+
+        return GraphJITImpl(
+            func,
+            arch=_graph_arch_from_target(target),
+            custom_kernels=custom_kernels,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+            cuda_graph=cuda_graph,
+            native=native,
+        ).compile(*example_args)
+
+    if example_args is not None:
+        raise ValueError("example_args is only supported when mode='graph'")
+    if custom_kernels is not None:
+        raise ValueError("custom_kernels is only supported when mode='graph'")
+    if cuda_graph:
+        raise ValueError("cuda_graph is only supported when mode='graph'")
+    if native:
+        raise ValueError("native is only supported when mode='graph'")
 
     assert isinstance(func, PrimFunc), f"target function must be a PrimFunc but got {type(func)}"
 
@@ -466,6 +536,10 @@ def jit(
     pass_configs: dict[str, Any] | None = None,
     debug_root_path: str | None = None,
     compile_flags: list[str] | str | None = None,
+    mode: Literal["auto", "lazy", "eager", "graph"] = "auto",
+    custom_kernels: dict[str, Any] | None = None,
+    cuda_graph: bool = False,
+    native: bool = False,
 ) -> Callable[[Callable[_KP, _T]], JITImpl[_KP, _KP, _T, _T]]: ...
 
 
@@ -480,13 +554,21 @@ def jit(
     pass_configs: dict[str, Any] | None = None,
     debug_root_path: str | None = None,
     compile_flags: list[str] | str | None = None,
+    mode: Literal["auto", "lazy", "eager", "graph"] = "auto",
+    custom_kernels: dict[str, Any] | None = None,
+    cuda_graph: bool = False,
+    native: bool = False,
 ) -> Callable[[Callable[_P, _T]], JITImpl[_KP, _KP, _T, _T]]:
     """
     JIT compiler decorator for TileLang functions.
 
-    Supports two execution modes (automatically inferred):
+    Supports three execution modes:
+
     - **lazy**: Function returns PrimFunc explicitly. Returns compiled kernel object.
     - **eager**: Function uses DSL builder pattern. Executes kernel immediately.
+    - **graph**: Function is a plain PyTorch function. Traces the computation graph,
+      schedules each kernel with TileLang schedule rules, compiles each kernel via
+      ``tilelang.compile``, and returns a pre-allocated graph runner.
 
     Parameters
     ----------
@@ -506,7 +588,45 @@ def jit(
         Directory to save compiled kernel source for debugging.
     compile_flags : list[str] | str | None
         Additional compiler flags.
+    mode : {"auto", "lazy", "eager", "graph"}
+        Execution mode. ``"graph"`` traces a PyTorch function end-to-end and
+        compiles every kernel through TileLang.
+    custom_kernels : dict[str, PrimFunc] | None
+        Map from fused-op name (substring match) to a user-provided TileLang
+        PrimFunc. Only used when ``mode="graph"``.
+    cuda_graph : bool
+        When True (and ``mode="graph"``), capture the kernel sequence as a
+        ``torch.cuda.CUDAGraph`` on the first call for near-zero replay
+        overhead (~1 μs). Input shapes must remain fixed after capture.
+    native : bool
+        When True (and ``mode="graph"``), build a compiled C dispatch
+        function that sequences kernel calls without Python loop overhead.
     """
+
+    # ---- graph mode: delegate to GraphJITImpl ----
+    if mode == "graph":
+        from tilelang.jit.graph import GraphJITImpl
+
+        def graph_decorator(inner):
+            return GraphJITImpl(
+                inner,
+                arch=_graph_arch_from_target(target),
+                custom_kernels=custom_kernels,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+                cuda_graph=cuda_graph,
+                native=native,
+            )
+
+        return graph_decorator(func) if func is not None else graph_decorator
+
+    # ---- existing lazy / eager modes: reject graph-only params ----
+    if custom_kernels is not None:
+        raise ValueError("custom_kernels is only supported when mode='graph'")
+    if cuda_graph:
+        raise ValueError("cuda_graph is only supported when mode='graph'")
+    if native:
+        raise ValueError("native is only supported when mode='graph'")
 
     compile_args = dict(
         out_idx=out_idx,
@@ -520,7 +640,6 @@ def jit(
     )
 
     def decorator(func: Callable[_P, _T]):
-        mode = "auto"
         pf: JITFunc[_P, _T] = prim_func(func, eager_jit=True)
         func_source = inspect.getsource(pf.orig_func)
         signature = inspect.signature(pf.orig_func)

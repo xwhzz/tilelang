@@ -134,6 +134,38 @@ def PreLowerSemanticCheck(mod: IRModule) -> None:
     tilelang.analysis.FragmentLoopChecker()(mod)
 
 
+def NormalizeScheduledIR(mod: IRModule) -> IRModule:
+    """Normalize scheduled TIR into legal input for LowerAndLegalize.
+
+    Schedule rules produce IR with For(kThreadBinding) loops (from
+    launch_thread / sch.bind) and possibly residual T.init() blocks.
+    LowerAndLegalize (specifically LayoutReducer) requires
+    AttrStmt(thread_extent) and opaque blocks.
+
+    This function bridges the gap:
+      Simplify -> ForceNarrowIndexToInt32 -> LowerInitBlock
+      -> ConvertBlocksToOpaque -> ReserveRootBlock
+
+    ForceNarrowIndexToInt32 is needed because Relax produces TIR with
+    int64 indices/shapes, but the layout system (Fragment/Layout) and
+    LayoutReducer expect int32 expressions.
+
+    LowerInitBlock (not StripBlockInit) is used because the dlight Matmul
+    rule produces standard T.init() blocks for accumulator initialization.
+    LowerInitBlock decomposes them into standalone blocks; for TileLang
+    rules that use T.fill instead, this is a no-op.
+
+    Safe for all functions: TileLang-scheduled (GEMV, Reduction,
+    ElementWise, Matmul) and standard TVM-scheduled (Fallback).
+    """
+    mod = tir.transform.Simplify()(mod)
+    mod = tir.transform.ForceNarrowIndexToInt32()(mod)
+    mod = tir.transform.LowerInitBlock()(mod)
+    mod = tir.transform.ConvertBlocksToOpaque()(mod)
+    mod = tilelang.transform.ReserveRootBlock()(mod)
+    return mod
+
+
 def LowerAndLegalize(mod: IRModule, target: Target) -> IRModule:
     # Bind the target device information to the module
     """

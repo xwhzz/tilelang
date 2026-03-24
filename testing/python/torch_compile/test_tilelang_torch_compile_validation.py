@@ -1,17 +1,17 @@
 import pytest
 import torch
 
+import tilelang
 import tilelang.testing
-from tilelang.torch_compile import torch_compile
 
 
-@torch_compile(executor="jit")
+@tilelang.jit(mode="graph")
 def add_one(x: torch.Tensor) -> torch.Tensor:
     return x + 1
 
 
 @tilelang.testing.requires_cuda
-def test_torch_compile_rejects_noncontiguous_inputs_before_compile():
+def test_graph_jit_rejects_noncontiguous_inputs_before_compile():
     x = torch.randn((8, 16), device="cuda", dtype=torch.float32).transpose(0, 1)
 
     with pytest.raises(ValueError, match="contiguous CUDA tensors"):
@@ -19,7 +19,7 @@ def test_torch_compile_rejects_noncontiguous_inputs_before_compile():
 
 
 @tilelang.testing.requires_cuda
-def test_compiled_torch_runner_rejects_noncontiguous_inputs():
+def test_graph_runner_rejects_noncontiguous_inputs():
     compiled = add_one.compile(torch.randn((16, 8), device="cuda", dtype=torch.float32))
     x = torch.randn((8, 16), device="cuda", dtype=torch.float32).transpose(0, 1)
 
