@@ -174,7 +174,6 @@ if not env.is_light_import():
     from .engine import lower, register_cuda_postproc, register_hip_postproc, register_c_postproc  # noqa: F401
     from .math import *  # noqa: F403
     from . import ir  # noqa: F401
-    from . import relax  # noqa: F401
     from . import tileop  # noqa: F401
 
 del _lazy_load_lib

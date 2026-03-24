@@ -1,4 +1,4 @@
-"""End-to-end MLP example using tilelang.torch_compile (VM first, JIT fallback)."""
+"""End-to-end MLP example using tilelang.jit(mode="graph")."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ import argparse
 import torch
 import torch.nn.functional as F
 
+import tilelang
 from tilelang.profiler import do_bench
-from tilelang.torch_compile import torch_compile
 
 
 def _dtype_tolerance(dtype: str, accum_dtype: str) -> tuple[float, float]:
@@ -39,15 +39,15 @@ def _build_reference(dtype: str, accum_dtype: str):
 
 def _build_compiled_mlp(
     arch: str | None,
-    executor: str,
-    dump_vm_code: bool,
     dtype: str,
     accum_dtype: str,
+    cuda_graph: bool = False,
+    native: bool = False,
 ):
     torch_dtype = getattr(torch, dtype)
     torch_accum_dtype = getattr(torch, accum_dtype)
 
-    @torch_compile(arch=arch, executor=executor, dump_vm_code=dump_vm_code)
+    @tilelang.jit(mode="graph", arch=arch, cuda_graph=cuda_graph, native=native)
     def mlp(x: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor) -> torch.Tensor:
         if torch_accum_dtype != torch_dtype:
             x_acc = x.to(torch_dtype)
@@ -63,7 +63,7 @@ def _build_compiled_mlp(
     return mlp
 
 
-def check_only(dim: int, arch: str | None, dtype: str, accum_dtype: str, executor: str, dump_vm_code: bool) -> None:
+def check_only(dim: int, arch: str | None, dtype: str, accum_dtype: str) -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
 
@@ -73,14 +73,11 @@ def check_only(dim: int, arch: str | None, dtype: str, accum_dtype: str, executo
     w1 = torch.randn((dim, dim), device="cuda", dtype=torch_dtype)
     w2 = torch.randn((dim, dim), device="cuda", dtype=torch_dtype)
 
-    mlp = _build_compiled_mlp(arch, executor, dump_vm_code, dtype, accum_dtype)
+    mlp = _build_compiled_mlp(arch, dtype, accum_dtype)
     runner = mlp.compile(x, w1, w2)
 
     print("=== Scheduled Relax Module ===")
     print(runner.scheduled_mod.script())
-    for call in runner.call_sequence:
-        print(f"=== Scheduled TIR ({call.gv_name}) ===")
-        print(runner.scheduled_mod[call.gv_name].script())
 
 
 def build_and_run(
@@ -89,8 +86,8 @@ def build_and_run(
     dtype: str,
     accum_dtype: str,
     bench_backend: str,
-    executor: str,
-    dump_vm_code: bool,
+    cuda_graph: bool,
+    native: bool,
 ) -> tuple[float, float]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required to run this script.")
@@ -101,7 +98,7 @@ def build_and_run(
     w1 = torch.randn((dim, dim), device="cuda", dtype=torch_dtype)
     w2 = torch.randn((dim, dim), device="cuda", dtype=torch_dtype)
 
-    mlp = _build_compiled_mlp(arch, executor, dump_vm_code, dtype, accum_dtype)
+    mlp = _build_compiled_mlp(arch, dtype, accum_dtype, cuda_graph=cuda_graph, native=native)
     runner = mlp.compile(x, w1, w2)
     tilelang_out = runner(x, w1, w2)
 
@@ -110,19 +107,16 @@ def build_and_run(
 
     rtol, atol = _dtype_tolerance(dtype, accum_dtype)
     torch.testing.assert_close(tilelang_out, ref_out, rtol=rtol, atol=atol)
-    print(f"\033[92mCorrectness check passed ({runner.active_executor}).\033[0m")
+    print("\033[92mCorrectness check passed.\033[0m")
 
-    if runner.active_executor == "vm":
-        tilelang_time = do_bench(lambda: runner(x, w1, w2), backend=bench_backend)
-    else:
-        tilelang_time = do_bench(lambda: runner(x, w1, w2), backend=bench_backend)
+    tilelang_time = do_bench(lambda: runner(x, w1, w2), backend=bench_backend)
     torch_time = do_bench(lambda: ref_fn(x, w1, w2), backend=bench_backend)
-    print(f"tilelang.torch_compile time: {tilelang_time:.6f} ms ({runner.active_executor}), torch.compile time: {torch_time:.6f} ms")
+    print(f"tilelang.jit(mode='graph') time: {tilelang_time:.6f} ms, torch.compile time: {torch_time:.6f} ms")
     return tilelang_time, torch_time
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="tilelang.torch_compile MLP example.")
+    parser = argparse.ArgumentParser(description="tilelang.jit(mode='graph') MLP example.")
     parser.add_argument("--arch", type=str, default=None, help='CUDA arch string, e.g. "sm_90a".')
     parser.add_argument("--dim", type=int, default=4096, help="Hidden/input/output size.")
     parser.add_argument(
@@ -140,18 +134,8 @@ def parse_args() -> argparse.Namespace:
         help="Internal matmul accumulation / output dtype in the graph.",
     )
     parser.add_argument("--bench-backend", type=str, default="event", choices=["event", "cuda"])
-    parser.add_argument(
-        "--executor",
-        type=str,
-        default="auto",
-        choices=["auto", "vm", "jit"],
-        help="Execution path: Relax VM, JIT fallback, or auto-select (VM first).",
-    )
-    parser.add_argument(
-        "--dump-vm-code",
-        action="store_true",
-        help="Dump VM text/python plus generated host/device source from VM build.",
-    )
+    parser.add_argument("--cuda-graph", action="store_true", help="Enable CUDA graph capture.")
+    parser.add_argument("--native", action="store_true", help="Enable C++ native dispatch.")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -163,7 +147,7 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     if args.check_only:
-        check_only(args.dim, args.arch, args.dtype, args.accum_dtype, args.executor, args.dump_vm_code)
+        check_only(args.dim, args.arch, args.dtype, args.accum_dtype)
         print("\033[92mCompilation check passed.\033[0m")
     else:
         build_and_run(
@@ -172,12 +156,14 @@ if __name__ == "__main__":
             args.dtype,
             args.accum_dtype,
             args.bench_backend,
-            args.executor,
-            args.dump_vm_code,
+            args.cuda_graph,
+            args.native,
         )
 
 
 """
 Usage:
-python tests/end2end/example_mlp.py --dim 4096 --dtype float16 --accum-dtype float32 --executor jit --arch sm_90a --bench-backend event
+python tests/end2end/example_mlp.py --dim 4096 --dtype float16 --accum-dtype float32 --arch sm_90a
+python tests/end2end/example_mlp.py --dim 4096 --dtype float16 --accum-dtype float32 --arch sm_90a --cuda-graph
+python tests/end2end/example_mlp.py --dim 4096 --dtype float16 --accum-dtype float32 --arch sm_90a --native
 """
