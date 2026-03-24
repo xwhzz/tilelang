@@ -71,6 +71,7 @@ def compile(
     custom_kernels: dict[str, PrimFunc] | None = None,
     cuda_graph: bool = False,
     native: bool = False,
+    dynamic_dims: dict[int, list[int]] | None = None,
 ) -> JITKernel[_KP, _T] | GraphRunner:
     """
     Compile either a TileLang PrimFunc or a graph-mode PyTorch function.
@@ -147,6 +148,7 @@ def compile(
             compile_flags=compile_flags,
             cuda_graph=cuda_graph,
             native=native,
+            dynamic_dims=dynamic_dims,
         ).compile(*example_args)
 
     if example_args is not None:
@@ -583,6 +585,7 @@ def jit(
     custom_kernels: dict[str, Any] | None = None,
     cuda_graph: bool = False,
     native: bool = False,
+    dynamic_dims: dict[int, list[int]] | None = None,
 ) -> Callable[[Callable[_P, _T]], JITImpl[_KP, _KP, _T, _T]]:
     """
     JIT compiler decorator for TileLang functions.
@@ -641,6 +644,7 @@ def jit(
                 compile_flags=compile_flags,
                 cuda_graph=cuda_graph,
                 native=native,
+                dynamic_dims=dynamic_dims,
             )
 
         return graph_decorator(func) if func is not None else graph_decorator

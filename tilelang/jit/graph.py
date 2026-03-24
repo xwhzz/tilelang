@@ -17,6 +17,7 @@ Usage::
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -26,12 +27,14 @@ from torch.export import export
 from torch.nn import Module
 from tvm import relax, tir
 from tvm.ir import GlobalVar
-from tvm.relax.frontend.torch import from_exported_program
+from tvm.relax.frontend.torch import from_exported_program, from_fx
 from tvm.tir import PrimFunc
 
 import tilelang
 from tilelang import tvm
 from tilelang.schedule.gpu import default_schedule_rules
+
+logger = logging.getLogger(__name__)
 
 # TVM op pattern constant: prevents FuseOps from fusing this function.
 _OP_PATTERN_OPAQUE = 8
@@ -155,14 +158,58 @@ def _build_custom_op_convert_map(
     return convert_map, torch_op_map
 
 
+def _build_dynamic_shapes_spec(
+    example_args: tuple[torch.Tensor, ...],
+    dynamic_dims: dict[int, list[int]] | None,
+) -> dict[str, Any] | None:
+    """Convert ``dynamic_dims`` to ``torch.export.Dim`` specifications.
+
+    Parameters
+    ----------
+    example_args : tuple of Tensor
+        Example inputs whose shapes seed the min/max hints.
+    dynamic_dims : dict mapping arg index → list of dynamic dimension indices,
+        or ``None`` for fully static export.
+
+    Returns
+    -------
+    dynamic_shapes : dict | None
+        A dict suitable for ``torch.export.export(dynamic_shapes=...)``,
+        or ``None`` to fall back to all-static export.
+    """
+    if not dynamic_dims:
+        return None
+
+    from torch.export import Dim
+
+    # Use Dim.AUTO for each marked dimension — torch.export automatically
+    # determines equality constraints from the traced computation.
+    per_arg: list[dict[int, Any] | None] = [None] * len(example_args)
+    for arg_idx, dim_indices in dynamic_dims.items():
+        if arg_idx < 0 or arg_idx >= len(example_args):
+            raise ValueError(
+                f"dynamic_dims references arg#{arg_idx} but only "
+                f"{len(example_args)} inputs were given."
+            )
+        per_arg[arg_idx] = {d: Dim.AUTO for d in dim_indices}
+
+    per_arg_final = tuple(spec if spec is not None else {} for spec in per_arg)
+    return {"args": per_arg_final}
+
+
 def _build_relax_module(
     func: Callable[..., torch.Tensor],
     example_args: tuple[torch.Tensor, ...],
+    dynamic_dims: dict[int, list[int]] | None = None,
 ) -> tuple[tvm.IRModule, dict[str, Any]]:
     """Trace and convert a PyTorch function to Relax IR.
 
     Returns ``(mod, torch_op_map)`` where *torch_op_map* maps Relax GV
     names to original torch callables for user-registered custom ops.
+
+    If the function contains data-dependent control flow (``if tensor:``,
+    ``while tensor:``), ``torch.export`` will raise an error.  The caller
+    should catch this and fall back to the dynamo-based compilation path.
     """
     class _WrappedModule(Module):
         def __init__(self, inner: Callable[..., torch.Tensor]):
@@ -173,7 +220,11 @@ def _build_relax_module(
             return self.inner(*args)
 
     wrapped = _WrappedModule(func)
-    exported_program = export(wrapped, args=example_args, dynamic_shapes={})
+    ds_spec = _build_dynamic_shapes_spec(example_args, dynamic_dims)
+    exported_program = export(
+        wrapped, args=example_args,
+        dynamic_shapes=ds_spec if ds_spec is not None else {},
+    )
 
     # Auto-detect user-registered custom ops and generate converters.
     detected_custom_ops = _scan_custom_ops(exported_program)
@@ -231,8 +282,6 @@ def _extract_call_sequence(main_func: relax.Function) -> tuple[CallRecord, ...]:
             arg_names.append(arg.name_hint)
         calls.append(CallRecord(binding.var.name_hint, callee.name_hint, tuple(arg_names)))
 
-    if not calls:
-        raise RuntimeError("No call_tir kernels were found in the scheduled Relax graph.")
     return tuple(calls)
 
 
@@ -245,6 +294,56 @@ def _extract_input_names(main_func: relax.Function) -> tuple[str, ...]:
     return tuple(names)
 
 
+def _compile_kernels(
+    mod: tvm.IRModule,
+    calls: tuple[CallRecord, ...],
+    pass_configs: dict[str, Any] | None = None,
+    compile_flags: list[str] | str | None = None,
+    out_idx: list[int] | None = None,
+    torch_op_map: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Compile all kernels in *calls* from the scheduled Relax module.
+
+    Shared logic between ``_compile_graph`` (export path) and
+    ``_compile_subgraph`` (dynamo path).
+    """
+    compile_kwargs: dict[str, Any] = {}
+    if pass_configs:
+        compile_kwargs["pass_configs"] = pass_configs
+    if compile_flags:
+        compile_kwargs["compile_flags"] = compile_flags
+    if out_idx is not None:
+        compile_kwargs["out_idx"] = out_idx
+
+    kernels: dict[str, Any] = {}
+    for call in calls:
+        tir_func = mod[call.gv_name]
+        is_torch_op = (
+            isinstance(tir_func, tir.PrimFunc)
+            and tir_func.attrs
+            and tir_func.attrs.get("torch_op")
+        )
+        if is_torch_op:
+            if torch_op_map is None:
+                raise RuntimeError(
+                    f"torch_op attribute set on '{call.gv_name}' but no "
+                    f"torch_op_map was provided."
+                )
+            torch_callable = torch_op_map.get(call.gv_name)
+            if torch_callable is None:
+                raise RuntimeError(
+                    f"torch_op attribute set on '{call.gv_name}' but no "
+                    f"matching entry in torch_op_map."
+                )
+            kernels[call.gv_name] = _TorchOpWrapper(
+                torch_callable, dynamic=(out_idx is not None),
+            )
+        else:
+            prepared = _lower_primfunc_for_tilelang(tir_func, call.gv_name)
+            kernels[call.gv_name] = tilelang.compile(prepared, **compile_kwargs)
+    return kernels
+
+
 def _lower_primfunc_for_tilelang(func: tir.PrimFunc, name: str) -> tir.PrimFunc:
     func = func.with_attr("global_symbol", name)
     if "tvm_thread_allreduce" in func.script():
@@ -255,34 +354,63 @@ def _lower_primfunc_for_tilelang(func: tir.PrimFunc, name: str) -> tir.PrimFunc:
     return mod[name]
 
 
-def _output_buffer_info(func: tir.PrimFunc) -> tuple[tuple[int, ...], str]:
+def _output_buffer_info(
+    func: tir.PrimFunc,
+) -> tuple[tuple[int | tir.Var, ...], str, bool]:
+    """Extract output buffer shape, dtype, and whether shape is dynamic.
+
+    Returns ``(shape, dtype, is_dynamic)`` where *shape* may contain
+    ``tir.Var`` entries for symbolic dimensions.
+    """
     output_buffer = func.buffer_map[list(func.params)[-1]]
-    return tuple(int(extent) for extent in output_buffer.shape), output_buffer.dtype
+    shape: list[int | tir.Var] = []
+    is_dynamic = False
+    for extent in output_buffer.shape:
+        if isinstance(extent, tir.IntImm):
+            shape.append(int(extent.value))
+        else:
+            shape.append(extent)
+            is_dynamic = True
+    return tuple(shape), str(output_buffer.dtype), is_dynamic
 
 
 def _validate_tensor_args(args: tuple[Any, ...]) -> tuple[torch.Tensor, ...]:
+    """Validate that all arguments are contiguous CUDA tensors.
+
+    Non-tensor arguments (bool, int, float, etc.) are silently skipped
+    so that mixed-type calls work with the dynamo fallback path.
+    """
     if not args:
-        raise ValueError("Expected at least one tensor input.")
+        raise ValueError("Expected at least one input.")
     tensors = []
     for idx, arg in enumerate(args):
         if not isinstance(arg, torch.Tensor):
-            raise TypeError(f"Only tensor inputs are supported now. Arg#{idx} has type {type(arg)}.")
+            continue  # Non-tensor args are handled by the dynamo path.
         if arg.device.type != "cuda":
-            raise RuntimeError("Only CUDA tensors are supported now.")
+            raise RuntimeError(f"Only CUDA tensors are supported now. Arg#{idx} is on {arg.device}.")
         if not arg.is_contiguous():
             raise ValueError(
                 f"Only contiguous CUDA tensors are supported now. "
                 f"Arg#{idx} has shape {tuple(arg.shape)} and stride {tuple(arg.stride())}."
             )
         tensors.append(arg)
+    if not tensors:
+        raise ValueError("Expected at least one tensor input.")
     return tuple(tensors)
 
 
-def _signature_from_inputs(args: tuple[torch.Tensor, ...]) -> tuple[Any, ...]:
-    return tuple(
-        (tuple(int(v) for v in arg.shape), str(arg.dtype), arg.device.type, arg.device.index)
-        for arg in args
-    )
+def _signature_from_inputs(args: tuple[Any, ...]) -> tuple[Any, ...]:
+    parts = []
+    for arg in args:
+        if isinstance(arg, torch.Tensor):
+            parts.append(
+                (tuple(int(v) for v in arg.shape), str(arg.dtype), arg.device.type, arg.device.index)
+            )
+        else:
+            # Non-tensor args (bool, int, float) contribute their value
+            # so that different values trigger recompilation.
+            parts.append(("scalar", type(arg).__name__, arg))
+    return tuple(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -326,16 +454,21 @@ class _TorchOpWrapper:
     """Adapts a ``torch`` op with ``output = op(*inputs)`` convention to
     GraphRunner's ``op(*inputs, output_buffer)`` calling convention.
 
-    The wrapper calls the original torch op normally, then copies the result
-    into the pre-allocated output buffer.
+    In static mode (``dynamic=False``), the wrapper copies the result into
+    a pre-allocated output buffer (last argument).  In dynamic mode
+    (``dynamic=True``), the wrapper simply returns the result — no output
+    buffer is passed.
     """
 
-    def __init__(self, torch_callable: Any) -> None:
+    def __init__(self, torch_callable: Any, dynamic: bool = False) -> None:
         self.torch_callable = torch_callable
+        self.dynamic = dynamic
 
-    def __call__(self, *args_and_out: torch.Tensor) -> None:
-        inputs = args_and_out[:-1]
-        out_buf = args_and_out[-1]
+    def __call__(self, *args: torch.Tensor) -> torch.Tensor | None:
+        if self.dynamic:
+            return self.torch_callable(*args)
+        inputs = args[:-1]
+        out_buf = args[-1]
         result = self.torch_callable(*inputs)
         out_buf.copy_(result)
 
@@ -362,25 +495,32 @@ class GraphRunner:
         calls: tuple[CallRecord, ...],
         input_names: tuple[str, ...],
         device: torch.device,
+        dynamic: bool = False,
     ) -> None:
         self.kernels = kernels
         self.calls = calls
         self.input_names = input_names
         self.device = device
+        self.dynamic = dynamic
 
-        # Pre-allocate one output buffer per call, indexed by position.
-        # Keying by name would alias calls that share the same out_name.
         self._input_name_set = frozenset(input_names)
         input_set = self._input_name_set
-        self._call_outputs: list[torch.Tensor | None] = []
-        for call in calls:
-            if call.out_name in input_set:
-                self._call_outputs.append(None)
-            else:
-                shape, dtype = _output_buffer_info(mod[call.gv_name])
-                self._call_outputs.append(
-                    torch.empty(shape, device=device, dtype=getattr(torch, dtype)),
-                )
+
+        if dynamic:
+            # Dynamic shapes: kernels handle their own output allocation
+            # via out_idx=[-1] — no pre-allocation.
+            self._call_outputs = [None] * len(calls)
+        else:
+            # Static shapes: pre-allocate one output buffer per call.
+            self._call_outputs: list[torch.Tensor | None] = []
+            for call in calls:
+                if call.out_name in input_set:
+                    self._call_outputs.append(None)
+                else:
+                    shape, dtype, _ = _output_buffer_info(mod[call.gv_name])
+                    self._call_outputs.append(
+                        torch.empty(shape, device=device, dtype=getattr(torch, dtype)),
+                    )
 
         self.scheduled_mod = mod
 
@@ -399,16 +539,29 @@ class GraphRunner:
         """Execute the full kernel sequence and return the final output."""
         if self._native_func is not None:
             return self._run_native(*args)
+
         env: dict[str, torch.Tensor] = dict(zip(self.input_names, args))
-        for idx, call in enumerate(self.calls):
-            out_buf = self._call_outputs[idx]
-            if out_buf is None:
-                out_buf = env[call.out_name]
-            self.kernels[call.gv_name](
-                *[env[name] for name in call.arg_names],
-                out_buf,
-            )
-            env[call.out_name] = out_buf
+
+        if self.dynamic:
+            # Dynamic path: kernels compiled with out_idx=[-1] allocate
+            # their own outputs and return them.
+            for call in self.calls:
+                result = self.kernels[call.gv_name](
+                    *[env[name] for name in call.arg_names],
+                )
+                env[call.out_name] = result
+        else:
+            # Static path: use pre-allocated output buffers.
+            for idx, call in enumerate(self.calls):
+                out_buf = self._call_outputs[idx]
+                if out_buf is None:
+                    out_buf = env[call.out_name]
+                self.kernels[call.gv_name](
+                    *[env[name] for name in call.arg_names],
+                    out_buf,
+                )
+                env[call.out_name] = out_buf
+
         return env[self.calls[-1].out_name]
 
     # ------------------------------------------------------------------
@@ -592,20 +745,191 @@ class GraphRunner:
 
 
 # ---------------------------------------------------------------------------
+# Dynamo fallback (data-dependent control flow support)
+# ---------------------------------------------------------------------------
+
+class DynamoGraphRunner:
+    """Wraps a ``torch.compile``-generated callable for data-dependent control flow.
+
+    When ``torch.export`` cannot trace a function (e.g. ``if tensor:``),
+    we fall back to ``torch.compile`` with a custom TileLang backend.
+    Each subgraph is compiled through TileLang's schedule pipeline;
+    inter-subgraph control flow is handled by Python at runtime.
+
+    .. note::
+        CUDA graph capture and native C++ dispatch are not supported
+        because Python control flow runs between subgraphs.
+    """
+
+    def __init__(self, compiled_fn: Callable) -> None:
+        self._compiled_fn = compiled_fn
+
+    def __call__(self, *args: Any) -> torch.Tensor:
+        return self._compiled_fn(*args)
+
+
+def _compile_subgraph(
+    gm: torch.fx.GraphModule,
+    example_inputs: list[torch.Tensor],
+    arch: str,
+    pass_configs: dict[str, Any] | None = None,
+    compile_flags: list[str] | str | None = None,
+) -> Callable:
+    """Compile a single dynamo subgraph through TileLang's pipeline.
+
+    Returns a callable matching the FX graph's output format (tuple).
+    Raises on failure so the caller can fall back to ``gm.forward``.
+    """
+    # Build input_info for from_fx (handles both real and FakeTensors).
+    input_info: list[tuple[list[int | tir.Var], str]] = []
+    for tensor in example_inputs:
+        shape: list[int | tir.Var] = []
+        for s in tensor.shape:
+            if isinstance(s, torch.SymInt):
+                shape.append(tir.Var(str(s), "int64"))
+            else:
+                shape.append(int(s))
+        dtype_str = str(tensor.dtype).replace("torch.", "")
+        input_info.append((shape, dtype_str))
+
+    # Convert FX graph → Relax IR.
+    mod = from_fx(gm, input_info, unwrap_unit_return_tuple=True)
+
+    # Schedule with TileLang rules.
+    mod = _schedule_relax_module(mod, arch)
+
+    # Check if the scheduled module has any kernels.
+    # Identity subgraphs (e.g. bool predicate pass-through) produce
+    # no DataflowBlock after scheduling — return original forward.
+    main_func = mod["main"]
+    if (
+        not isinstance(main_func.body, relax.SeqExpr)
+        or len(main_func.body.blocks) == 0
+    ):
+        return gm.forward
+
+    calls = _extract_call_sequence(main_func)
+    input_names = _extract_input_names(main_func)
+
+    if not calls:
+        return gm.forward
+
+    kernels = _compile_kernels(
+        mod, calls, pass_configs=pass_configs, compile_flags=compile_flags,
+    )
+
+    # Build a mini GraphRunner for this subgraph.
+    device = torch.device("cuda", torch.cuda.current_device())
+    runner = GraphRunner(mod, kernels, calls, input_names, device)
+
+    # torch.compile expects the backend callable to return a tuple
+    # matching the FX graph's output format.
+    def subgraph_runner(*args):
+        return (runner._run_kernels(*args),)
+
+    return subgraph_runner
+
+
+def _tilelang_dynamo_backend(
+    arch: str,
+    pass_configs: dict[str, Any] | None = None,
+    compile_flags: list[str] | str | None = None,
+) -> Callable:
+    """Create a ``torch.compile`` backend that compiles subgraphs via TileLang.
+
+    Each captured FX subgraph is converted to Relax IR via ``from_fx``,
+    scheduled with TileLang's rules, and compiled into GPU kernels.
+    """
+
+    def backend(gm: torch.fx.GraphModule, example_inputs: list[torch.Tensor]):
+        gm.graph.eliminate_dead_code()
+
+        try:
+            return _compile_subgraph(gm, example_inputs, arch, pass_configs, compile_flags)
+        except Exception:
+            # If TileLang cannot compile this subgraph (e.g. unsupported
+            # ops, 0-dim tensors), fall back to PyTorch eager execution.
+            logger.debug(
+                "TileLang dynamo backend: subgraph compilation failed, "
+                "falling back to eager execution.",
+                exc_info=True,
+            )
+            return gm.forward
+
+    return backend
+
+
+def _compile_graph_via_dynamo(
+    func: Callable[..., torch.Tensor],
+    example_args: tuple[torch.Tensor, ...],
+    arch: str,
+    pass_configs: dict[str, Any] | None = None,
+    compile_flags: list[str] | str | None = None,
+) -> DynamoGraphRunner:
+    """Compile a PyTorch function via ``torch.compile`` with a TileLang backend.
+
+    This is the fallback path when ``torch.export`` cannot trace the function
+    (e.g. data-dependent Python control flow like ``if tensor:``).
+    """
+    import torch._dynamo as dynamo
+
+    dynamo.reset()
+    backend = _tilelang_dynamo_backend(arch, pass_configs, compile_flags)
+    compiled_fn = torch.compile(func, backend=backend)
+
+    # Warmup call to trigger compilation of all reachable subgraphs.
+    with torch.no_grad():
+        compiled_fn(*example_args)
+
+    return DynamoGraphRunner(compiled_fn)
+
+
+# ---------------------------------------------------------------------------
 # Graph compilation pipeline
 # ---------------------------------------------------------------------------
 
 def _compile_graph(
     func: Callable[..., torch.Tensor],
-    example_args: tuple[torch.Tensor, ...],
+    example_args: tuple[Any, ...],
     arch: str,
     custom_kernels: dict[str, PrimFunc] | None = None,
     pass_configs: dict[str, Any] | None = None,
     compile_flags: list[str] | str | None = None,
-) -> GraphRunner:
+    dynamic_dims: dict[int, list[int]] | None = None,
+) -> GraphRunner | DynamoGraphRunner:
     """Trace a PyTorch function, schedule each kernel, and compile."""
+    is_dynamic = bool(dynamic_dims)
+
+    # Non-tensor args (bool, int, float) are not supported by torch.export's
+    # Relax importer — use the dynamo path which handles mixed types natively.
+    has_non_tensor = any(not isinstance(a, torch.Tensor) for a in example_args)
+    if has_non_tensor:
+        return _compile_graph_via_dynamo(
+            func, example_args, arch,
+            pass_configs=pass_configs,
+            compile_flags=compile_flags,
+        )
+
     # 1. Trace PyTorch function → Relax IR
-    mod, torch_op_map = _build_relax_module(func, example_args)
+    #    If tracing fails due to data-dependent control flow, fall back to
+    #    torch.compile with a TileLang backend (graph-break support).
+    try:
+        mod, torch_op_map = _build_relax_module(
+            func, example_args, dynamic_dims=dynamic_dims,
+        )
+    except (
+        RuntimeError,
+        torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode,
+    ) as e:
+        if "data-dependent" in str(e) or isinstance(
+            e, torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode,
+        ):
+            return _compile_graph_via_dynamo(
+                func, example_args, arch,
+                pass_configs=pass_configs,
+                compile_flags=compile_flags,
+            )
+        raise
 
     # 2. Schedule with TileLang rules
     mod = _schedule_relax_module(mod, arch)
@@ -620,35 +944,23 @@ def _compile_graph(
     input_names = _extract_input_names(main_func)
 
     # 5. Compile each kernel.
-    kernels: dict[str, Any] = {}
-    for call in calls:
-        tir_func = mod[call.gv_name]
-        is_torch_op = (
-            isinstance(tir_func, tir.PrimFunc)
-            and tir_func.attrs
-            and tir_func.attrs.get("torch_op")
-        )
-        if is_torch_op:
-            # Wrap the original torch callable to match GraphRunner's
-            # (*inputs, output_buffer) calling convention.
-            torch_callable = torch_op_map.get(call.gv_name)
-            if torch_callable is None:
-                raise RuntimeError(
-                    f"torch_op attribute set on '{call.gv_name}' but no "
-                    f"matching entry in torch_op_map."
-                )
-            kernels[call.gv_name] = _TorchOpWrapper(torch_callable)
-        else:
-            prepared = _lower_primfunc_for_tilelang(tir_func, call.gv_name)
-            kernels[call.gv_name] = tilelang.compile(
-                prepared,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
-            )
+    # For dynamic shapes: compile with out_idx=[-1] so kernels allocate
+    # their own outputs (resolving symbolic dims from input shapes).
+    # For static shapes: compile normally (GraphRunner pre-allocates outputs).
+    kernels = _compile_kernels(
+        mod, calls,
+        pass_configs=pass_configs,
+        compile_flags=compile_flags,
+        out_idx=[-1] if is_dynamic else None,
+        torch_op_map=torch_op_map,
+    )
 
-    # 6. Build pre-allocated runner
+    # 6. Build runner
     device = example_args[0].device
-    return GraphRunner(mod, kernels, calls, input_names, device)
+    return GraphRunner(
+        mod, kernels, calls, input_names, device,
+        dynamic=is_dynamic,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -658,9 +970,11 @@ def _compile_graph(
 class GraphJITImpl:
     """Decorator wrapper for graph-mode JIT compilation of PyTorch functions.
 
-    On first call (or when the input shape signature changes), the PyTorch
-    function is traced, scheduled, and compiled.  Subsequent calls with the
-    same shape signature reuse the cached ``GraphRunner``.
+    When ``dynamic_dims`` is ``None``, each unique shape signature triggers
+    a separate compilation (shape-keyed recompilation).
+
+    When ``dynamic_dims`` is provided, the kernel is compiled **once** with
+    symbolic dimensions and reused for any concrete shape — no recompilation.
     """
 
     def __init__(
@@ -673,6 +987,7 @@ class GraphJITImpl:
         compile_flags: list[str] | str | None = None,
         cuda_graph: bool = False,
         native: bool = False,
+        dynamic_dims: dict[int, list[int]] | None = None,
     ) -> None:
         self.func = func
         self.arch = arch
@@ -681,12 +996,45 @@ class GraphJITImpl:
         self.compile_flags = compile_flags
         self.cuda_graph = cuda_graph
         self.native = native
+        self.dynamic_dims = dynamic_dims
         self._cache: dict[tuple[Any, ...], GraphRunner] = {}
+        # Single cached runner for dynamic shapes (compiled once).
+        self._dynamic_runner: GraphRunner | None = None
+        # Cached DynamoGraphRunner (set when torch.export fails and we
+        # fall back to torch.compile for data-dependent control flow).
+        self._dynamo_runner: DynamoGraphRunner | None = None
 
-    def compile(self, *example_args: torch.Tensor) -> GraphRunner:
+    def _configure_runner(self, runner: GraphRunner) -> None:
+        """Apply native dispatch and CUDA graph settings to a GraphRunner."""
+        if self.native:
+            runner.enable_native_dispatch()
+        if self.cuda_graph:
+            runner.enable_cuda_graph()
+
+    def compile(self, *example_args, _sig: tuple[Any, ...] | None = None) -> GraphRunner | DynamoGraphRunner:
         """Trace, schedule, and compile for the given example inputs."""
-        tensors = _validate_tensor_args(example_args)
-        sig = _signature_from_inputs(tensors)
+        _validate_tensor_args(example_args)
+
+        if self.dynamic_dims:
+            if self._dynamic_runner is not None:
+                return self._dynamic_runner
+            arch = _resolve_arch(self.arch)
+            runner = _compile_graph(
+                self.func,
+                example_args,
+                arch,
+                custom_kernels=self.custom_kernels,
+                pass_configs=self.pass_configs,
+                compile_flags=self.compile_flags,
+                dynamic_dims=self.dynamic_dims,
+            )
+            if isinstance(runner, GraphRunner):
+                self._configure_runner(runner)
+            self._dynamic_runner = runner
+            return runner
+
+        # Static path: shape-keyed caching.
+        sig = _sig if _sig is not None else _signature_from_inputs(example_args)
         cached = self._cache.get(sig)
         if cached is not None:
             return cached
@@ -694,23 +1042,33 @@ class GraphJITImpl:
         arch = _resolve_arch(self.arch)
         runner = _compile_graph(
             self.func,
-            tensors,
+            example_args,
             arch,
             custom_kernels=self.custom_kernels,
             pass_configs=self.pass_configs,
             compile_flags=self.compile_flags,
         )
-        if self.native:
-            runner.enable_native_dispatch()
-        if self.cuda_graph:
-            runner.enable_cuda_graph()
+        if isinstance(runner, DynamoGraphRunner):
+            self._dynamo_runner = runner
+            return runner
+        self._configure_runner(runner)
         self._cache[sig] = runner
         return runner
 
-    def __call__(self, *args: torch.Tensor) -> torch.Tensor:
-        # Fast path: check cache before full validation.
+    def __call__(self, *args) -> torch.Tensor:
+        # Dynamo fallback path (cached after first data-dependent error).
+        if self._dynamo_runner is not None:
+            return self._dynamo_runner(*args)
+
+        if self.dynamic_dims:
+            runner = self._dynamic_runner
+            if runner is None:
+                runner = self.compile(*args)
+            return runner(*args)
+
+        # Static path: check cache before full validation.
         sig = _signature_from_inputs(args)
         runner = self._cache.get(sig)
         if runner is None:
-            runner = self.compile(*args)
+            runner = self.compile(*args, _sig=sig)
         return runner(*args)
