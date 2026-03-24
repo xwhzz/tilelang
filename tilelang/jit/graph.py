@@ -17,7 +17,6 @@ Usage::
 
 from __future__ import annotations
 
-import types
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -58,11 +57,113 @@ def _resolve_arch(arch: str | None) -> str:
     return f"sm_{major}{minor}"
 
 
+def _torch_dtype_to_str(dtype: torch.dtype) -> str:
+    """Convert a ``torch.dtype`` to a TVM dtype string."""
+    from tilelang.language.dtypes import _TORCH_DTYPE_TO_STR
+    return _TORCH_DTYPE_TO_STR.get(dtype, str(dtype).split(".")[-1])
+
+
+def _scan_custom_ops(exported_program) -> dict[str, Any]:
+    """Detect user-registered custom ops in an exported FX graph.
+
+    Returns a dict mapping op function names (e.g. ``"my_op.default"``)
+    to the original torch op callable, for ops that are NOT in the
+    standard Relax convert map.
+    """
+    from tvm.relax.frontend.torch.exported_program_translator import ExportedProgramImporter
+
+    # Build the standard convert map to know what's already handled.
+    dummy_importer = ExportedProgramImporter()
+    standard_keys = set(dummy_importer.create_convert_map().keys())
+
+    custom_ops: dict[str, Any] = {}
+    for node in exported_program.graph.nodes:
+        if node.op != "call_function":
+            continue
+        func_name = node.target.__name__
+        if func_name not in standard_keys:
+            custom_ops[func_name] = node.target
+    return custom_ops
+
+
+def _build_custom_op_convert_map(
+    custom_ops: dict[str, Any],
+    exported_program,
+) -> tuple[dict[str, Callable], dict[str, Any]]:
+    """Build convert_map entries for user-registered custom ops.
+
+    Returns ``(convert_map, torch_op_map)`` where:
+    - *convert_map* maps op names to Relax converters
+    - *torch_op_map* maps Relax GV names to original torch callables
+    """
+    convert_map: dict[str, Callable] = {}
+    torch_op_map: dict[str, Any] = {}
+
+    for func_name, op_callable in custom_ops.items():
+        safe_name = func_name.replace(".", "_")
+        relax_name = f"torch_op_{safe_name}"
+
+        # Extract output shape/dtype from the FX node metadata.
+        out_shape: tuple[int, ...] | None = None
+        out_dtype: str | None = None
+        for node in exported_program.graph.nodes:
+            if node.op == "call_function" and node.target.__name__ == func_name:
+                val = node.meta.get("val")
+                if val is not None and isinstance(val, torch.Tensor):
+                    out_shape = tuple(int(s) for s in val.shape)
+                    out_dtype = _torch_dtype_to_str(val.dtype)
+                break
+
+        if out_shape is None or out_dtype is None:
+            continue  # Skip ops we can't infer output info for.
+
+        def _make(rn, os, od):
+            def converter(node, importer):
+                args = [importer.env[a] for a in node.args if a in importer.env]
+                bb = importer.block_builder
+
+                # Build a stub PrimFunc with the correct buffer signature.
+                params = []
+                buf_map = {}
+                for i, arg in enumerate(args):
+                    sinfo = arg.struct_info
+                    shape = [int(s) for s in sinfo.shape]
+                    buf = tir.decl_buffer(shape, sinfo.dtype, f"arg{i}")
+                    param = tir.Var(f"p{i}", "handle")
+                    params.append(param)
+                    buf_map[param] = buf
+                out_buf = tir.decl_buffer(os, od, "output")
+                out_param = tir.Var("p_out", "handle")
+                params.append(out_param)
+                buf_map[out_param] = out_buf
+
+                body = tir.Evaluate(tir.const(0))
+                stub = tir.PrimFunc(params, body, buffer_map=buf_map)
+                stub = stub.with_attr("global_symbol", rn)
+                stub = stub.with_attr("op_pattern", _OP_PATTERN_OPAQUE)
+                stub = stub.with_attr("tir.is_scheduled", True)
+                stub = stub.with_attr("torch_op", True)
+
+                gv = bb.add_func(stub, rn)
+                sinfo = relax.TensorStructInfo(os, od)
+                return bb.emit(relax.call_tir(gv, args, sinfo))
+            return converter
+
+        convert_map[func_name] = _make(relax_name, out_shape, out_dtype)
+        torch_op_map[relax_name] = op_callable
+
+    return convert_map, torch_op_map
+
+
 def _build_relax_module(
     func: Callable[..., torch.Tensor],
     example_args: tuple[torch.Tensor, ...],
-    custom_convert_map: dict[str, Any] | None = None,
-) -> tvm.IRModule:
+) -> tuple[tvm.IRModule, dict[str, Any]]:
+    """Trace and convert a PyTorch function to Relax IR.
+
+    Returns ``(mod, torch_op_map)`` where *torch_op_map* maps Relax GV
+    names to original torch callables for user-registered custom ops.
+    """
     class _WrappedModule(Module):
         def __init__(self, inner: Callable[..., torch.Tensor]):
             super().__init__()
@@ -73,7 +174,17 @@ def _build_relax_module(
 
     wrapped = _WrappedModule(func)
     exported_program = export(wrapped, args=example_args, dynamic_shapes={})
-    return from_exported_program(
+
+    # Auto-detect user-registered custom ops and generate converters.
+    detected_custom_ops = _scan_custom_ops(exported_program)
+    torch_op_map: dict[str, Any] = {}
+    custom_convert_map: dict[str, Any] | None = None
+    if detected_custom_ops:
+        custom_convert_map, torch_op_map = _build_custom_op_convert_map(
+            detected_custom_ops, exported_program,
+        )
+
+    mod = from_exported_program(
         exported_program,
         run_ep_decomposition=None,
         keep_params_as_input=None,
@@ -81,6 +192,7 @@ def _build_relax_module(
         no_bind_return_tuple=None,
         custom_convert_map=custom_convert_map,
     )
+    return mod, torch_op_map
 
 
 def _schedule_relax_module(
@@ -207,143 +319,25 @@ def _inject_custom_kernels(
 
 
 # ---------------------------------------------------------------------------
-# JITKernel auto-detection for graph-mode
+# Torch op wrapper for graph-mode dispatch
 # ---------------------------------------------------------------------------
 
-_tl_lib_counter: int = 0
+class _TorchOpWrapper:
+    """Adapts a ``torch`` op with ``output = op(*inputs)`` convention to
+    GraphRunner's ``op(*inputs, output_buffer)`` calling convention.
 
-
-def _detect_jit_kernels(func: Callable) -> dict[str, tilelang.JITKernel]:
-    """Find JITKernel instances referenced by *func*'s globals or closure."""
-    from tilelang.jit.kernel import JITKernel
-
-    found: dict[str, tilelang.JITKernel] = {}
-    # Globals referenced in the bytecode.
-    for name in func.__code__.co_names:
-        val = func.__globals__.get(name)
-        if isinstance(val, JITKernel):
-            found[name] = val
-    # Closure (free) variables.
-    if func.__closure__:
-        for name, cell in zip(func.__code__.co_freevars, func.__closure__):
-            try:
-                val = cell.cell_contents
-                if isinstance(val, JITKernel):
-                    found[name] = val
-            except ValueError:
-                pass
-    return found
-
-
-class _JITKernelTracer:
-    """Registers torch custom ops for detected JITKernels so that
-    ``torch.export`` can trace through them, and provides a
-    ``custom_convert_map`` that emits Relax ``call_tir`` nodes
-    referencing the kernel's original PrimFunc.
+    The wrapper calls the original torch op normally, then copies the result
+    into the pre-allocated output buffer.
     """
 
-    def __init__(self) -> None:
-        global _tl_lib_counter
-        _tl_lib_counter += 1
-        self._ns = f"tl_jit_{_tl_lib_counter}"
-        self._lib = torch.library.Library(self._ns, "DEF")
-        # {var_name: (custom_op_callable, relax_gv_name)}
-        self._ops: dict[str, tuple[Callable, str]] = {}
-        # {relax_gv_name: JITKernel}
-        self._kernels: dict[str, tilelang.JITKernel] = {}
-        # {relax_gv_name: (shape, dtype)} — cached to avoid repeated extraction
-        self._buf_info: dict[str, tuple[tuple[int, ...], str]] = {}
+    def __init__(self, torch_callable: Any) -> None:
+        self.torch_callable = torch_callable
 
-    @property
-    def precompiled_kernels(self) -> dict[str, tilelang.JITKernel]:
-        """Mapping from Relax GlobalVar name to the pre-compiled JITKernel."""
-        return dict(self._kernels)
-
-    def register(self, var_name: str, kernel: tilelang.JITKernel) -> None:
-        """Create a torch custom op backed by *kernel*."""
-        primfunc = kernel.prim_func
-        out_shape, out_dtype = _output_buffer_info(primfunc)
-        n_inputs = len(list(primfunc.params)) - 1
-
-        op_name = f"kernel_{var_name}"
-        relax_name = f"tl_{var_name}"
-
-        # Schema: tl_jit_N::kernel_<name>(Tensor a, ...) -> Tensor
-        param_list = ", ".join(f"Tensor arg{i}" for i in range(n_inputs))
-        self._lib.define(f"{op_name}({param_list}) -> Tensor")
-
-        torch_dtype = getattr(torch, out_dtype)
-
-        def cuda_impl(*args, _k=kernel, _s=out_shape, _d=torch_dtype):
-            out = torch.empty(_s, device=args[0].device, dtype=_d)
-            _k(*args, out)
-            return out
-
-        def meta_impl(*args, _s=out_shape, _d=torch_dtype):
-            return torch.empty(_s, device=args[0].device, dtype=_d)
-
-        self._lib.impl(op_name, cuda_impl, "CUDA")
-        self._lib.impl(op_name, meta_impl, "Meta")
-
-        op_callable = getattr(getattr(torch.ops, self._ns), op_name)
-        self._ops[var_name] = (op_callable, relax_name)
-        self._kernels[relax_name] = kernel
-        self._buf_info[relax_name] = (out_shape, out_dtype)
-
-    # ------------------------------------------------------------------
-
-    def make_traced_func(self, func: Callable) -> Callable:
-        """Return a copy of *func* with JITKernel refs swapped for custom ops."""
-        replacements = {name: op for name, (op, _) in self._ops.items()}
-
-        new_globals = dict(func.__globals__)
-        for name, op in replacements.items():
-            if name in new_globals:
-                new_globals[name] = op
-
-        new_closure = func.__closure__
-        if func.__closure__:
-            free_vars = func.__code__.co_freevars
-            if any(n in free_vars for n in replacements):
-                cells: list[types.CellType] = []
-                for name, cell in zip(free_vars, func.__closure__):
-                    if name in replacements:
-                        cells.append(types.CellType(replacements[name]))
-                    else:
-                        cells.append(cell)
-                new_closure = tuple(cells)
-
-        return types.FunctionType(
-            func.__code__, new_globals, func.__name__,
-            func.__defaults__, new_closure,
-        )
-
-    # ------------------------------------------------------------------
-
-    def get_convert_map(self) -> dict[str, Callable]:
-        """Build ``custom_convert_map`` for ``from_exported_program``."""
-        from tvm import relax as _relax
-
-        convert_map: dict[str, Callable] = {}
-        for var_name, (_, relax_name) in self._ops.items():
-            primfunc = self._kernels[relax_name].prim_func
-            out_shape, out_dtype = self._buf_info[relax_name]
-
-            def _make(pf, rn, os, od):
-                def converter(node, importer):
-                    args = [importer.env[a] for a in node.args if a in importer.env]
-                    bb = importer.block_builder
-                    annotated = pf.with_attr("global_symbol", rn).with_attr(
-                        "op_pattern", _OP_PATTERN_OPAQUE,
-                    ).with_attr("tir.is_scheduled", True)
-                    gv = bb.add_func(annotated, rn)
-                    sinfo = _relax.TensorStructInfo(os, od)
-                    return bb.emit(_relax.call_tir(gv, args, sinfo))
-                return converter
-
-            op_key = f"kernel_{var_name}.default"
-            convert_map[op_key] = _make(primfunc, relax_name, out_shape, out_dtype)
-        return convert_map
+    def __call__(self, *args_and_out: torch.Tensor) -> None:
+        inputs = args_and_out[:-1]
+        out_buf = args_and_out[-1]
+        result = self.torch_callable(*inputs)
+        out_buf.copy_(result)
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +358,7 @@ class GraphRunner:
     def __init__(
         self,
         mod: tvm.IRModule,
-        kernels: dict[str, tilelang.JITKernel],
+        kernels: dict[str, Any],
         calls: tuple[CallRecord, ...],
         input_names: tuple[str, ...],
         device: torch.device,
@@ -472,9 +466,16 @@ class GraphRunner:
         After calling this, :meth:`_run_kernels` delegates to a single
         native ``PackedFunc`` that sequences all kernel calls in C, avoiding
         per-kernel Python interpreter overhead.
+
+        Not supported when the graph contains torch op wrappers.
         """
         if self._native_func is not None:
             return
+        if any(isinstance(k, _TorchOpWrapper) for k in self.kernels.values()):
+            raise RuntimeError(
+                "native dispatch is not supported when the graph contains "
+                "user-registered torch ops. Use the default Python dispatch."
+            )
 
         # Assign a unique TIR parameter for each call's output to avoid
         # aliasing (same logic as _call_outputs indexing).
@@ -603,54 +604,49 @@ def _compile_graph(
     compile_flags: list[str] | str | None = None,
 ) -> GraphRunner:
     """Trace a PyTorch function, schedule each kernel, and compile."""
-    # 1. Detect JITKernels referenced by the function
-    detected = _detect_jit_kernels(func)
-    tracer: _JITKernelTracer | None = None
-    traced_func = func
-    custom_convert_map: dict[str, Any] | None = None
-    if detected:
-        tracer = _JITKernelTracer()
-        for name, kernel in detected.items():
-            tracer.register(name, kernel)
-        traced_func = tracer.make_traced_func(func)
-        custom_convert_map = tracer.get_convert_map()
+    # 1. Trace PyTorch function → Relax IR
+    mod, torch_op_map = _build_relax_module(func, example_args)
 
-    # 2. Trace PyTorch function → Relax IR
-    mod = _build_relax_module(traced_func, example_args, custom_convert_map=custom_convert_map)
-
-    # 3. Schedule with TileLang rules
+    # 2. Schedule with TileLang rules
     mod = _schedule_relax_module(mod, arch)
 
-    # 4. Inject custom kernels (replace TIR functions by name)
+    # 3. Inject custom kernels (replace TIR functions by name)
     if custom_kernels:
         mod = _inject_custom_kernels(mod, custom_kernels)
 
-    # 5. Extract execution plan
+    # 4. Extract execution plan
     main_func = mod["main"]
     calls = _extract_call_sequence(main_func)
     input_names = _extract_input_names(main_func)
 
-    # 6. Compile each kernel.
-    # Pre-compiled JITKernels are re-compiled without out_idx so they accept
-    # the output buffer as an explicit argument (graph-mode calling convention).
-    pre_compiled = tracer.precompiled_kernels if tracer else {}
-    kernels: dict[str, tilelang.JITKernel] = {}
+    # 5. Compile each kernel.
+    kernels: dict[str, Any] = {}
     for call in calls:
-        if call.gv_name in pre_compiled:
-            kernels[call.gv_name] = tilelang.compile(
-                pre_compiled[call.gv_name].prim_func,
-                pass_configs=pass_configs,
-                compile_flags=compile_flags,
-            )
+        tir_func = mod[call.gv_name]
+        is_torch_op = (
+            isinstance(tir_func, tir.PrimFunc)
+            and tir_func.attrs
+            and tir_func.attrs.get("torch_op")
+        )
+        if is_torch_op:
+            # Wrap the original torch callable to match GraphRunner's
+            # (*inputs, output_buffer) calling convention.
+            torch_callable = torch_op_map.get(call.gv_name)
+            if torch_callable is None:
+                raise RuntimeError(
+                    f"torch_op attribute set on '{call.gv_name}' but no "
+                    f"matching entry in torch_op_map."
+                )
+            kernels[call.gv_name] = _TorchOpWrapper(torch_callable)
         else:
-            prepared = _lower_primfunc_for_tilelang(mod[call.gv_name], call.gv_name)
+            prepared = _lower_primfunc_for_tilelang(tir_func, call.gv_name)
             kernels[call.gv_name] = tilelang.compile(
                 prepared,
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
 
-    # 7. Build pre-allocated runner
+    # 6. Build pre-allocated runner
     device = example_args[0].device
     return GraphRunner(mod, kernels, calls, input_names, device)
 
