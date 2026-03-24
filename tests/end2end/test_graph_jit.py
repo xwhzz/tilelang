@@ -367,174 +367,81 @@ def test_graph_jit_native_benchmark():
 
 
 # ---------------------------------------------------------------------------
-# Test 11: JITKernel auto-detection – custom add kernel via global reference
+# Test 11: user-registered torch.library custom op (transparent handling)
 # ---------------------------------------------------------------------------
 
-def test_graph_jit_detect_global_kernel():
+_test11_lib = None
+
+def test_graph_jit_torch_library_custom_op():
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    from tilelang import language as T
+    global _test11_lib
+    # Register a custom torch op that doubles a tensor.
+    _test11_lib = torch.library.Library("test_tl_graph", "DEF")
+    _test11_lib.define("my_double(Tensor x) -> Tensor")
 
-    dim = 128
+    def _cuda_impl(x):
+        return x * 2.0
 
-    @T.prim_func
-    def add_kernel(
-        A: T.Tensor((dim,), "float32"),
-        B: T.Tensor((dim,), "float32"),
-        C: T.Tensor((dim,), "float32"),
-    ):
-        with T.Kernel(1, threads=128) as bx:
-            for i in T.Parallel(dim):
-                C[i] = A[i] + B[i]
+    def _meta_impl(x):
+        return torch.empty_like(x)
 
-    # Pre-compile the kernel
-    my_add = tilelang.compile(add_kernel)
+    _test11_lib.impl("my_double", _cuda_impl, "CUDA")
+    _test11_lib.impl("my_double", _meta_impl, "Meta")
 
-    # Use the pre-compiled kernel inside a graph-mode function
+    my_double = torch.ops.test_tl_graph.my_double
+
     @tilelang.jit(mode="graph")
-    def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return my_add(a, b)
+    def fn(a: torch.Tensor) -> torch.Tensor:
+        return my_double(a)
 
-    a = torch.randn(dim, device="cuda", dtype=torch.float32)
-    b = torch.randn(dim, device="cuda", dtype=torch.float32)
-    out = fn(a, b)
-    ref = a + b
+    a = torch.randn(256, device="cuda", dtype=torch.float32)
+    out = fn(a)
+    ref = a * 2.0
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-    print("\033[92mtest_graph_jit_detect_global_kernel: passed.\033[0m")
+    print("\033[92mtest_graph_jit_torch_library_custom_op: passed.\033[0m")
 
 
 # ---------------------------------------------------------------------------
-# Test 12: JITKernel auto-detection – closure variable
+# Test 12: torch.library custom op mixed with standard ops
 # ---------------------------------------------------------------------------
 
-def test_graph_jit_detect_closure_kernel():
+_test12_lib = None
+
+def test_graph_jit_torch_library_mixed():
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    from tilelang import language as T
+    global _test12_lib
+    _test12_lib = torch.library.Library("test_tl_graph2", "DEF")
+    _test12_lib.define("my_scale(Tensor x) -> Tensor")
 
-    dim = 128
+    def _cuda_impl(x):
+        return x * 3.0
 
-    @T.prim_func
-    def mul_kernel(
-        A: T.Tensor((dim,), "float32"),
-        B: T.Tensor((dim,), "float32"),
-        C: T.Tensor((dim,), "float32"),
-    ):
-        with T.Kernel(1, threads=128) as bx:
-            for i in T.Parallel(dim):
-                C[i] = A[i] * B[i]
+    def _meta_impl(x):
+        return torch.empty_like(x)
 
-    my_mul = tilelang.compile(mul_kernel)
+    _test12_lib.impl("my_scale", _cuda_impl, "CUDA")
+    _test12_lib.impl("my_scale", _meta_impl, "Meta")
 
-    def make_fn():
-        # my_mul captured via closure
-        @tilelang.jit(mode="graph")
-        def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-            return my_mul(a, b)
-        return fn
-
-    fn = make_fn()
-    a = torch.randn(dim, device="cuda", dtype=torch.float32)
-    b = torch.randn(dim, device="cuda", dtype=torch.float32)
-    out = fn(a, b)
-    ref = a * b
-    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-    print("\033[92mtest_graph_jit_detect_closure_kernel: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 13: JITKernel mixed with standard ops
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_mixed_custom_and_standard():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    from tilelang import language as T
-
-    dim = 256
-
-    @T.prim_func
-    def custom_add(
-        A: T.Tensor((dim,), "float32"),
-        B: T.Tensor((dim,), "float32"),
-        C: T.Tensor((dim,), "float32"),
-    ):
-        with T.Kernel(1, threads=128) as bx:
-            for i in T.Parallel(dim):
-                C[i] = A[i] + B[i]
-
-    my_add = tilelang.compile(custom_add)
+    my_scale = torch.ops.test_tl_graph2.my_scale
 
     @tilelang.jit(mode="graph")
     def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        # Custom kernel for add, standard relu auto-scheduled
-        s = my_add(a, b)
-        return F.relu(s)
+        s = a + b           # standard op
+        s = my_scale(s)     # custom torch op
+        return F.relu(s)    # standard op
 
-    a = torch.randn(dim, device="cuda", dtype=torch.float32)
-    b = torch.randn(dim, device="cuda", dtype=torch.float32)
+    a = torch.randn(256, device="cuda", dtype=torch.float32)
+    b = torch.randn(256, device="cuda", dtype=torch.float32)
     out = fn(a, b)
-    ref = F.relu(a + b)
+    ref = F.relu((a + b) * 3.0)
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-
-    # Check that the runner has at least 2 kernels (custom add + auto relu)
-    runner = fn._cache[list(fn._cache.keys())[0]]
-    assert len(runner.calls) >= 2, f"Expected >=2 calls, got {len(runner.calls)}"
-    print("\033[92mtest_graph_jit_mixed_custom_and_standard: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 14: JITKernel with CUDA graph capture
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_detect_kernel_cuda_graph():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    from tilelang import language as T
-
-    dim = 128
-
-    @T.prim_func
-    def add_kernel(
-        A: T.Tensor((dim,), "float32"),
-        B: T.Tensor((dim,), "float32"),
-        C: T.Tensor((dim,), "float32"),
-    ):
-        with T.Kernel(1, threads=128) as bx:
-            for i in T.Parallel(dim):
-                C[i] = A[i] + B[i]
-
-    my_add = tilelang.compile(add_kernel)
-
-    @tilelang.jit(mode="graph", cuda_graph=True)
-    def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return my_add(a, b)
-
-    a = torch.randn(dim, device="cuda", dtype=torch.float32)
-    b = torch.randn(dim, device="cuda", dtype=torch.float32)
-    out = fn(a, b)
-    ref = a + b
-    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-
-    # Verify CUDA graph was captured
-    runner = fn._cache[list(fn._cache.keys())[0]]
-    assert runner._cuda_graph is not None, "CUDA graph should be captured"
-
-    # Second call with different data
-    a2 = torch.randn(dim, device="cuda", dtype=torch.float32)
-    b2 = torch.randn(dim, device="cuda", dtype=torch.float32)
-    out2 = fn(a2, b2)
-    ref2 = a2 + b2
-    torch.testing.assert_close(out2, ref2, rtol=1e-5, atol=1e-5)
-    print("\033[92mtest_graph_jit_detect_kernel_cuda_graph: passed.\033[0m")
+    print("\033[92mtest_graph_jit_torch_library_mixed: passed.\033[0m")
 
 
 # ---------------------------------------------------------------------------
@@ -552,8 +459,6 @@ if __name__ == "__main__":
     test_graph_jit_native_manual()
     test_graph_jit_native_decorator()
     test_graph_jit_native_benchmark()
-    test_graph_jit_detect_global_kernel()
-    test_graph_jit_detect_closure_kernel()
-    test_graph_jit_mixed_custom_and_standard()
-    test_graph_jit_detect_kernel_cuda_graph()
+    test_graph_jit_torch_library_custom_op()
+    test_graph_jit_torch_library_mixed()
     print("\n\033[92mAll graph-mode JIT tests passed.\033[0m")
