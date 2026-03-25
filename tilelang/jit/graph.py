@@ -18,7 +18,8 @@ Usage::
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 import torch
@@ -38,6 +39,82 @@ logger = logging.getLogger(__name__)
 
 # TVM op pattern constant: prevents FuseOps from fusing this function.
 _OP_PATTERN_OPAQUE = 8
+
+
+# ---------------------------------------------------------------------------
+# Graph compilation trace
+# ---------------------------------------------------------------------------
+
+@dataclass
+class KernelTrace:
+    """Trace record for a single kernel in the graph."""
+    name: str
+    schedule_rule: str = ""  # e.g. "Matmul", "ElementWise", "Fallback"
+    input_shapes: list[tuple[int | str, ...]] = field(default_factory=list)
+    output_shape: tuple[int | str, ...] = ()
+    output_dtype: str = ""
+    is_dynamic: bool = False
+    is_torch_op: bool = False
+    compile_time_ms: float = 0.0
+
+
+@dataclass
+class GraphCompileTrace:
+    """Structured trace of the entire graph compilation pipeline.
+
+    Accessible via ``GraphRunner.trace`` or ``GraphJITImpl.get_trace()``.
+    """
+    compilation_path: str = ""  # "export", "dynamo", or "export+dynamo_fallback"
+    arch: str = ""
+    dynamic: bool = False
+    # Relax IR pass timings (ms)
+    trace_time_ms: float = 0.0     # torch.export tracing
+    schedule_time_ms: float = 0.0  # Relax transforms + schedule rules
+    compile_time_ms: float = 0.0   # total tilelang.compile time
+    total_time_ms: float = 0.0
+    # Per-kernel details
+    kernels: list[KernelTrace] = field(default_factory=list)
+    # Relax IR functions before scheduling (name → op summary)
+    relax_functions: dict[str, str] = field(default_factory=dict)
+    # Schedule rule matching (function_name → rule_name)
+    schedule_matches: dict[str, str] = field(default_factory=dict)
+    # IR module snapshots as TVM Script strings.
+    # Stored as strings to avoid aliasing issues with mutable IRModule objects.
+    unscheduled_mod: str = ""  # after FuseTIR, before schedule rules
+    scheduled_mod: str = ""   # after schedule rules applied
+
+    def summary(self) -> str:
+        """Return a human-readable summary of the compilation trace."""
+        lines = []
+        lines.append(f"Graph Compilation Trace")
+        lines.append(f"  path: {self.compilation_path}, arch: {self.arch}, "
+                      f"dynamic: {self.dynamic}")
+        lines.append(f"  timing: trace={self.trace_time_ms:.1f}ms, "
+                      f"schedule={self.schedule_time_ms:.1f}ms, "
+                      f"compile={self.compile_time_ms:.1f}ms, "
+                      f"total={self.total_time_ms:.1f}ms")
+        lines.append(f"  kernels ({len(self.kernels)}):")
+        for kt in self.kernels:
+            tag = "[torch_op]" if kt.is_torch_op else f"[{kt.schedule_rule}]"
+            dyn = " (dynamic)" if kt.is_dynamic else ""
+            lines.append(f"    {kt.name}: {tag}{dyn} "
+                          f"→ {kt.output_dtype}{list(kt.output_shape)} "
+                          f"({kt.compile_time_ms:.1f}ms)")
+        return "\n".join(lines)
+
+    def show_unscheduled_mod(self) -> None:
+        """Print the Relax IR module before schedule rules were applied."""
+        if not self.unscheduled_mod:
+            print("Unscheduled module not available.")
+            return
+        print(self.unscheduled_mod)
+
+    def show_scheduled_mod(self) -> None:
+        """Print the Relax IR module after schedule rules were applied."""
+        if not self.scheduled_mod:
+            print("Scheduled module not available.")
+            return
+        print(self.scheduled_mod)
 
 
 # ---------------------------------------------------------------------------
@@ -246,9 +323,51 @@ def _build_relax_module(
     return mod, torch_op_map
 
 
+def _apply_schedule_rules_traced(
+    mod: tvm.IRModule,
+    rules: list[Any],
+    target: tvm.target.Target,
+) -> tuple[tvm.IRModule, dict[str, str]]:
+    """Apply schedule rules with tracing: returns (mod, {func_name: rule_name}).
+
+    This replaces ``ApplyDefaultSchedule`` to capture which rule matched
+    each TIR function, enabling compilation trace reporting.
+    """
+    schedule_matches: dict[str, str] = {}
+    updated_functions = {}
+    for g_var, func in mod.functions_items():
+        if not isinstance(func, tir.PrimFunc):
+            continue
+        if func.attrs and func.attrs.get("tir.is_scheduled"):
+            continue
+        matched_rule = None
+        for rule in rules:
+            space = rule.apply(func, target, False)
+            if space is None:
+                continue
+            if isinstance(space, tir.Schedule):
+                space = [space]
+            assert len(space) == 1
+            updated_functions[g_var] = (
+                space[0].mod["main"].with_attr("tir.is_scheduled", True)
+            )
+            matched_rule = type(rule).__name__
+            break
+        name = g_var.name_hint
+        schedule_matches[name] = matched_rule or "none"
+        if matched_rule:
+            logger.info("  %-40s → %s", name, matched_rule)
+        else:
+            logger.debug("  %-40s → no rule matched", name)
+    for g_var, func in updated_functions.items():
+        mod[g_var] = func
+    return mod, schedule_matches
+
+
 def _schedule_relax_module(
     mod: tvm.IRModule,
     arch: str,
+    trace: GraphCompileTrace | None = None,
 ) -> tvm.IRModule:
     target = tvm.target.cuda(arch=arch)
     with target:
@@ -257,7 +376,29 @@ def _schedule_relax_module(
         mod = relax.transform.FoldConstant()(mod)
         mod = relax.transform.FuseOps()(mod)
         mod = relax.transform.FuseTIR()(mod)
-        mod = tvm.dlight.ApplyDefaultSchedule(*default_schedule_rules())(mod)
+
+        if trace is not None:
+            # Snapshot the unscheduled module (after fusion, before rules).
+            trace.unscheduled_mod = str(mod)
+
+            # Capture pre-schedule function list.
+            for g_var, func in mod.functions_items():
+                if isinstance(func, tir.PrimFunc):
+                    params = []
+                    for p in func.params:
+                        buf = func.buffer_map.get(p)
+                        if buf is not None:
+                            shape_str = "x".join(str(s) for s in buf.shape)
+                            params.append(f"{buf.dtype}[{shape_str}]")
+                    trace.relax_functions[g_var.name_hint] = ", ".join(params)
+
+            logger.info("Schedule rule matching:")
+            rules = default_schedule_rules()
+            mod, schedule_matches = _apply_schedule_rules_traced(mod, rules, target)
+            trace.schedule_matches = schedule_matches
+            trace.scheduled_mod = str(mod)
+        else:
+            mod = tvm.dlight.ApplyDefaultSchedule(*default_schedule_rules())(mod)
     return mod
 
 
@@ -530,6 +671,37 @@ class GraphRunner:
         self._graph_inputs: tuple[torch.Tensor, ...] | None = None
         self._graph_output: torch.Tensor | None = None
         self._native_func: Any | None = None
+        self.trace: GraphCompileTrace | None = None
+
+    # ------------------------------------------------------------------
+    # Kernel source inspection
+    # ------------------------------------------------------------------
+
+    def get_kernel_sources(self) -> dict[str, str]:
+        """Return a ``{kernel_name: cuda_source}`` mapping for every compiled
+        TileLang kernel in this graph.
+
+        Torch-op wrappers (custom ops executed via PyTorch) are skipped.
+        """
+        from tilelang.jit.kernel import JITKernel
+        sources: dict[str, str] = {}
+        for name, kernel in self.kernels.items():
+            if isinstance(kernel, JITKernel):
+                sources[name] = kernel.get_kernel_source()
+        return sources
+
+    def show_kernel_sources(self) -> None:
+        """Print the CUDA source of every compiled TileLang kernel."""
+        sources = self.get_kernel_sources()
+        if not sources:
+            print("No TileLang kernels in this graph.")
+            return
+        for name, src in sources.items():
+            print(f"{'=' * 60}")
+            print(f"Kernel: {name}")
+            print(f"{'=' * 60}")
+            print(src)
+            print()
 
     # ------------------------------------------------------------------
     # Core kernel dispatch (used by both normal and capture paths)
@@ -898,12 +1070,16 @@ def _compile_graph(
     dynamic_dims: dict[int, list[int]] | None = None,
 ) -> GraphRunner | DynamoGraphRunner:
     """Trace a PyTorch function, schedule each kernel, and compile."""
+    t_total_start = time.perf_counter()
     is_dynamic = bool(dynamic_dims)
+    trace = GraphCompileTrace(arch=arch, dynamic=is_dynamic)
 
     # Non-tensor args (bool, int, float) are not supported by torch.export's
     # Relax importer — use the dynamo path which handles mixed types natively.
     has_non_tensor = any(not isinstance(a, torch.Tensor) for a in example_args)
     if has_non_tensor:
+        logger.info("Graph compile: non-tensor args detected, using dynamo path.")
+        trace.compilation_path = "dynamo"
         return _compile_graph_via_dynamo(
             func, example_args, arch,
             pass_configs=pass_configs,
@@ -911,8 +1087,9 @@ def _compile_graph(
         )
 
     # 1. Trace PyTorch function → Relax IR
-    #    If tracing fails due to data-dependent control flow, fall back to
-    #    torch.compile with a TileLang backend (graph-break support).
+    logger.info("Graph compile: tracing via torch.export%s ...",
+                " (dynamic)" if is_dynamic else "")
+    t0 = time.perf_counter()
     try:
         mod, torch_op_map = _build_relax_module(
             func, example_args, dynamic_dims=dynamic_dims,
@@ -924,15 +1101,24 @@ def _compile_graph(
         if "data-dependent" in str(e) or isinstance(
             e, torch.fx.experimental.symbolic_shapes.GuardOnDataDependentSymNode,
         ):
+            logger.info("Graph compile: data-dependent control flow detected, "
+                        "falling back to dynamo path.")
+            trace.compilation_path = "export+dynamo_fallback"
             return _compile_graph_via_dynamo(
                 func, example_args, arch,
                 pass_configs=pass_configs,
                 compile_flags=compile_flags,
             )
         raise
+    trace.trace_time_ms = (time.perf_counter() - t0) * 1000
+    trace.compilation_path = "export"
+    logger.info("Graph compile: tracing done (%.1f ms).", trace.trace_time_ms)
 
     # 2. Schedule with TileLang rules
-    mod = _schedule_relax_module(mod, arch)
+    t0 = time.perf_counter()
+    mod = _schedule_relax_module(mod, arch, trace=trace)
+    trace.schedule_time_ms = (time.perf_counter() - t0) * 1000
+    logger.info("Graph compile: scheduling done (%.1f ms).", trace.schedule_time_ms)
 
     # 3. Inject custom kernels (replace TIR functions by name)
     if custom_kernels:
@@ -943,24 +1129,81 @@ def _compile_graph(
     calls = _extract_call_sequence(main_func)
     input_names = _extract_input_names(main_func)
 
-    # 5. Compile each kernel.
-    # For dynamic shapes: compile with out_idx=[-1] so kernels allocate
-    # their own outputs (resolving symbolic dims from input shapes).
-    # For static shapes: compile normally (GraphRunner pre-allocates outputs).
-    kernels = _compile_kernels(
-        mod, calls,
-        pass_configs=pass_configs,
-        compile_flags=compile_flags,
-        out_idx=[-1] if is_dynamic else None,
-        torch_op_map=torch_op_map,
-    )
+    # 5. Compile each kernel with per-kernel tracing.
+    t_compile_start = time.perf_counter()
+    kernels: dict[str, Any] = {}
+    out_idx = [-1] if is_dynamic else None
+    compile_kwargs: dict[str, Any] = {}
+    if pass_configs:
+        compile_kwargs["pass_configs"] = pass_configs
+    if compile_flags:
+        compile_kwargs["compile_flags"] = compile_flags
+    if out_idx is not None:
+        compile_kwargs["out_idx"] = out_idx
+
+    for call in calls:
+        tir_func = mod[call.gv_name]
+        is_torch_op = (
+            isinstance(tir_func, tir.PrimFunc)
+            and tir_func.attrs
+            and tir_func.attrs.get("torch_op")
+        )
+
+        kt = KernelTrace(name=call.gv_name)
+        kt.schedule_rule = trace.schedule_matches.get(call.gv_name, "unknown")
+        kt.is_torch_op = is_torch_op
+
+        if isinstance(tir_func, tir.PrimFunc):
+            # Extract input/output shape info from buffer_map.
+            params_list = list(tir_func.params)
+            for p in params_list[:-1]:
+                buf = tir_func.buffer_map.get(p)
+                if buf is not None:
+                    kt.input_shapes.append(tuple(
+                        int(s) if isinstance(s, tir.IntImm) else str(s)
+                        for s in buf.shape
+                    ))
+            out_shape, out_dtype, out_dyn = _output_buffer_info(tir_func)
+            kt.output_shape = tuple(
+                int(s) if isinstance(s, (int,)) else str(s) for s in out_shape
+            )
+            kt.output_dtype = out_dtype
+            kt.is_dynamic = out_dyn
+
+        if is_torch_op:
+            torch_callable = torch_op_map.get(call.gv_name)
+            if torch_callable is None:
+                raise RuntimeError(
+                    f"torch_op attribute set on '{call.gv_name}' but no "
+                    f"matching entry in torch_op_map."
+                )
+            kernels[call.gv_name] = _TorchOpWrapper(
+                torch_callable, dynamic=(out_idx is not None),
+            )
+            logger.info("  %-40s [torch_op]", call.gv_name)
+        else:
+            t_k = time.perf_counter()
+            prepared = _lower_primfunc_for_tilelang(tir_func, call.gv_name)
+            kernels[call.gv_name] = tilelang.compile(prepared, **compile_kwargs)
+            kt.compile_time_ms = (time.perf_counter() - t_k) * 1000
+            logger.info("  %-40s [%s] %.1f ms",
+                        call.gv_name, kt.schedule_rule, kt.compile_time_ms)
+
+        trace.kernels.append(kt)
+
+    trace.compile_time_ms = (time.perf_counter() - t_compile_start) * 1000
+    trace.total_time_ms = (time.perf_counter() - t_total_start) * 1000
+    logger.info("Graph compile: total %.1f ms (%d kernels).",
+                trace.total_time_ms, len(trace.kernels))
 
     # 6. Build runner
     device = example_args[0].device
-    return GraphRunner(
+    runner = GraphRunner(
         mod, kernels, calls, input_names, device,
         dynamic=is_dynamic,
     )
+    runner.trace = trace
+    return runner
 
 
 # ---------------------------------------------------------------------------
@@ -1072,3 +1315,82 @@ class GraphJITImpl:
         if runner is None:
             runner = self.compile(*args, _sig=sig)
         return runner(*args)
+
+    # ------------------------------------------------------------------
+    # Kernel source inspection
+    # ------------------------------------------------------------------
+
+    def _iter_graph_runners(self) -> list[GraphRunner]:
+        """Collect all GraphRunners across caching paths."""
+        runners: list[GraphRunner] = []
+        if self._dynamic_runner is not None and isinstance(self._dynamic_runner, GraphRunner):
+            runners.append(self._dynamic_runner)
+        runners.extend(self._cache.values())
+        return runners
+
+    def get_kernel_sources(self) -> dict[str, str]:
+        """Return ``{kernel_name: cuda_source}`` for all compiled kernels.
+
+        If multiple shape-specialized compilations exist, all are included.
+        Raises ``RuntimeError`` if no compilation has been performed yet.
+        """
+        runners = self._iter_graph_runners()
+        if not runners:
+            if self._dynamo_runner is not None:
+                raise RuntimeError(
+                    "Kernel sources are not available for dynamo-compiled "
+                    "graphs (Python control flow fallback)."
+                )
+            raise RuntimeError("No compilation has been performed yet. Call the function first.")
+        sources: dict[str, str] = {}
+        for runner in runners:
+            sources.update(runner.get_kernel_sources())
+        return sources
+
+    def show_kernel_sources(self) -> None:
+        """Print CUDA source of every compiled TileLang kernel."""
+        runners = self._iter_graph_runners()
+        if not runners:
+            if self._dynamo_runner is not None:
+                print("Kernel sources are not available for dynamo-compiled "
+                      "graphs (Python control flow fallback).")
+                return
+            print("No compilation has been performed yet. Call the function first.")
+            return
+        for runner in runners:
+            runner.show_kernel_sources()
+
+    # ------------------------------------------------------------------
+    # Compilation trace
+    # ------------------------------------------------------------------
+
+    def get_trace(self) -> GraphCompileTrace | list[GraphCompileTrace]:
+        """Return the compilation trace(s).
+
+        For dynamic shapes or single-shape calls, returns a single
+        ``GraphCompileTrace``.  For multiple shape-keyed compilations,
+        returns a list.  Raises ``RuntimeError`` if no compilation yet.
+        """
+        runners = self._iter_graph_runners()
+        if not runners:
+            if self._dynamo_runner is not None:
+                trace = GraphCompileTrace(
+                    compilation_path="dynamo", arch=_resolve_arch(self.arch),
+                )
+                return trace
+            raise RuntimeError("No compilation has been performed yet. Call the function first.")
+        traces = [r.trace for r in runners if r.trace is not None]
+        if len(traces) == 1:
+            return traces[0]
+        return traces
+
+    def show_trace(self) -> None:
+        """Print a human-readable compilation trace summary."""
+        result = self.get_trace()
+        if isinstance(result, list):
+            for i, t in enumerate(result):
+                print(f"--- Compilation #{i} ---")
+                print(t.summary())
+                print()
+        else:
+            print(result.summary())
