@@ -45,17 +45,52 @@ _OP_PATTERN_OPAQUE = 8
 # Graph compilation trace
 # ---------------------------------------------------------------------------
 
-@dataclass
 class KernelTrace:
-    """Trace record for a single kernel in the graph."""
-    name: str
-    schedule_rule: str = ""  # e.g. "Matmul", "ElementWise", "Fallback"
-    input_shapes: list[tuple[int | str, ...]] = field(default_factory=list)
-    output_shape: tuple[int | str, ...] = ()
-    output_dtype: str = ""
-    is_dynamic: bool = False
-    is_torch_op: bool = False
-    compile_time_ms: float = 0.0
+    """Trace record for a single kernel in the graph.
+
+    TIR snapshots (``unscheduled_tir`` / ``scheduled_tir``) are serialized
+    lazily on first access to avoid the cost of TVM Script printing during
+    compilation when the user never inspects the trace.
+    """
+
+    __slots__ = (
+        "name", "schedule_rule", "input_shapes", "output_shape",
+        "output_dtype", "is_dynamic", "is_torch_op", "compile_time_ms",
+        "_unscheduled_func", "_scheduled_func",
+        "_unscheduled_tir", "_scheduled_tir",
+    )
+
+    def __init__(self, name: str):
+        self.name = name
+        self.schedule_rule: str = ""
+        self.input_shapes: list[tuple[int | str, ...]] = []
+        self.output_shape: tuple[int | str, ...] = ()
+        self.output_dtype: str = ""
+        self.is_dynamic: bool = False
+        self.is_torch_op: bool = False
+        self.compile_time_ms: float = 0.0
+        # Lazy TIR snapshots: store PrimFunc refs, serialize on access.
+        self._unscheduled_func: Any = None
+        self._scheduled_func: Any = None
+        self._unscheduled_tir: str | None = None
+        self._scheduled_tir: str | None = None
+
+    @property
+    def unscheduled_tir(self) -> str:
+        if self._unscheduled_tir is None:
+            self._unscheduled_tir = str(self._unscheduled_func) if self._unscheduled_func is not None else ""
+        return self._unscheduled_tir
+
+    @property
+    def scheduled_tir(self) -> str:
+        if self._scheduled_tir is None:
+            self._scheduled_tir = str(self._scheduled_func) if self._scheduled_func is not None else ""
+        return self._scheduled_tir
+
+    def set_tir_funcs(self, unscheduled: Any, scheduled: Any) -> None:
+        """Attach PrimFunc references for lazy serialization."""
+        self._unscheduled_func = unscheduled
+        self._scheduled_func = scheduled
 
 
 @dataclass
@@ -78,10 +113,6 @@ class GraphCompileTrace:
     relax_functions: dict[str, str] = field(default_factory=dict)
     # Schedule rule matching (function_name → rule_name)
     schedule_matches: dict[str, str] = field(default_factory=dict)
-    # IR module snapshots as TVM Script strings.
-    # Stored as strings to avoid aliasing issues with mutable IRModule objects.
-    unscheduled_mod: str = ""  # after FuseTIR, before schedule rules
-    scheduled_mod: str = ""   # after schedule rules applied
 
     def summary(self) -> str:
         """Return a human-readable summary of the compilation trace."""
@@ -102,19 +133,30 @@ class GraphCompileTrace:
                           f"({kt.compile_time_ms:.1f}ms)")
         return "\n".join(lines)
 
-    def show_unscheduled_mod(self) -> None:
-        """Print the Relax IR module before schedule rules were applied."""
-        if not self.unscheduled_mod:
-            print("Unscheduled module not available.")
-            return
-        print(self.unscheduled_mod)
+    def show_tir(self, kernel_name: str | None = None) -> None:
+        """Print unscheduled and scheduled TIR for each kernel.
 
-    def show_scheduled_mod(self) -> None:
-        """Print the Relax IR module after schedule rules were applied."""
-        if not self.scheduled_mod:
-            print("Scheduled module not available.")
-            return
-        print(self.scheduled_mod)
+        If *kernel_name* is given, only that kernel is printed.
+        """
+        targets = self.kernels
+        if kernel_name is not None:
+            targets = [kt for kt in self.kernels if kt.name == kernel_name]
+            if not targets:
+                print(f"No kernel named '{kernel_name}' in trace.")
+                return
+        for kt in targets:
+            if kt.is_torch_op:
+                print(f"--- {kt.name} [torch_op, no TIR] ---")
+                continue
+            print(f"{'=' * 60}")
+            print(f"Kernel: {kt.name}  (rule: {kt.schedule_rule})")
+            print(f"{'=' * 60}")
+            print(f"--- Unscheduled TIR ---")
+            print(kt.unscheduled_tir or "(not captured)")
+            print()
+            print(f"--- Scheduled TIR ---")
+            print(kt.scheduled_tir or "(not captured)")
+            print()
 
 
 # ---------------------------------------------------------------------------
@@ -323,24 +365,35 @@ def _build_relax_module(
     return mod, torch_op_map
 
 
+@dataclass
+class _ScheduleResult:
+    """Result of traced schedule rule application."""
+    schedule_matches: dict[str, str] = field(default_factory=dict)
+    # Per-function PrimFunc refs: {func_name: (unscheduled_func, scheduled_func)}.
+    # Stored as references, not strings — serialization is deferred to KernelTrace.
+    tir_snapshots: dict[str, tuple[Any, Any]] = field(default_factory=dict)
+
+
 def _apply_schedule_rules_traced(
     mod: tvm.IRModule,
     rules: list[Any],
     target: tvm.target.Target,
-) -> tuple[tvm.IRModule, dict[str, str]]:
-    """Apply schedule rules with tracing: returns (mod, {func_name: rule_name}).
+) -> tuple[tvm.IRModule, _ScheduleResult]:
+    """Apply schedule rules with tracing.
 
-    This replaces ``ApplyDefaultSchedule`` to capture which rule matched
-    each TIR function, enabling compilation trace reporting.
+    Returns ``(mod, result)`` where *result* contains which rule matched
+    each TIR function and per-function before/after TIR snapshots.
     """
-    schedule_matches: dict[str, str] = {}
+    result = _ScheduleResult()
     updated_functions = {}
     for g_var, func in mod.functions_items():
         if not isinstance(func, tir.PrimFunc):
             continue
         if func.attrs and func.attrs.get("tir.is_scheduled"):
             continue
+        name = g_var.name_hint
         matched_rule = None
+        scheduled_func = None
         for rule in rules:
             space = rule.apply(func, target, False)
             if space is None:
@@ -348,28 +401,33 @@ def _apply_schedule_rules_traced(
             if isinstance(space, tir.Schedule):
                 space = [space]
             assert len(space) == 1
-            updated_functions[g_var] = (
-                space[0].mod["main"].with_attr("tir.is_scheduled", True)
-            )
+            scheduled_func = space[0].mod["main"].with_attr("tir.is_scheduled", True)
+            updated_functions[g_var] = scheduled_func
             matched_rule = type(rule).__name__
             break
-        name = g_var.name_hint
-        schedule_matches[name] = matched_rule or "none"
+        result.schedule_matches[name] = matched_rule or "none"
+        result.tir_snapshots[name] = (func, scheduled_func)
         if matched_rule:
             logger.info("  %-40s → %s", name, matched_rule)
         else:
             logger.debug("  %-40s → no rule matched", name)
     for g_var, func in updated_functions.items():
         mod[g_var] = func
-    return mod, schedule_matches
+    return mod, result
 
 
 def _schedule_relax_module(
     mod: tvm.IRModule,
     arch: str,
     trace: GraphCompileTrace | None = None,
-) -> tvm.IRModule:
+) -> tuple[tvm.IRModule, _ScheduleResult | None]:
+    """Schedule all TIR functions in *mod*.
+
+    Returns ``(mod, schedule_result)`` where *schedule_result* is ``None``
+    when tracing is disabled (no ``trace`` argument).
+    """
     target = tvm.target.cuda(arch=arch)
+    schedule_result: _ScheduleResult | None = None
     with target:
         mod = relax.transform.LegalizeOps()(mod)
         mod = relax.transform.AnnotateTIROpPattern()(mod)
@@ -378,9 +436,6 @@ def _schedule_relax_module(
         mod = relax.transform.FuseTIR()(mod)
 
         if trace is not None:
-            # Snapshot the unscheduled module (after fusion, before rules).
-            trace.unscheduled_mod = str(mod)
-
             # Capture pre-schedule function list.
             for g_var, func in mod.functions_items():
                 if isinstance(func, tir.PrimFunc):
@@ -394,12 +449,11 @@ def _schedule_relax_module(
 
             logger.info("Schedule rule matching:")
             rules = default_schedule_rules()
-            mod, schedule_matches = _apply_schedule_rules_traced(mod, rules, target)
-            trace.schedule_matches = schedule_matches
-            trace.scheduled_mod = str(mod)
+            mod, schedule_result = _apply_schedule_rules_traced(mod, rules, target)
+            trace.schedule_matches = schedule_result.schedule_matches
         else:
             mod = tvm.dlight.ApplyDefaultSchedule(*default_schedule_rules())(mod)
-    return mod
+    return mod, schedule_result
 
 
 def _extract_call_sequence(main_func: relax.Function) -> tuple[CallRecord, ...]:
@@ -968,7 +1022,7 @@ def _compile_subgraph(
     mod = from_fx(gm, input_info, unwrap_unit_return_tuple=True)
 
     # Schedule with TileLang rules.
-    mod = _schedule_relax_module(mod, arch)
+    mod, _ = _schedule_relax_module(mod, arch)
 
     # Check if the scheduled module has any kernels.
     # Identity subgraphs (e.g. bool predicate pass-through) produce
@@ -1116,7 +1170,7 @@ def _compile_graph(
 
     # 2. Schedule with TileLang rules
     t0 = time.perf_counter()
-    mod = _schedule_relax_module(mod, arch, trace=trace)
+    mod, schedule_result = _schedule_relax_module(mod, arch, trace=trace)
     trace.schedule_time_ms = (time.perf_counter() - t0) * 1000
     logger.info("Graph compile: scheduling done (%.1f ms).", trace.schedule_time_ms)
 
@@ -1152,6 +1206,9 @@ def _compile_graph(
         kt = KernelTrace(name=call.gv_name)
         kt.schedule_rule = trace.schedule_matches.get(call.gv_name, "unknown")
         kt.is_torch_op = is_torch_op
+        if schedule_result is not None and call.gv_name in schedule_result.tir_snapshots:
+            unsched, sched = schedule_result.tir_snapshots[call.gv_name]
+            kt.set_tir_funcs(unsched, sched)
 
         if isinstance(tir_func, tir.PrimFunc):
             # Extract input/output shape info from buffer_map.
