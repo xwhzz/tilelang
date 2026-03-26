@@ -512,16 +512,11 @@ def _compile_subgraph(
         _compilation_traces.append(trace)
 
     # Try direct kernel execution (bypasses VM, ~10x less per-call overhead).
-    from tilelang.jit.graph import _extract_call_sequence
-    extract_result = _extract_call_sequence(mod)
     direct_result = None
-    if extract_result is None:
-        logger.info("Direct path: call sequence extraction failed (unsupported IR)")
-    else:
-        try:
-            direct_result = compile_subgraph_direct(mod, target)
-        except Exception:
-            logger.info("Direct path: TIR compilation failed, will use VM", exc_info=True)
+    try:
+        direct_result = compile_subgraph_direct(mod, target)
+    except Exception:
+        logger.info("Direct path: compilation failed, will use VM", exc_info=True)
 
     # Whether this subgraph has only static (concrete int) shapes.
     is_static = not sym_var_cache
