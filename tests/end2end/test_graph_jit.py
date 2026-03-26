@@ -1,12 +1,13 @@
-"""Tests for tilelang.jit(mode="graph") end-to-end graph compilation."""
+"""Tests for torch.compile(backend="tilelang") end-to-end graph compilation."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import torch._dynamo
 
-import tilelang
-from tilelang.profiler import do_bench
+import tilelang  # noqa: F401  (triggers backend registration)
+from tilelang.profiler import do_bench  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -32,6 +33,8 @@ def test_graph_jit_mlp():
         print("CUDA not available, skipping.")
         return
 
+    torch._dynamo.reset()
+
     dim = 4096
     dtype = "float16"
     accum_dtype = "float32"
@@ -43,8 +46,8 @@ def test_graph_jit_mlp():
     w1 = torch.randn((dim, dim), device="cuda", dtype=torch_dtype)
     w2 = torch.randn((dim, dim), device="cuda", dtype=torch_dtype)
 
-    # --- graph-mode JIT ---
-    @tilelang.jit(mode="graph")
+    # --- graph-mode via torch.compile ---
+    @torch.compile(backend="tilelang")
     def mlp(x_in: torch.Tensor, w1_in: torch.Tensor, w2_in: torch.Tensor) -> torch.Tensor:
         x_acc = x_in.to(torch_accum)
         w1_acc = w1_in.to(torch_accum)
@@ -70,7 +73,7 @@ def test_graph_jit_mlp():
     # --- benchmark ---
     tl_time = do_bench(lambda: mlp(x, w1, w2), backend="event")
     tc_time = do_bench(lambda: ref(x, w1, w2), backend="event")
-    print(f"  tilelang.jit(graph) time: {tl_time:.6f} ms, torch.compile time: {tc_time:.6f} ms")
+    print(f"  tilelang backend time: {tl_time:.6f} ms, torch.compile time: {tc_time:.6f} ms")
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +85,9 @@ def test_graph_jit_shape_cache():
         print("CUDA not available, skipping.")
         return
 
-    @tilelang.jit(mode="graph")
+    torch._dynamo.reset()
+
+    @torch.compile(backend="tilelang")
     def add_relu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return F.relu(a + b)
 
@@ -98,47 +103,19 @@ def test_graph_jit_shape_cache():
     ref2 = F.relu(a2 + b2)
     torch.testing.assert_close(out2, ref2, rtol=1e-3, atol=1e-3)
 
-    # Check that both shapes are cached
-    assert len(add_relu._cache) == 2, f"Expected 2 cached runners, got {len(add_relu._cache)}"
     print("\033[92mtest_graph_jit_shape_cache: passed.\033[0m")
 
 
 # ---------------------------------------------------------------------------
-# Test 3: explicit compile() to inspect the runner
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_explicit_compile():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    @tilelang.jit(mode="graph")
-    def simple_matmul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a @ b
-
-    M, N, K = 512, 512, 512
-    a = torch.randn(M, K, device="cuda")
-    b = torch.randn(K, N, device="cuda")
-
-    runner = simple_matmul.compile(a, b)
-    assert hasattr(runner, "kernels"), "GraphRunner should expose .kernels"
-    assert hasattr(runner, "calls"), "GraphRunner should expose .calls"
-    assert len(runner.calls) > 0, "Expected at least one kernel call"
-
-    out = runner(a, b)
-    ref = a @ b
-    torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
-    print("\033[92mtest_graph_jit_explicit_compile: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 4: float32 path
+# Test 3: float32 path
 # ---------------------------------------------------------------------------
 
 def test_graph_jit_float32():
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
+
+    torch._dynamo.reset()
 
     dim = 1024
 
@@ -147,7 +124,7 @@ def test_graph_jit_float32():
     w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float32)
     w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float32)
 
-    @tilelang.jit(mode="graph")
+    @torch.compile(backend="tilelang")
     def mlp_f32(x_in, w1_in, w2_in):
         return w2_in @ F.relu(w1_in @ x_in)
 
@@ -158,229 +135,21 @@ def test_graph_jit_float32():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: CUDA graph capture via enable_cuda_graph()
+# Test 4: user-registered torch.library custom op (transparent handling)
 # ---------------------------------------------------------------------------
 
-def test_graph_jit_cuda_graph_manual():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 1024
-    torch.manual_seed(0)
-    x = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-
-    @tilelang.jit(mode="graph")
-    def mlp(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    # Compile and enable CUDA graph manually
-    runner = mlp.compile(x, w1, w2)
-    runner.enable_cuda_graph(warmup_iters=3)
-
-    # First call triggers capture; subsequent calls replay.
-    out1 = runner(x, w1, w2)
-    ref1 = w2.float() @ F.relu(w1.float() @ x.float())
-    rtol, atol = _dtype_tolerance("float16", "float32")
-    torch.testing.assert_close(out1.float(), ref1, rtol=rtol, atol=atol)
-
-    # Second call with different data — must still be correct.
-    x2 = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    out2 = runner(x2, w1, w2)
-    ref2 = w2.float() @ F.relu(w1.float() @ x2.float())
-    torch.testing.assert_close(out2.float(), ref2, rtol=rtol, atol=atol)
-
-    assert runner._cuda_graph is not None, "CUDA graph should be captured"
-    print("\033[92mtest_graph_jit_cuda_graph_manual: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 6: CUDA graph via decorator (cuda_graph=True)
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_cuda_graph_decorator():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 1024
-    torch.manual_seed(42)
-    x = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-
-    @tilelang.jit(mode="graph", cuda_graph=True)
-    def mlp_cg(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    # First call: compile + capture + return result
-    out = mlp_cg(x, w1, w2)
-    ref = w2.float() @ F.relu(w1.float() @ x.float())
-    rtol, atol = _dtype_tolerance("float16", "float32")
-    torch.testing.assert_close(out.float(), ref, rtol=rtol, atol=atol)
-
-    # Verify graph was captured
-    runner = mlp_cg._cache[list(mlp_cg._cache.keys())[0]]
-    assert runner._cuda_graph is not None, "cuda_graph=True should auto-capture"
-
-    # Second call with new data — replays captured graph
-    x2 = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    out2 = mlp_cg(x2, w1, w2)
-    ref2 = w2.float() @ F.relu(w1.float() @ x2.float())
-    torch.testing.assert_close(out2.float(), ref2, rtol=rtol, atol=atol)
-    print("\033[92mtest_graph_jit_cuda_graph_decorator: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 7: CUDA graph benchmark
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_cuda_graph_benchmark():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 4096
-    torch.manual_seed(0)
-    x = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-
-    # Normal graph runner (no CUDA graph)
-    @tilelang.jit(mode="graph")
-    def mlp_normal(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    # CUDA graph runner
-    @tilelang.jit(mode="graph", cuda_graph=True)
-    def mlp_cudagraph(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    # Warm up both
-    mlp_normal(x, w1, w2)
-    mlp_cudagraph(x, w1, w2)
-
-    normal_time = do_bench(lambda: mlp_normal(x, w1, w2), backend="event")
-    cg_time = do_bench(lambda: mlp_cudagraph(x, w1, w2), backend="event")
-    print(f"\033[92mtest_graph_jit_cuda_graph_benchmark:\033[0m "
-          f"normal={normal_time:.6f} ms, cuda_graph={cg_time:.6f} ms")
-
-
-# ---------------------------------------------------------------------------
-# Test 8: native C++ dispatch via enable_native_dispatch()
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_native_manual():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 1024
-    torch.manual_seed(0)
-    x = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-
-    @tilelang.jit(mode="graph")
-    def mlp(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    runner = mlp.compile(x, w1, w2)
-    runner.enable_native_dispatch()
-
-    out = runner(x, w1, w2)
-    ref = w2.float() @ F.relu(w1.float() @ x.float())
-    rtol, atol = _dtype_tolerance("float16", "float32")
-    torch.testing.assert_close(out.float(), ref, rtol=rtol, atol=atol)
-
-    # Different data
-    x2 = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    out2 = runner(x2, w1, w2)
-    ref2 = w2.float() @ F.relu(w1.float() @ x2.float())
-    torch.testing.assert_close(out2.float(), ref2, rtol=rtol, atol=atol)
-
-    assert runner._native_func is not None
-    print("\033[92mtest_graph_jit_native_manual: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 9: native dispatch via decorator (native=True)
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_native_decorator():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 1024
-    torch.manual_seed(42)
-    x = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-
-    @tilelang.jit(mode="graph", native=True)
-    def mlp_native(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    out = mlp_native(x, w1, w2)
-    ref = w2.float() @ F.relu(w1.float() @ x.float())
-    rtol, atol = _dtype_tolerance("float16", "float32")
-    torch.testing.assert_close(out.float(), ref, rtol=rtol, atol=atol)
-
-    runner = mlp_native._cache[list(mlp_native._cache.keys())[0]]
-    assert runner._native_func is not None, "native=True should build C dispatch"
-    print("\033[92mtest_graph_jit_native_decorator: passed.\033[0m")
-
-
-# ---------------------------------------------------------------------------
-# Test 10: native dispatch benchmark
-# ---------------------------------------------------------------------------
-
-def test_graph_jit_native_benchmark():
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 4096
-    torch.manual_seed(0)
-    x = torch.randn((dim,), device="cuda", dtype=torch.float16)
-    w1 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-    w2 = torch.randn((dim, dim), device="cuda", dtype=torch.float16)
-
-    @tilelang.jit(mode="graph")
-    def mlp_py(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    @tilelang.jit(mode="graph", native=True)
-    def mlp_native(x_in, w1_in, w2_in):
-        return w2_in @ F.relu(w1_in @ x_in)
-
-    mlp_py(x, w1, w2)
-    mlp_native(x, w1, w2)
-
-    py_time = do_bench(lambda: mlp_py(x, w1, w2), backend="event")
-    native_time = do_bench(lambda: mlp_native(x, w1, w2), backend="event")
-    print(f"\033[92mtest_graph_jit_native_benchmark:\033[0m "
-          f"python={py_time:.6f} ms, native={native_time:.6f} ms")
-
-
-# ---------------------------------------------------------------------------
-# Test 11: user-registered torch.library custom op (transparent handling)
-# ---------------------------------------------------------------------------
-
-_test11_lib = None
+_test4_lib = None
 
 def test_graph_jit_torch_library_custom_op():
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    global _test11_lib
-    # Register a custom torch op that doubles a tensor.
-    _test11_lib = torch.library.Library("test_tl_graph", "DEF")
-    _test11_lib.define("my_double(Tensor x) -> Tensor")
+    torch._dynamo.reset()
+
+    global _test4_lib
+    _test4_lib = torch.library.Library("test_tl_graph", "DEF")
+    _test4_lib.define("my_double(Tensor x) -> Tensor")
 
     def _cuda_impl(x):
         return x * 2.0
@@ -388,12 +157,12 @@ def test_graph_jit_torch_library_custom_op():
     def _meta_impl(x):
         return torch.empty_like(x)
 
-    _test11_lib.impl("my_double", _cuda_impl, "CUDA")
-    _test11_lib.impl("my_double", _meta_impl, "Meta")
+    _test4_lib.impl("my_double", _cuda_impl, "CUDA")
+    _test4_lib.impl("my_double", _meta_impl, "Meta")
 
     my_double = torch.ops.test_tl_graph.my_double
 
-    @tilelang.jit(mode="graph")
+    @torch.compile(backend="tilelang")
     def fn(a: torch.Tensor) -> torch.Tensor:
         return my_double(a)
 
@@ -405,19 +174,21 @@ def test_graph_jit_torch_library_custom_op():
 
 
 # ---------------------------------------------------------------------------
-# Test 12: torch.library custom op mixed with standard ops
+# Test 5: torch.library custom op mixed with standard ops
 # ---------------------------------------------------------------------------
 
-_test12_lib = None
+_test5_lib = None
 
 def test_graph_jit_torch_library_mixed():
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    global _test12_lib
-    _test12_lib = torch.library.Library("test_tl_graph2", "DEF")
-    _test12_lib.define("my_scale(Tensor x) -> Tensor")
+    torch._dynamo.reset()
+
+    global _test5_lib
+    _test5_lib = torch.library.Library("test_tl_graph2", "DEF")
+    _test5_lib.define("my_scale(Tensor x) -> Tensor")
 
     def _cuda_impl(x):
         return x * 3.0
@@ -425,12 +196,12 @@ def test_graph_jit_torch_library_mixed():
     def _meta_impl(x):
         return torch.empty_like(x)
 
-    _test12_lib.impl("my_scale", _cuda_impl, "CUDA")
-    _test12_lib.impl("my_scale", _meta_impl, "Meta")
+    _test5_lib.impl("my_scale", _cuda_impl, "CUDA")
+    _test5_lib.impl("my_scale", _meta_impl, "Meta")
 
     my_scale = torch.ops.test_tl_graph2.my_scale
 
-    @tilelang.jit(mode="graph")
+    @torch.compile(backend="tilelang")
     def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         s = a + b           # standard op
         s = my_scale(s)     # custom torch op
@@ -445,20 +216,44 @@ def test_graph_jit_torch_library_mixed():
 
 
 # ---------------------------------------------------------------------------
+# Test 7: trace inspection API
+# ---------------------------------------------------------------------------
+
+def test_graph_jit_trace():
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping.")
+        return
+
+    torch._dynamo.reset()
+    from tilelang.jit.backend import clear_compilation_traces, get_compilation_traces
+
+    clear_compilation_traces()
+
+    @torch.compile(backend="tilelang")
+    def add_fn(a, b):
+        return a + b
+
+    a = torch.randn(256, device="cuda")
+    b = torch.randn(256, device="cuda")
+    add_fn(a, b)
+
+    traces = get_compilation_traces()
+    assert len(traces) > 0, "Expected at least one compilation trace"
+    print(f"  Got {len(traces)} trace(s)")
+    for t in traces:
+        print(f"    {t.summary()}")
+    print("\033[92mtest_graph_jit_trace: passed.\033[0m")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     test_graph_jit_mlp()
     test_graph_jit_shape_cache()
-    test_graph_jit_explicit_compile()
     test_graph_jit_float32()
-    test_graph_jit_cuda_graph_manual()
-    test_graph_jit_cuda_graph_decorator()
-    test_graph_jit_cuda_graph_benchmark()
-    test_graph_jit_native_manual()
-    test_graph_jit_native_decorator()
-    test_graph_jit_native_benchmark()
     test_graph_jit_torch_library_custom_op()
     test_graph_jit_torch_library_mixed()
+    test_graph_jit_trace()
     print("\n\033[92mAll graph-mode JIT tests passed.\033[0m")

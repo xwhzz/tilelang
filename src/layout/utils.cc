@@ -117,9 +117,13 @@ Array<IterSplitExpr> get_unused_iters(const IterMark &mark,
   bool match_full_iter =
       analyzer->CanProveEqual(expected_lower_factor, mark->extent);
   if (!match_full_iter) {
-    results.emplace_back(
-        mark, expected_lower_factor,
-        analyzer->Simplify(FloorDiv(mark->extent, expected_lower_factor)), 1);
+    PrimExpr extent =
+        analyzer->Simplify(FloorDiv(mark->extent, expected_lower_factor));
+    // Skip zero-extent splits (can happen when tile factors exceed the
+    // loop extent, e.g. seq_len=7 with tile_size=128).
+    if (!is_zero(extent)) {
+      results.emplace_back(mark, expected_lower_factor, extent, 1);
+    }
   }
   return results;
 }
@@ -272,13 +276,20 @@ Array<IterSplitExpr> DivideUnusedIterators(const Array<PrimExpr> &exprs,
 }
 
 PrimExpr MakeFlattenedExpression(const Array<arith::IterSplitExpr> &splits) {
+  // Filter out zero-extent splits to avoid divide-by-zero in
+  // NormalizeIterMapToExpr when FloorMod/FloorDiv receives a zero divisor.
+  Array<arith::IterSplitExpr> valid;
+  for (const auto &s : splits) {
+    if (!is_zero(s->extent)) valid.push_back(s);
+  }
+  if (valid.empty()) return IntImm(DataType::Int(32), 0);
   Array<arith::IterSplitExpr> lists;
   PrimExpr scale = 1;
-  for (int i = splits.size() - 1; i >= 0; i--) {
+  for (int i = valid.size() - 1; i >= 0; i--) {
     auto scaled_split = arith::IterSplitExpr(
-        splits[i]->source, splits[i]->lower_factor, splits[i]->extent, scale);
+        valid[i]->source, valid[i]->lower_factor, valid[i]->extent, scale);
     lists.push_back(scaled_split);
-    scale *= splits[i]->extent;
+    scale *= valid[i]->extent;
   }
   return arith::NormalizeIterMapToExpr(arith::IterSumExpr(lists, 0));
 }

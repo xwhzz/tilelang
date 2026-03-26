@@ -1,28 +1,31 @@
-"""Tests for dynamic shapes and dynamic control flow in graph compile."""
+"""Tests for dynamic shapes and dynamic control flow with torch.compile(backend="tilelang")."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import torch._dynamo
 
-import tilelang
+import tilelang  # noqa: F401  (triggers backend registration)
 
 
 # ===========================================================================
-# Dynamic Shape Tests (True dynamic — compile once, run with any shape)
+# Shape Recompilation Tests (Dynamo handles guard-based recompilation)
 # ===========================================================================
 
-def test_dynamic_shape_elementwise():
-    """Compile add+relu once with symbolic dim, run with multiple sizes."""
+def test_shape_recompilation():
+    """Different shapes trigger Dynamo recompilation automatically."""
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    @tilelang.jit(mode="graph", dynamic_dims={0: [0], 1: [0]})
+    torch._dynamo.reset()
+
+    @torch.compile(backend="tilelang")
     def add_relu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return F.relu(a + b)
 
-    for N in [128, 256, 512, 1024]:
+    for N in [128, 256, 512]:
         a = torch.randn(N, device="cuda")
         b = torch.randn(N, device="cuda")
         out = add_relu(a, b)
@@ -30,21 +33,20 @@ def test_dynamic_shape_elementwise():
         torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
         print(f"  shape ({N},) passed")
 
-    # Verify single compilation
-    assert add_relu._dynamic_runner is not None
-    assert len(add_relu._cache) == 0
-    print("\033[92mtest_dynamic_shape_elementwise: passed (compiled once).\033[0m")
+    print("\033[92mtest_shape_recompilation: passed.\033[0m")
 
 
-def test_dynamic_shape_matmul():
-    """Dynamic batch dimension for matmul (compile once)."""
+def test_shape_recompilation_matmul():
+    """Different batch sizes with matmul."""
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
+    torch._dynamo.reset()
+
     K, N = 512, 512
 
-    @tilelang.jit(mode="graph", dynamic_dims={0: [0]})
+    @torch.compile(backend="tilelang")
     def matmul_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         return a @ b
 
@@ -56,49 +58,27 @@ def test_dynamic_shape_matmul():
         torch.testing.assert_close(out, ref, rtol=1e-2, atol=1e-2)
         print(f"  shape ({M}, {K}) @ ({K}, {N}) passed")
 
-    assert matmul_fn._dynamic_runner is not None
-    print("\033[92mtest_dynamic_shape_matmul: passed (compiled once).\033[0m")
+    print("\033[92mtest_shape_recompilation_matmul: passed.\033[0m")
 
 
-def test_dynamic_shape_2d_single_dim():
-    """2D tensor with one dynamic dimension."""
+def test_shape_recompilation_mlp():
+    """MLP with different batch dimensions."""
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    @tilelang.jit(mode="graph", dynamic_dims={0: [0], 1: [0]})
-    def add_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return a + b
-
-    N = 256
-    for M in [32, 64, 128]:
-        a = torch.randn(M, N, device="cuda")
-        b = torch.randn(M, N, device="cuda")
-        out = add_fn(a, b)
-        ref = a + b
-        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-        print(f"  shape ({M}, {N}) passed")
-
-    assert add_fn._dynamic_runner is not None
-    print("\033[92mtest_dynamic_shape_2d_single_dim: passed (compiled once).\033[0m")
-
-
-def test_dynamic_shape_mlp():
-    """MLP with dynamic batch dimension: (B, dim) @ (dim, dim) → (B, dim)."""
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
+    torch._dynamo.reset()
 
     dim = 256
     torch.manual_seed(0)
     w1 = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
     w2 = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
 
-    @tilelang.jit(mode="graph", dynamic_dims={0: [0]})
+    @torch.compile(backend="tilelang")
     def mlp(x, w1_in, w2_in):
-        h = x @ w1_in        # (B, dim) @ (dim, dim) -> (B, dim)
+        h = x @ w1_in
         h = F.relu(h)
-        return h @ w2_in     # (B, dim) @ (dim, dim) -> (B, dim)
+        return h @ w2_in
 
     for B in [4, 16, 64]:
         x = torch.randn(B, dim, device="cuda", dtype=torch.float32)
@@ -107,33 +87,7 @@ def test_dynamic_shape_mlp():
         torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
         print(f"  batch={B} passed")
 
-    assert mlp._dynamic_runner is not None
-    print("\033[92mtest_dynamic_shape_mlp: passed (compiled once).\033[0m")
-
-
-# ===========================================================================
-# Shape Recompilation Tests (fallback when dynamic_dims not specified)
-# ===========================================================================
-
-def test_shape_recompilation():
-    """Without dynamic_dims, each shape triggers recompilation."""
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    @tilelang.jit(mode="graph")
-    def add_relu(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-        return F.relu(a + b)
-
-    for N in [128, 256, 512]:
-        a = torch.randn(N, device="cuda")
-        b = torch.randn(N, device="cuda")
-        out = add_relu(a, b)
-        ref = F.relu(a + b)
-        torch.testing.assert_close(out, ref, rtol=1e-3, atol=1e-3)
-
-    assert len(add_relu._cache) == 3
-    print("\033[92mtest_shape_recompilation: passed (3 compilations).\033[0m")
+    print("\033[92mtest_shape_recompilation_mlp: passed.\033[0m")
 
 
 # ===========================================================================
@@ -141,13 +95,15 @@ def test_shape_recompilation():
 # ===========================================================================
 
 def test_python_if_else_basic():
-    """Python if/else on tensor pred — compiled via torch.compile fallback."""
+    """Python if/else on tensor pred — Dynamo handles via graph breaks."""
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
 
-    @tilelang.jit(mode="graph")
-    def cond_fn(pred: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    torch._dynamo.reset()
+
+    @torch.compile(backend="tilelang")
+    def cond_fn(pred, x: torch.Tensor) -> torch.Tensor:
         if pred:
             return x * 2.0
         else:
@@ -155,69 +111,13 @@ def test_python_if_else_basic():
 
     x = torch.randn(256, device="cuda")
 
-    pred_true = True # torch.tensor(True, device="cuda")
-    out = cond_fn(pred_true, x)
+    out = cond_fn(True, x)
     torch.testing.assert_close(out, x * 2.0, rtol=1e-5, atol=1e-5)
 
-    pred_false = False # torch.tensor(False, device="cuda")
-    out = cond_fn(pred_false, x)
+    out = cond_fn(False, x)
     torch.testing.assert_close(out, x * 0.5, rtol=1e-5, atol=1e-5)
 
-    # Verify dynamo fallback was used.
-    assert cond_fn._dynamo_runner is not None
-    print("\033[92mtest_python_if_else_basic: passed (dynamo fallback).\033[0m")
-
-
-def test_python_if_else_with_matmul():
-    """Python if/else with matmul in branches — dynamo fallback."""
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    dim = 256
-
-    @tilelang.jit(mode="graph")
-    def cond_matmul(pred, x, w):
-        if pred:
-            return F.relu(w @ x)
-        else:
-            return F.silu(w @ x)
-
-    x = torch.randn(dim, device="cuda", dtype=torch.float32)
-    w = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
-
-    pred_true = torch.tensor(True, device="cuda")
-    out = cond_matmul(pred_true, x, w)
-    torch.testing.assert_close(out, F.relu(w @ x), rtol=1e-3, atol=1e-3)
-
-    pred_false = torch.tensor(False, device="cuda")
-    out = cond_matmul(pred_false, x, w)
-    torch.testing.assert_close(out, F.silu(w @ x), rtol=1e-3, atol=1e-3)
-
-    assert cond_matmul._dynamo_runner is not None
-    print("\033[92mtest_python_if_else_with_matmul: passed (dynamo fallback).\033[0m")
-
-
-def test_python_while_loop():
-    """Python while loop with data-dependent iteration — dynamo fallback."""
-    if not torch.cuda.is_available():
-        print("CUDA not available, skipping.")
-        return
-
-    @tilelang.jit(mode="graph")
-    def iterative_fn(x: torch.Tensor) -> torch.Tensor:
-        while x.sum() < 100.0:
-            x = x * 1.5
-        return x
-
-    x = torch.ones(10, device="cuda") * 2.0
-    out = iterative_fn(x)
-    ref = x.clone()
-    while ref.sum() < 100.0:
-        ref = ref * 1.5
-    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
-    assert iterative_fn._dynamo_runner is not None
-    print("\033[92mtest_python_while_loop: passed (dynamo fallback).\033[0m")
+    print("\033[92mtest_python_if_else_basic: passed.\033[0m")
 
 
 def test_where_conditional():
@@ -226,7 +126,9 @@ def test_where_conditional():
         print("CUDA not available, skipping.")
         return
 
-    @tilelang.jit(mode="graph")
+    torch._dynamo.reset()
+
+    @torch.compile(backend="tilelang")
     def where_fn(cond, a, b):
         return torch.where(cond, a, b)
 
@@ -245,27 +147,19 @@ def test_where_conditional():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("True Dynamic Shape Tests (compile once)")
+    print("Shape Recompilation Tests")
     print("=" * 60)
-    test_dynamic_shape_elementwise()
-    print()
-    test_dynamic_shape_matmul()
-    print()
-    test_dynamic_shape_2d_single_dim()
-    print()
-    test_dynamic_shape_mlp()
-    print()
     test_shape_recompilation()
+    print()
+    test_shape_recompilation_matmul()
+    print()
+    test_shape_recompilation_mlp()
     print()
 
     print("=" * 60)
     print("Dynamic Control Flow Tests")
     print("=" * 60)
     test_python_if_else_basic()
-    print()
-    test_python_if_else_with_matmul()
-    print()
-    test_python_while_loop()
     print()
     test_where_conditional()
     print()

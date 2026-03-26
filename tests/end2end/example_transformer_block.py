@@ -191,18 +191,14 @@ def _build_transformer_block(
     ffn_dim: int = FFN_DIM,
     is_causal: bool = IS_CAUSAL,
     arch: str | None = None,
-    cuda_graph: bool = False,
-    native: bool = False,
 ):
     flash_attn = _get_flash_attn_kernel(batch, num_heads, seq_len, seq_len, head_dim, is_causal)
 
-    @tilelang.jit(
-        mode="graph",
-        target=arch,
-        cuda_graph=cuda_graph,
-        native=native,
-        pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-    )
+    options = {"pass_configs": {tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True}}
+    if arch is not None:
+        options["arch"] = arch
+
+    @torch.compile(backend="tilelang", options=options)
     def transformer_block(x, w_q, w_k, w_v, w_o, w_gate, w_up, w_down):
         # QKV projections: [B, S, H] @ [H, H] -> [B, S, H]
         # Explicit bf16 casts: Relax matmul legalization upcasts to f32;
@@ -302,31 +298,37 @@ def _make_inputs(
 # ---------------------------------------------------------------------------
 
 def check_only(arch: str | None) -> None:
+    import torch._dynamo
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
+    torch._dynamo.reset()
+
     args = _make_inputs()
     block = _build_transformer_block(arch=arch)
-    runner = block.compile(*args)
 
-    print("=== Scheduled Relax Module ===")
-    print(runner.scheduled_mod.script())
+    # Trigger compilation.
+    out = block(*args)
+    print(f"Output shape: {out.shape}, dtype: {out.dtype}")
+    print("\033[92mCompilation check passed.\033[0m")
 
 
 def build_and_run(
     arch: str | None,
     bench_backend: str,
-    cuda_graph: bool,
-    native: bool,
 ) -> tuple[float, float]:
+    import torch._dynamo
+
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required.")
 
+    torch._dynamo.reset()
+
     args = _make_inputs()
 
-    block = _build_transformer_block(arch=arch, cuda_graph=cuda_graph, native=native)
-    runner = block.compile(*args)
-    tl_out = runner(*args)
+    block = _build_transformer_block(arch=arch)
+    tl_out = block(*args)
 
     ref_fn = _build_reference()
     ref_out = ref_fn(*args)
@@ -334,16 +336,12 @@ def build_and_run(
     torch.testing.assert_close(tl_out, ref_out, rtol=0.1, atol=0.1)
     print("\033[92mCorrectness check passed.\033[0m")
 
-    tl_time = do_bench(lambda: runner(*args), backend=bench_backend)
+    tl_time = do_bench(lambda: block(*args), backend=bench_backend)
     ref_time = do_bench(lambda: ref_fn(*args), backend=bench_backend)
 
     print(f"tilelang graph:  {tl_time:.3f} ms")
     print(f"torch.compile:   {ref_time:.3f} ms")
     print(f"speedup:         {ref_time / tl_time:.2f}x")
-
-    if cuda_graph:
-        cg_time = do_bench(lambda: runner(*args), backend=bench_backend)
-        print(f"tilelang CUDA graph: {cg_time:.3f} ms")
 
     return tl_time, ref_time
 
@@ -355,10 +353,6 @@ def parse_args() -> argparse.Namespace:
                         help='CUDA arch, e.g. "sm_90a".')
     parser.add_argument("--bench-backend", type=str, default="event",
                         choices=["event", "cuda"])
-    parser.add_argument("--cuda-graph", action="store_true",
-                        help="Enable CUDA graph capture.")
-    parser.add_argument("--native", action="store_true",
-                        help="Enable C++ native dispatch.")
     parser.add_argument("--check-only", action="store_true",
                         help="Only compile and print scheduled IR.")
     return parser.parse_args()
@@ -368,15 +362,12 @@ if __name__ == "__main__":
     args = parse_args()
     if args.check_only:
         check_only(args.arch)
-        print("\033[92mCompilation check passed.\033[0m")
     else:
-        build_and_run(args.arch, args.bench_backend, args.cuda_graph, args.native)
+        build_and_run(args.arch, args.bench_backend)
 
 
 """
 Usage:
 python tests/end2end/example_transformer_block.py --arch sm_90a
-python tests/end2end/example_transformer_block.py --arch sm_90a --cuda-graph
-python tests/end2end/example_transformer_block.py --arch sm_90a --native
 python tests/end2end/example_transformer_block.py --arch sm_90a --check-only
 """

@@ -602,7 +602,7 @@ tvm::transform::Pass MakePackedAPI() {
                                                       func->body)) {
           func.CopyOnWrite()->body = body.value();
         }
-        func = MakePackedAPI(std::move(func));
+        func = tvm::tl::MakePackedAPI(std::move(func));
         func = MergeIfStmtSubstitute(func);
 
         if (!func.same_as(orig_func)) {

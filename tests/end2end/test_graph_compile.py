@@ -1,17 +1,20 @@
-"""End-to-end coverage for tilelang.compile(..., mode="graph")."""
+"""End-to-end coverage for torch.compile(backend="tilelang")."""
 
 from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
+import torch._dynamo
 
-import tilelang
+import tilelang  # noqa: F401  (triggers backend registration)
 
 
 def test_graph_compile_mlp():
     if not torch.cuda.is_available():
         print("CUDA not available, skipping.")
         return
+
+    torch._dynamo.reset()
 
     m = 256
     n = 256
@@ -25,17 +28,9 @@ def test_graph_compile_mlp():
     def mlp(a_in: torch.Tensor, b_in: torch.Tensor, bias_in: torch.Tensor) -> torch.Tensor:
         return F.relu(a_in @ b_in + bias_in)
 
-    runner = tilelang.compile(
-        mlp,
-        mode="graph",
-        example_args=(a, b, bias),
-    )
+    compiled = torch.compile(mlp, backend="tilelang")
 
-    assert hasattr(runner, "kernels"), "GraphRunner should expose .kernels"
-    assert hasattr(runner, "calls"), "GraphRunner should expose .calls"
-    assert len(runner.calls) > 0, "Expected at least one scheduled kernel call"
-
-    out = runner(a, b, bias)
+    out = compiled(a, b, bias)
     ref = mlp(a, b, bias)
     torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
     print("\033[92mtest_graph_compile_mlp: passed.\033[0m")

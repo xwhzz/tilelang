@@ -154,7 +154,17 @@ bool ArgBinder::BindNullable(const PrimExpr &arg, const PrimExpr &value,
         LOG(FATAL) << "Unable to solve non-integer variables " << undefs
                    << " from equation `" << value << "`";
       }
-      arith::IntConstraints constraints(undefs, {}, {arg == value});
+      // Shape variables are non-negative.  Tell the analyzer so that
+      // max(v, 0) simplifies to v before the linear solver sees it.
+      for (const auto &v : undefs) {
+        analyzer_.const_int_bound.Update(
+            v, arith::ConstIntBound(0, arith::ConstIntBound::kPosInf),
+            /*allow_override=*/true);
+      }
+      PrimExpr arg_simplified = analyzer_.Simplify(arg);
+      PrimExpr value_simplified = analyzer_.Simplify(value);
+      arith::IntConstraints constraints(undefs, {},
+                                        {arg_simplified == value_simplified});
       auto sol = arith::SolveLinearEquations(constraints);
       if (!sol->dst->variables.empty()) {
         LOG(FATAL) << "TVM is unable to solve variables " << undefs

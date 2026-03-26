@@ -540,6 +540,11 @@ Fragment ParallelOpNode::CompleteBufferFragment(const Buffer &buffer) const {
 
   PrimExpr indice_rep_extent =
       ind_inv->InputShape().back(); // this is the size of rep_b
+  // Guard: if the replicate extent is zero (degenerate case when tile
+  // factors exceed loop extents), fall back to loop_layout_.
+  if (is_zero(indice_rep_extent)) {
+    return loop_layout_;
+  }
   PrimExpr loop_rep_extent = loop_layout_->ReplicateExtent();
   PrimExpr dest_buffer_rep_extent = indice_rep_extent * loop_rep_extent;
   Array<PrimExpr> fwd;
