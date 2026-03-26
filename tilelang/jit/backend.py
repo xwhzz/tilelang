@@ -286,6 +286,66 @@ def _make_direct_runner(param_names, call_seq, output_names, rt_mod, tvm_device,
 
 
 # ---------------------------------------------------------------------------
+# CUDA Graph runner (eliminates kernel launch overhead on repeated calls)
+# ---------------------------------------------------------------------------
+
+# Environment variable to disable CUDA graphs (e.g. for debugging).
+_CUDA_GRAPHS_ENABLED = os.environ.get("TILELANG_CUDA_GRAPHS", "1") not in ("0", "false", "no")
+
+
+def _wrap_with_cuda_graph(base_runner, warmup_iters=3):
+    """Wrap a runner with CUDA graph recording/replay.
+
+    1. First *warmup_iters* calls execute normally (warmup + allocator priming).
+    2. Next call: record the kernel sequence into a ``torch.cuda.CUDAGraph``
+       using a private memory pool on the current stream.
+    3. Subsequent calls: copy inputs into static buffers, replay, clone outputs.
+
+    This eliminates per-call kernel launch overhead (~5-10 us each)
+    which compounds across many subgraphs.
+    """
+    call_count = 0
+    graph = None
+    static_inputs = None
+    static_outputs = None
+    pool = torch.cuda.graph_pool_handle()
+
+    def runner(*args):
+        nonlocal call_count, graph, static_inputs, static_outputs
+
+        call_count += 1
+
+        # --- Warmup phase: execute normally to prime allocator ---
+        if call_count <= warmup_iters:
+            return base_runner(*args)
+
+        # --- Record phase: capture CUDA graph ---
+        if graph is None:
+            static_inputs = [a.clone() for a in args if isinstance(a, torch.Tensor)]
+
+            # Record on the current stream with a private pool so that
+            # graph-internal allocations don't conflict with external ones.
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, pool=pool):
+                static_outputs = base_runner(*static_inputs)
+
+            if not isinstance(static_outputs, tuple):
+                static_outputs = (static_outputs,)
+
+        # --- Replay phase ---
+        j = 0
+        for a in args:
+            if isinstance(a, torch.Tensor):
+                static_inputs[j].copy_(a)
+                j += 1
+
+        graph.replay()
+        return tuple(o.clone() for o in static_outputs)
+
+    return runner
+
+
+# ---------------------------------------------------------------------------
 # FX-level diamond breaking (improves FuseOps fusion)
 # ---------------------------------------------------------------------------
 
@@ -463,6 +523,9 @@ def _compile_subgraph(
         except Exception:
             logger.info("Direct path: TIR compilation failed, will use VM", exc_info=True)
 
+    # Whether this subgraph has only static (concrete int) shapes.
+    is_static = not sym_var_cache
+
     if direct_result is not None:
         param_names, call_seq, output_names, rt_mod = direct_result
         runner = _make_direct_runner(
@@ -482,6 +545,17 @@ def _compile_subgraph(
             ex = tilelang_relax_build(mod, target)
         vm = VirtualMachine(ex, tvm_device)
         runner = _make_runner(vm["main"], expected_dtypes)
+
+    # Wrap with CUDA graph for static-shape subgraphs to eliminate
+    # kernel launch overhead on repeated calls.
+    use_cuda_graphs = (
+        _CUDA_GRAPHS_ENABLED
+        and is_static
+        and not options.get("disable_cuda_graphs", False)
+    )
+    if use_cuda_graphs:
+        runner = _wrap_with_cuda_graph(runner)
+        logger.info("CUDA graph enabled for subgraph %s", cache_key)
 
     # Store in cache.
     with _subgraph_cache_lock:
