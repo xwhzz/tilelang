@@ -346,6 +346,211 @@ def _wrap_with_cuda_graph(base_runner, warmup_iters=3):
 
 
 # ---------------------------------------------------------------------------
+# Dynamic-shape direct runner (per-shape JIT cache)
+# ---------------------------------------------------------------------------
+
+def _fold_scalar_inputs(gm: torch.fx.GraphModule, concrete_args: tuple) -> torch.fx.GraphModule:
+    """Replace 0-d scalar tensor placeholders with their constant values.
+
+    Dynamo with ``dynamic=True`` lifts module attributes like ``self.eps``
+    to graph inputs (0-d tensors). ``from_fx`` cannot handle these, so we
+    fold them back to inline constants.  Returns a *copy* of *gm* with
+    the scalar placeholders removed.
+    """
+    import copy
+    gm = copy.deepcopy(gm)
+    graph = gm.graph
+
+    # Map: FX Node → folded scalar value.
+    folded: dict[torch.fx.Node, float | int] = {}
+
+    arg_idx = 0
+    for node in list(graph.nodes):
+        if node.op != "placeholder":
+            continue
+        if arg_idx >= len(concrete_args):
+            break
+        val = concrete_args[arg_idx]
+        arg_idx += 1
+        if isinstance(val, torch.Tensor) and val.ndim == 0:
+            folded[node] = val.item()
+
+    if not folded:
+        return gm
+
+    # Propagate: if a node's inputs are all folded scalars and it's a
+    # simple op (item, float, int), fold the result too.
+    changed = True
+    while changed:
+        changed = False
+        for node in list(graph.nodes):
+            if node in folded:
+                continue
+            if node.op == "call_method" and node.target in ("item", "float", "int"):
+                src = node.args[0]
+                if src in folded:
+                    val = folded[src]
+                    if node.target == "int":
+                        val = int(val)
+                    else:
+                        val = float(val)
+                    folded[node] = val
+                    changed = True
+            elif node.op == "call_function":
+                name = getattr(node.target, "__name__", "")
+                if name in ("float", "int", "item"):
+                    src = node.args[0]
+                    if src in folded:
+                        folded[node] = folded[src]
+                        changed = True
+
+    # Replace all uses of folded nodes with their scalar values, then erase.
+    for node in reversed(list(graph.nodes)):
+        if node not in folded:
+            continue
+        scalar = folded[node]
+        for user in list(node.users.keys()):
+            user.args = tuple(
+                scalar if isinstance(a, torch.fx.Node) and a is node else a
+                for a in user.args
+            )
+            user.kwargs = {
+                k: (scalar if isinstance(v, torch.fx.Node) and v is node else v)
+                for k, v in user.kwargs.items()
+            }
+        graph.erase_node(node)
+
+    graph.lint()
+    gm.recompile()
+    return gm
+
+
+def _compile_for_concrete_shapes(
+    gm: torch.fx.GraphModule,
+    concrete_args: tuple[torch.Tensor, ...],
+    arch: str,
+    options: dict[str, Any],
+    expected_dtypes: list[torch.dtype],
+) -> Callable | None:
+    """Compile *gm* with concrete shapes from *concrete_args*.
+
+    Returns a direct runner or ``None`` if direct compilation fails.
+    This is the inner compile used by the dynamic-shape runner for each
+    new shape combination.
+    """
+    from tvm import relax, tir
+    from tvm.relax.frontend.torch import from_fx
+
+    from tilelang import tvm as _tvm
+    from tilelang.jit.graph import (
+        _build_extra_convert_map,
+        _schedule_relax_module,
+        compile_subgraph_direct,
+    )
+
+    # Fold 0-d scalar tensor inputs (e.g. eps) back to constants.
+    gm = _fold_scalar_inputs(gm, concrete_args)
+
+    input_info: list[tuple[list[int], str]] = []
+    for a in concrete_args:
+        if isinstance(a, torch.Tensor) and a.ndim > 0:
+            shape = [int(s) for s in a.shape]
+            dtype_str = str(a.dtype).replace("torch.", "")
+            input_info.append((shape, dtype_str))
+
+    extra_map = _build_extra_convert_map()
+    try:
+        mod = from_fx(
+            gm, input_info, unwrap_unit_return_tuple=True,
+            custom_convert_map=extra_map,
+        )
+    except Exception:
+        logger.debug("Dynamic compile: from_fx failed", exc_info=True)
+        return None
+
+    try:
+        mod, _ = _schedule_relax_module(mod, arch)
+    except Exception:
+        logger.debug("Dynamic compile: scheduling failed", exc_info=True)
+        return None
+
+    main_func = mod["main"]
+    if (
+        not isinstance(main_func.body, relax.SeqExpr)
+        or len(main_func.body.blocks) == 0
+    ):
+        return None
+
+    target = _tvm.target.cuda(arch=arch)
+    tvm_device = _tvm.cuda(torch.cuda.current_device())
+
+    try:
+        direct_result = compile_subgraph_direct(mod, target)
+    except Exception:
+        logger.debug("Dynamic compile: TIR compilation failed", exc_info=True)
+        return None
+
+    if direct_result is None:
+        return None
+
+    param_names, call_seq, output_names, rt_mod = direct_result
+    return _make_direct_runner(
+        param_names, call_seq, output_names,
+        rt_mod, tvm_device, expected_dtypes,
+    )
+
+
+def _make_dynamic_direct_runner(
+    gm: torch.fx.GraphModule,
+    arch: str,
+    options: dict[str, Any],
+    expected_dtypes: list[torch.dtype],
+    first_runner: Callable,
+    first_shape_key: tuple,
+) -> Callable:
+    """Build a runner that JIT-compiles per-shape and caches direct runners.
+
+    *first_runner* / *first_shape_key* seed the cache so the first call
+    is free.
+    """
+    lock = threading.Lock()
+    shape_cache: dict[tuple, Callable] = {first_shape_key: first_runner}
+
+    def runner(*args):
+        # Separate non-scalar tensors (real inputs to TIR kernels) from
+        # other arguments (SymInt scalars, 0-d scalar tensors).
+        tensor_args = tuple(
+            a for a in args if isinstance(a, torch.Tensor) and a.ndim > 0
+        )
+
+        shape_key = tuple(
+            (tuple(a.shape), str(a.dtype)) for a in tensor_args
+        )
+
+        with lock:
+            cached = shape_cache.get(shape_key)
+        if cached is not None:
+            return cached(*tensor_args)
+
+        logger.info("Dynamic runner: compiling for new shape %s", shape_key)
+        # Pass ALL args to _compile_for_concrete_shapes so that
+        # _fold_scalar_inputs can correctly map 0-d tensor placeholders.
+        concrete = _compile_for_concrete_shapes(
+            gm, args, arch, options, expected_dtypes,
+        )
+        if concrete is None:
+            raise RuntimeError(
+                f"TileLang dynamic runner: failed to compile for shapes {shape_key}"
+            )
+
+        with lock:
+            shape_cache[shape_key] = concrete
+        return concrete(*tensor_args)
+
+    return runner
+
+
+# ---------------------------------------------------------------------------
 # FX-level diamond breaking (improves FuseOps fusion)
 # ---------------------------------------------------------------------------
 
@@ -478,74 +683,103 @@ def _compile_subgraph(
 
     logger.info("Cache miss for subgraph %s — compiling", cache_key)
 
+    # Whether this subgraph has symbolic (dynamic) shapes.
+    is_dynamic = bool(sym_var_cache)
+
     # Break diamond dependencies to improve FuseOps fusion.
     _break_fx_diamonds(gm)
 
-    # Build convert map for ops not in TVM's default from_fx map.
-    extra_map = _build_extra_convert_map()
-
-    # Convert FX graph → Relax IR.
-    mod = from_fx(
-        gm, input_info, unwrap_unit_return_tuple=True,
-        custom_convert_map=extra_map,
-    )
-
-    # Schedule with TileLang rules.
-    trace = GraphCompileTrace(arch=arch, compilation_path="dynamo_backend")
-    mod, _ = _schedule_relax_module(mod, arch, trace=trace)
-
-    # Identity subgraphs → fall back.
-    main_func = mod["main"]
-    if (
-        not isinstance(main_func.body, relax.SeqExpr)
-        or len(main_func.body.blocks) == 0
-    ):
-        return gm.forward
-
-    target = _tvm.target.cuda(arch=arch)
-    tvm_device = _tvm.cuda(torch.cuda.current_device())
     expected_dtypes = _extract_output_dtypes(gm)
 
-    if options.get("print_trace"):
-        logger.info(trace.summary())
-    with _compilation_traces_lock:
-        _compilation_traces.append(trace)
+    if is_dynamic:
+        # --- Dynamic shapes: compile with concrete example shapes, ---
+        # --- wrap in a per-shape dispatching runner.               ---
+        logger.info("Dynamic shapes detected — building per-shape JIT runner")
+        trace = GraphCompileTrace(arch=arch, compilation_path="dynamo_dynamic")
+        with _compilation_traces_lock:
+            _compilation_traces.append(trace)
 
-    # Try direct kernel execution (bypasses VM, ~10x less per-call overhead).
-    direct_result = None
-    try:
-        direct_result = compile_subgraph_direct(mod, target)
-    except Exception:
-        logger.info("Direct path: compilation failed, will use VM", exc_info=True)
-
-    # Whether this subgraph has only static (concrete int) shapes.
-    is_static = not sym_var_cache
-
-    if direct_result is not None:
-        param_names, call_seq, output_names, rt_mod = direct_result
-        runner = _make_direct_runner(
-            param_names, call_seq, output_names,
-            rt_mod, tvm_device, expected_dtypes,
+        first_runner = _compile_for_concrete_shapes(
+            gm, tuple(example_inputs), arch, options, expected_dtypes,
         )
-        logger.info("Using direct kernel runner (%d kernels)", len(call_seq))
+        if first_runner is None:
+            logger.info("Dynamic shapes: direct compilation failed, falling back")
+            return gm.forward
+
+        first_shape_key = tuple(
+            (tuple(a.shape), str(a.dtype))
+            for a in example_inputs
+            if isinstance(a, torch.Tensor) and a.ndim > 0
+        )
+        runner = _make_dynamic_direct_runner(
+            gm, arch, options, expected_dtypes,
+            first_runner, first_shape_key,
+        )
+        logger.info("Using dynamic direct runner (seeded with %s)", first_shape_key)
+
     else:
-        # Fall back to VM path.
-        logger.info("Falling back to VM runner")
-        pass_configs = options.get("pass_configs")
-        if pass_configs:
-            pass_ctx = _tvm.transform.PassContext(opt_level=3, config=pass_configs)
+        # --- Static shapes: standard compilation path. ---
+        # Build convert map for ops not in TVM's default from_fx map.
+        extra_map = _build_extra_convert_map()
+
+        # Convert FX graph → Relax IR.
+        mod = from_fx(
+            gm, input_info, unwrap_unit_return_tuple=True,
+            custom_convert_map=extra_map,
+        )
+
+        # Schedule with TileLang rules.
+        trace = GraphCompileTrace(arch=arch, compilation_path="dynamo_backend")
+        mod, _ = _schedule_relax_module(mod, arch, trace=trace)
+
+        # Identity subgraphs → fall back.
+        main_func = mod["main"]
+        if (
+            not isinstance(main_func.body, relax.SeqExpr)
+            or len(main_func.body.blocks) == 0
+        ):
+            return gm.forward
+
+        target = _tvm.target.cuda(arch=arch)
+        tvm_device = _tvm.cuda(torch.cuda.current_device())
+
+        if options.get("print_trace"):
+            logger.info(trace.summary())
+        with _compilation_traces_lock:
+            _compilation_traces.append(trace)
+
+        # Try direct kernel execution (bypasses VM, ~10x less per-call overhead).
+        direct_result = None
+        try:
+            direct_result = compile_subgraph_direct(mod, target)
+        except Exception:
+            logger.info("Direct path: compilation failed, will use VM", exc_info=True)
+
+        if direct_result is not None:
+            param_names, call_seq, output_names, rt_mod = direct_result
+            runner = _make_direct_runner(
+                param_names, call_seq, output_names,
+                rt_mod, tvm_device, expected_dtypes,
+            )
+            logger.info("Using direct kernel runner (%d kernels)", len(call_seq))
         else:
-            pass_ctx = _tvm.transform.PassContext(opt_level=3)
-        with pass_ctx:
-            ex = tilelang_relax_build(mod, target)
-        vm = VirtualMachine(ex, tvm_device)
-        runner = _make_runner(vm["main"], expected_dtypes)
+            # Fall back to VM path.
+            logger.info("Falling back to VM runner")
+            pass_configs = options.get("pass_configs")
+            if pass_configs:
+                pass_ctx = _tvm.transform.PassContext(opt_level=3, config=pass_configs)
+            else:
+                pass_ctx = _tvm.transform.PassContext(opt_level=3)
+            with pass_ctx:
+                ex = tilelang_relax_build(mod, target)
+            vm = VirtualMachine(ex, tvm_device)
+            runner = _make_runner(vm["main"], expected_dtypes)
 
     # Wrap with CUDA graph for static-shape subgraphs to eliminate
     # kernel launch overhead on repeated calls.
     use_cuda_graphs = (
         _CUDA_GRAPHS_ENABLED
-        and is_static
+        and not is_dynamic
         and not options.get("disable_cuda_graphs", False)
     )
     if use_cuda_graphs:
