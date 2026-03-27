@@ -290,7 +290,7 @@ def _make_direct_runner(param_names, call_seq, output_names, rt_mod, tvm_device,
 # ---------------------------------------------------------------------------
 
 # Environment variable to disable CUDA graphs (e.g. for debugging).
-_CUDA_GRAPHS_ENABLED = os.environ.get("TILELANG_CUDA_GRAPHS", "1") not in ("0", "false", "no")
+_CUDA_GRAPHS_ENABLED = os.environ.get("TILELANG_CUDA_GRAPHS", "0") not in ("0", "false", "no")
 
 
 def _wrap_with_cuda_graph(base_runner, warmup_iters=3):
@@ -303,7 +303,14 @@ def _wrap_with_cuda_graph(base_runner, warmup_iters=3):
 
     This eliminates per-call kernel launch overhead (~5-10 us each)
     which compounds across many subgraphs.
+
+    TVM dispatches CUDA kernels on its own thread-local stream, which by
+    default is stream 0. ``use_torch_stream`` aligns TVM's stream with
+    PyTorch's current stream so that CUDA graph recording captures TVM
+    kernel launches.
     """
+    from tvm_ffi import use_torch_stream
+
     call_count = 0
     graph = None
     static_inputs = None
@@ -317,16 +324,18 @@ def _wrap_with_cuda_graph(base_runner, warmup_iters=3):
 
         # --- Warmup phase: execute normally to prime allocator ---
         if call_count <= warmup_iters:
-            return base_runner(*args)
+            with use_torch_stream():
+                return base_runner(*args)
 
         # --- Record phase: capture CUDA graph ---
         if graph is None:
             static_inputs = [a.clone() for a in args if isinstance(a, torch.Tensor)]
 
-            # Record on the current stream with a private pool so that
-            # graph-internal allocations don't conflict with external ones.
+            # Record on the current stream with a private pool.
+            # use_torch_stream wraps torch.cuda.graph so TVM kernels
+            # are launched on the capture stream.
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph, pool=pool):
+            with use_torch_stream(torch.cuda.graph(graph, pool=pool)):
                 static_outputs = base_runner(*static_inputs)
 
             if not isinstance(static_outputs, tuple):
