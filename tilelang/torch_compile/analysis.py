@@ -106,6 +106,11 @@ class GraphCompileTrace:
                 f"    {kernel.name}: {tag}{dyn} -> {kernel.output_dtype}{list(kernel.output_shape)} "
                 f"({kernel.compile_time_ms:.1f}ms)"
             )
+        if self.n_compiled is not None:
+            lines.append(
+                f"  composition: compiled={self.n_compiled}, extern={self.n_extern}, "
+                f"fallback_eager={self.n_fallback_eager}"
+            )
         return "\n".join(lines)
 
     def show_tir(self, kernel_name: str | None = None) -> None:
@@ -492,8 +497,16 @@ def compile_subgraph_direct(
     # CompileCapability: reject TIR functions with non-float buffers.
     compilable = compile_capability_check(tir_funcs)
     non_compilable = set(tir_funcs) - set(compilable)
+    extern_names = {r.func_name for r in call_seq if r.extern_op is not None}
     for record in call_seq:
         if record.func_name in non_compilable:
+            if record.func_name not in extern_names:
+                # No extern backing → eager subgraph fallback.
+                logger.info(
+                    "CompileCapability: %s excluded with no extern fallback — eager subgraph",
+                    record.func_name,
+                )
+                return None
             record.is_torch_fallback = True
             logger.info("CompileCapability: %s excluded (non-float buffers)", record.func_name)
 
@@ -619,36 +632,48 @@ def compile_capability_check(
     return compilable
 
 
+def _op_identity_key(target: Any) -> str:
+    """Return a stable identity key for an FX call_function target.
+
+    - ``OpOverload`` / ``OpOverloadPacket``: ``str(target)`` (e.g. ``"aten.sdpa.default"``)
+    - Other callables: ``module.qualname`` (e.g. ``"torch.nn.functional.scaled_dot_product_attention"``)
+    - Fallback: ``target.__name__``
+    """
+    if isinstance(target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
+        return str(target)
+    mod = getattr(target, "__module__", "") or ""
+    qual = getattr(target, "__qualname__", "") or getattr(target, "__name__", "")
+    return f"{mod}.{qual}" if mod else qual
+
+
+# Permanent extern entries keyed by identity key.
+_PERMANENT_EXTERN: frozenset[str] = frozenset({
+    "scaled_dot_product_attention",
+    "torch.nn.functional.scaled_dot_product_attention",
+    "tensor",
+})
+
+
 @dataclass
 class ExternPolicy:
     """Classifies FX ops as extern (bypass TIR, call torch directly).
 
     An op is extern if:
-    1. Its qualname is in ``permanent_extern_qualnames`` (e.g. SDPA), OR
-    2. It is a ``torch.library`` custom op (``OpOverloadPacket``), OR
+    1. Its identity key matches ``_PERMANENT_EXTERN``, OR
+    2. It is a ``torch.library`` custom op (``OpOverloadPacket``/``OpOverload``), OR
     3. It is absent from TVM's ``from_fx`` convert_map.
     """
 
-    # Ops that are permanently extern regardless of TVM support.
-    # Keyed by qualname (str(target)) for OpOverloadPacket or __name__ for builtins.
-    permanent_extern_qualnames: frozenset[str] = frozenset({
-        "scaled_dot_product_attention",  # single optimized kernel, no fusion benefit
-        "tensor",                        # TVM converter rejects non-scalar inputs
-    })
-
     def is_extern(self, target: Any, known_fx_ops: set[str]) -> bool:
         """Return True if *target* should be an extern call."""
-        # torch.library custom ops are always extern.
         if isinstance(target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
             return True
+        key = _op_identity_key(target)
+        if key in _PERMANENT_EXTERN:
+            return True
+        # TVM convert_map is keyed by __name__; check that.
         name = getattr(target, "__name__", None)
-        if name is None:
-            return True
-        # Permanent extern entries.
-        if name in self.permanent_extern_qualnames:
-            return True
-        # Not in TVM's convert_map → extern.
-        if name not in known_fx_ops:
+        if name is None or name not in known_fx_ops:
             return True
         return False
 
@@ -663,7 +688,8 @@ def _build_unsupported_op_map(
     known_fx = _get_known_fx_ops()
     policy = ExternPolicy()
 
-    unsupported: dict[str, Any] = {}
+    # Dedup by __name__ (from_fx convert_map key) but store identity key.
+    unsupported: dict[str, Any] = {}  # __name__ → target
     nontensor_ops: set[str] = set()
     for node in gm.graph.nodes:
         if node.op != "call_function":
@@ -681,12 +707,7 @@ def _build_unsupported_op_map(
     counter: dict[str, int] = {}
 
     for op_name, op_target in unsupported.items():
-        if isinstance(op_target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
-            qualname = str(op_target)
-        else:
-            module_name = getattr(op_target, "__module__", "") or ""
-            qual = getattr(op_target, "__qualname__", op_name) or op_name
-            qualname = f"{module_name}.{qual}" if module_name else qual
+        qualname = _op_identity_key(op_target)
 
         def _make_converter(_op_name, _qualname, _target):
             def _converter(node, importer):

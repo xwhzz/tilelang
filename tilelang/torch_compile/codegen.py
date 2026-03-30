@@ -89,13 +89,13 @@ class WrapperCodeGen:
     _param_idx: dict[str, int] = field(init=False, repr=False)
     _output_set: frozenset[str] = field(init=False, repr=False)
     _param_set: frozenset[str] = field(init=False, repr=False)
-    _fallback_outputs: frozenset[str] = field(init=False, repr=False)
+    _extern_outputs: frozenset[str] = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self._param_idx = {name: i for i, name in enumerate(self.param_names)}
         self._output_set = frozenset(self.output_names)
         self._param_set = frozenset(self.param_names)
-        self._fallback_outputs = frozenset(
+        self._extern_outputs = frozenset(
             record.out_name for record in self.call_seq if record.is_torch_fallback
         )
 
@@ -310,7 +310,7 @@ class WrapperCodeGen:
                     tvm_args.append(f"_tvm_inp_{param_idx[arg_name]}")
                 else:
                     safe_arg = _safe_name(arg_name)
-                    if arg_name in self._fallback_outputs:
+                    if arg_name in self._extern_outputs:
                         # Extern op output → convert to TVM via DLPack.
                         torch_var = self._torch_var(arg_name)
                         tvm_args.append(
