@@ -312,10 +312,12 @@ class WrapperCodeGen:
                     safe_arg = _safe_name(arg_name)
                     if arg_name in self._extern_outputs:
                         # Extern op output → convert to TVM via DLPack.
+                        # Cast to expected dtype if TIR kernel has different expectations.
                         torch_var = self._torch_var(arg_name)
-                        tvm_args.append(
-                            f"_from_dlpack({torch_var}.contiguous())"
-                        )
+                        bridge = f"{torch_var}.contiguous()"
+                        if arg_i < len(record.arg_dtypes) and record.arg_dtypes[arg_i]:
+                            bridge = f"{bridge}.to({self._torch_dtype_str(record.arg_dtypes[arg_i])})"
+                        tvm_args.append(f"_from_dlpack({bridge})")
                     elif arg_name in output_set:
                         tvm_args.append(f"_tvm_out_{safe_arg}")
                     else:

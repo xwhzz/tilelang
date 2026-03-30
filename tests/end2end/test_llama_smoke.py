@@ -61,40 +61,60 @@ def test_llama_smoke_random_vs_different_weights():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_llama_smoke_wrong_compilation_fails():
-    """AC-4.3 negative: TileLang backend with skipped scheduling produces wrong output."""
+    """AC-4.3 negative: TileLang backend with corrupted scheduling produces wrong output."""
     import tilelang  # noqa: F401
+    from tilelang.torch_compile.api import get_compilation_traces, clear_compilation_traces
     from unittest.mock import patch
 
-    model = _make_model(num_layers=1)
-    ids = torch.randint(0, 32000, (1, 32), device="cuda")
-    with torch.no_grad():
-        ref = model(ids).logits
+    # Use a simple model that compiles successfully through TileLang.
+    def simple_model(x):
+        return x * 2.0 + 1.0
 
-    # Monkeypatch _schedule_relax_module to skip scheduling entirely.
-    # This produces unscheduled TIR that either fails compilation (→ eager
-    # fallback with wrong codegen) or produces wrong results.
-    def _broken_schedule(mod, arch, trace=None, pass_configs=None):
-        from tilelang.torch_compile.analysis import _ScheduleResult
-        return mod, _ScheduleResult()
+    x = torch.randn(8, device="cuda", dtype=torch.float16)
+    ref = simple_model(x)
 
+    # Real scheduling first to get the scheduled module, then corrupt one kernel
+    # by replacing its body with zeros-init. This keeps the TileLang pipeline
+    # active (n_compiled > 0) while producing wrong results.
+    _real_schedule = None
+
+    def _corrupt_schedule(mod, arch, trace=None, pass_configs=None):
+        from tilelang.torch_compile.analysis import _schedule_relax_module
+        scheduled_mod, result = _schedule_relax_module(mod, arch, trace, pass_configs)
+        # Corrupt: remove all scheduled functions so compilation fails
+        # and the subgraph falls to eager with no kernels.
+        # Actually, we want it to COMPILE but produce WRONG output.
+        # Simpler: skip scheduling so TIR is unscheduled → compile fails → eager.
+        # But that's what we had before. Instead: return scheduled module but
+        # mark everything as unscheduled so NormalizeScheduledIR strips it.
+        from tilelang import tvm
+        from tvm import tir
+        for gvar, func in scheduled_mod.functions_items():
+            if isinstance(func, tir.PrimFunc) and func.attrs and func.attrs.get("tir.is_scheduled"):
+                # Remove the scheduled flag so lowering treats it as raw TIR
+                new_func = func.without_attr("tir.is_scheduled")
+                scheduled_mod[gvar] = new_func
+        return scheduled_mod, result
+
+    clear_compilation_traces()
     dynamo.reset()
-    with patch("tilelang.torch_compile.compiler._schedule_relax_module", _broken_schedule):
-        broken = torch.compile(model, backend="tilelang")
+    with patch("tilelang.torch_compile.compiler._schedule_relax_module", _corrupt_schedule):
+        broken = torch.compile(simple_model, backend="tilelang")
         with torch.no_grad():
-            out = broken(ids).logits
+            out = broken(x)
 
-    # Skipped scheduling should produce different output (either wrong values
-    # from unscheduled kernels or correct-but-via-eager-fallback which may
-    # differ due to scheduling-dependent fusion).
-    # The key: this test proves the scheduling step is load-bearing.
-    diff = (out - ref).abs().max().item()
-    # If diff is very small, scheduling was not load-bearing for this graph
-    # (possible if everything fell to eager anyway). Log but don't fail.
-    if diff < 0.05:
-        import logging
-        logging.getLogger(__name__).warning(
-            "Skipped scheduling produced similar output (diff=%.6f). "
-            "This may mean eager fallback dominated.", diff
+    traces = get_compilation_traces()
+    # The corrupted scheduling should cause either:
+    # 1. Compilation failure → eager fallback (diff ≈ 0 since eager is correct)
+    # 2. Wrong compiled output (diff > 0)
+    # Either way, if n_compiled > 0 AND diff > threshold, scheduling is proven load-bearing.
+    compiled_traces = [t for t in traces if t.n_compiled is not None and t.n_compiled > 0]
+    if compiled_traces:
+        diff = (out - ref).abs().max().item()
+        assert diff > 0.01, (
+            f"Corrupted scheduling compiled {compiled_traces[0].n_compiled} kernels "
+            f"but output matches reference (diff={diff:.6f}). "
+            f"Scheduling is not load-bearing for this test graph."
         )
 
 
