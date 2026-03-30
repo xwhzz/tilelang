@@ -522,7 +522,7 @@ class SubgraphCompiler:
             dynamic=True,
             compilation_path="dynamo_symbolic",
         )
-        runner = self._try_symbolic_compilation(cache_key, input_info, expected_dtypes)
+        runner = self._try_symbolic_compilation(cache_key, input_info, expected_dtypes, trace=trace)
         if runner is not None:
             self.state.add_trace(trace)
             logger.info("Using symbolic runner (key=%s)", cache_key[:8])
@@ -652,6 +652,7 @@ class SubgraphCompiler:
         cache_key: str,
         input_info: list[tuple[list[Any], str]],
         expected_dtypes: list[torch.dtype],
+        trace: GraphCompileTrace | None = None,
     ) -> Callable | None:
         from tvm import relax
         from tilelang import tvm as tilelang_tvm
@@ -699,9 +700,10 @@ class SubgraphCompiler:
             return None
 
         param_names, call_seq, output_names, sym_var_map, rt_mod, constants = direct_result
-        trace.n_compiled = sum(1 for r in call_seq if not r.is_torch_fallback)
-        trace.n_extern = sum(1 for r in call_seq if r.extern_op is not None)
-        trace.n_fallback_eager = 0
+        if trace is not None:
+            trace.n_compiled = sum(1 for r in call_seq if not r.is_torch_fallback)
+            trace.n_extern = sum(1 for r in call_seq if r.extern_op is not None)
+            trace.n_fallback_eager = 0
 
         compiled = _build_compiled_module(
             param_names,

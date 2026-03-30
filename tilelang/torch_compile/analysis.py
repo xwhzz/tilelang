@@ -646,10 +646,13 @@ def _op_identity_key(target: Any) -> str:
     return f"{mod}.{qual}" if mod else qual
 
 
-# Permanent extern entries keyed by identity key.
-_PERMANENT_EXTERN: frozenset[str] = frozenset({
-    "scaled_dot_product_attention",
+# Permanent extern entries keyed by identity key and __name__ fallback.
+_PERMANENT_EXTERN_KEYS: frozenset[str] = frozenset({
+    "torch._C._nn.scaled_dot_product_attention",
     "torch.nn.functional.scaled_dot_product_attention",
+})
+_PERMANENT_EXTERN_NAMES: frozenset[str] = frozenset({
+    "scaled_dot_product_attention",
     "tensor",
 })
 
@@ -668,12 +671,17 @@ class ExternPolicy:
         """Return True if *target* should be an extern call."""
         if isinstance(target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
             return True
+        # Check identity key first (stable, collision-free).
         key = _op_identity_key(target)
-        if key in _PERMANENT_EXTERN:
+        if key in _PERMANENT_EXTERN_KEYS:
             return True
-        # TVM convert_map is keyed by __name__; check that.
+        # Check __name__ for permanent entries and TVM convert_map.
         name = getattr(target, "__name__", None)
-        if name is None or name not in known_fx_ops:
+        if name is None:
+            return True
+        if name in _PERMANENT_EXTERN_NAMES:
+            return True
+        if name not in known_fx_ops:
             return True
         return False
 
@@ -688,26 +696,32 @@ def _build_unsupported_op_map(
     known_fx = _get_known_fx_ops()
     policy = ExternPolicy()
 
-    # Dedup by __name__ (from_fx convert_map key) but store identity key.
-    unsupported: dict[str, Any] = {}  # __name__ → target
+    # Dedup by identity key. We also track __name__ → identity key
+    # because TVM's custom_convert_map is keyed by __name__.
+    unsupported: dict[str, Any] = {}     # identity_key → target
+    unsup_by_name: dict[str, str] = {}   # __name__ → identity_key
     nontensor_ops: set[str] = set()
     for node in gm.graph.nodes:
         if node.op != "call_function":
             continue
         name = getattr(node.target, "__name__", "")
-        if name in unsupported or name in nontensor_ops:
+        ikey = _op_identity_key(node.target)
+        if ikey in unsupported or name in nontensor_ops:
             continue
         example_value = node.meta.get("example_value")
         if example_value is None or not hasattr(example_value, "shape"):
             nontensor_ops.add(name)
         elif name in force_extern_ops or policy.is_extern(node.target, known_fx):
-            unsupported[name] = node.target
+            unsupported[ikey] = node.target
+            unsup_by_name[name] = ikey
 
     convert_map: dict[str, Any] = {}
     counter: dict[str, int] = {}
 
-    for op_name, op_target in unsupported.items():
-        qualname = _op_identity_key(op_target)
+    for ikey, op_target in unsupported.items():
+        # TVM's custom_convert_map is keyed by __name__.
+        op_name = getattr(op_target, "__name__", ikey)
+        qualname = ikey
 
         def _make_converter(_op_name, _qualname, _target):
             def _converter(node, importer):
