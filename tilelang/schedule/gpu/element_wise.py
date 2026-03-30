@@ -95,18 +95,32 @@ def _tile_aligns_with_suffix(s_extents: list[int | None], tile: int) -> bool:
     fragment with non-affine access patterns.
 
     For a single spatial dim, divisibility of the extent itself suffices.
-    Returns True (optimistic) when any extent is dynamic (None).
+
+    When dynamic extents are present, we check the *static* innermost
+    suffix.  If the product of all contiguous static dims starting from
+    the innermost already divides by tile, alignment is guaranteed
+    regardless of the dynamic dims.  Otherwise we conservatively return
+    False — the tile may cross dimension boundaries and produce
+    block-dependent fragment shapes that crash LayoutInference.
     """
-    if any(e is None for e in s_extents):
+    if not s_extents:
         return True
-    if len(s_extents) <= 1:
-        # Single dim: just check divisibility of the extent.
-        return s_extents[0] % tile == 0 if s_extents else True
-    # Check proper suffixes (excluding the full product).
-    # A proper suffix d_{k}..d_{n-1} with k >= 1 means the tile fits
-    # within the last (n-k) dims without crossing the k-th boundary.
+    has_dynamic = any(e is None for e in s_extents)
+    if not has_dynamic:
+        if len(s_extents) <= 1:
+            return s_extents[0] % tile == 0
+        suffix_product = 1
+        for e in reversed(s_extents[1:]):  # skip outermost dim
+            suffix_product *= e
+            if suffix_product % tile == 0:
+                return True
+        return False
+    # Dynamic case: check the contiguous static innermost suffix.
+    # If those known dims already align with the tile, we're safe.
     suffix_product = 1
-    for e in reversed(s_extents[1:]):  # skip outermost dim
+    for e in reversed(s_extents):
+        if e is None:
+            break
         suffix_product *= e
         if suffix_product % tile == 0:
             return True

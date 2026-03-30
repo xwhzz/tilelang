@@ -7,6 +7,11 @@ import torch.nn.functional as F
 import torch._dynamo
 
 import tilelang  # noqa: F401  (triggers backend registration)
+from tilelang.jit.backend import (
+    clear_compilation_traces,
+    clear_subgraph_cache,
+    get_compilation_traces,
+)
 
 
 # ===========================================================================
@@ -91,6 +96,66 @@ def test_shape_recompilation_mlp():
 
 
 # ===========================================================================
+# Symbolic Shape Tests (compile once, run with any shape)
+# ===========================================================================
+
+def test_symbolic_shapes_add():
+    """torch.compile(dynamic=True) should compile once and reuse for multiple sizes."""
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping.")
+        return
+
+    torch._dynamo.reset()
+    clear_subgraph_cache()
+    clear_compilation_traces()
+
+    @torch.compile(backend="tilelang", dynamic=True)
+    def add_fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+        return a + b
+
+    for N in [128, 256, 512, 1024]:
+        a = torch.randn(N, device="cuda")
+        b = torch.randn(N, device="cuda")
+        out = add_fn(a, b)
+        ref = a + b
+        torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+        print(f"  shape ({N},) passed")
+
+    paths = [trace.compilation_path for trace in get_compilation_traces()]
+    assert paths == ["dynamo_symbolic"], paths
+    print("\033[92mtest_symbolic_shapes_add: passed.\033[0m")
+
+
+def test_symbolic_shapes_mlp():
+    """MLP with explicit dynamic=True — should use symbolic runner."""
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping.")
+        return
+
+    torch._dynamo.reset()
+
+    dim = 256
+    torch.manual_seed(42)
+    w1 = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
+    w2 = torch.randn(dim, dim, device="cuda", dtype=torch.float32)
+
+    @torch.compile(backend="tilelang", dynamic=True)
+    def mlp(x, w1_in, w2_in):
+        h = x @ w1_in
+        h = F.relu(h)
+        return h @ w2_in
+
+    for B in [1, 4, 16, 64, 128]:
+        x = torch.randn(B, dim, device="cuda", dtype=torch.float32)
+        out = mlp(x, w1, w2)
+        ref = F.relu(x @ w1) @ w2
+        torch.testing.assert_close(out, ref, rtol=2e-3, atol=2e-3)
+        print(f"  batch={B} passed")
+
+    print("\033[92mtest_symbolic_shapes_mlp: passed.\033[0m")
+
+
+# ===========================================================================
 # Dynamic Control Flow Tests
 # ===========================================================================
 
@@ -154,6 +219,14 @@ if __name__ == "__main__":
     test_shape_recompilation_matmul()
     print()
     test_shape_recompilation_mlp()
+    print()
+
+    print("=" * 60)
+    print("Symbolic Shape Tests")
+    print("=" * 60)
+    test_symbolic_shapes_add()
+    print()
+    test_symbolic_shapes_mlp()
     print()
 
     print("=" * 60)

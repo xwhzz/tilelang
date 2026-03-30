@@ -52,12 +52,54 @@ def _choose_static_tile(candidates: list[int], extent: int | None) -> int:
     return candidates[-1]
 
 
+def _num_sms(target: Target) -> int:
+    """Return the number of SMs for the target, querying the driver when possible."""
+    if target.kind.name == "cuda":
+        try:
+            from tilelang.carver.arch.driver import get_num_sms
+            return get_num_sms()
+        except Exception:
+            pass
+        # Fallback heuristics based on SM version.
+        sm = utils.get_sm_version(target)
+        if sm >= 90:
+            return 132  # H100
+        if sm >= 80:
+            return 108  # A100
+        return 80  # V100
+    return 64
+
+
+def _shared_mem_bytes(block_m: int, block_n: int, block_k: int,
+                      num_stages: int, element_bytes: int) -> int:
+    """Estimate shared memory usage for double-buffered A + B tiles."""
+    return (block_m + block_n) * block_k * element_bytes * num_stages
+
+
+def _max_shared_mem(sm_version: int) -> int:
+    """Maximum configurable shared memory per SM (bytes)."""
+    if sm_version >= 90:
+        return 228 * 1024  # H100
+    if sm_version >= 80:
+        return 163 * 1024  # A100
+    return 96 * 1024  # V100
+
+
+def _grid_blocks(m_extent: int | None, n_extent: int | None,
+                 block_m: int, block_n: int) -> int:
+    """Compute the total number of grid blocks."""
+    m = m_extent if m_extent is not None else 1024
+    n = n_extent if n_extent is not None else 1024
+    return -(-m // block_m) * -(-n // block_n)
+
+
 def _choose_tile_config(
     target: Target,
     block_stmt: tir.Block,
     has_epilogue: bool,
 ) -> _MatmulTileConfig:
     input_bits = max(tvm.DataType(region.buffer.dtype).bits for region in block_stmt.reads)
+    element_bytes = input_bits // 8
     max_threads = min(int(utils.max_threads_per_block(target)), 256)
     num_threads = max(1, _largest_power_of_two_at_most(max_threads))
     iter_extents = [_as_static_int(iter_var.dom.extent) for iter_var in block_stmt.iter_vars]
@@ -66,25 +108,92 @@ def _choose_tile_config(
     k_extent = iter_extents[3] if len(iter_extents) >= 4 else None
     sm_version = utils.get_sm_version(target)
 
-    # Hopper (sm_90): larger K tile + aggressive pipelining
-    # Shared budget: 128*64*2*4 + 128*64*2*4 = 128 KB (fits 228 KB)
+    # Hopper (sm_90): WGMMA with aggressive pipelining.
     if input_bits <= 16 and target.kind.name == "cuda" and sm_version >= 90:
+        block_k = _choose_static_tile([64, 32, 16], k_extent)
+        num_stages = 4
+        # WGMMA requires threads = multiple of 128 (warp group).
+        threads = 128
+        smem_cap = _max_shared_mem(sm_version)
+        num_sms = _num_sms(target)
+        # Minimum grid occupancy target: half the SMs.
+        min_blocks = max(num_sms // 2, 1)
+
+        # Candidate tile sizes in decreasing preference.
+        m_candidates = [t for t in [128, 64, 32, 16]
+                        if m_extent is None or m_extent >= t]
+        n_candidates = [t for t in [128, 64, 32, 16]
+                        if n_extent is None or n_extent >= t]
+        if not m_candidates:
+            m_candidates = [16]
+        if not n_candidates:
+            n_candidates = [16]
+
+        best = None
+        best_score = (-1, -1)
+        for bm in m_candidates:
+            for bn in n_candidates:
+                smem = _shared_mem_bytes(bm, bn, block_k, num_stages, element_bytes)
+                if smem > smem_cap:
+                    continue
+                grid = _grid_blocks(m_extent, n_extent, bm, bn)
+                volume = bm * bn
+                # Two-level priority:
+                #   1. Meet occupancy target (grid >= min_blocks).
+                #   2. Among configs that meet target, prefer largest tile.
+                meets_occ = grid >= min_blocks
+                score = (meets_occ, volume)
+                if score > best_score:
+                    best_score = score
+                    best = (bm, bn)
+
+        block_m, block_n = best or (m_candidates[0], n_candidates[0])
         return _MatmulTileConfig(
-            block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
-            block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
-            block_k=_choose_static_tile([64, 32, 16], k_extent),
-            num_stages=4,
-            num_threads=min(num_threads, 128),
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            num_stages=num_stages,
+            num_threads=threads,
         )
 
     # Ampere (sm_80): larger K tile
-    # Shared budget: 128*64*2*2 + 128*64*2*2 = 64 KB (fits 163 KB)
     if input_bits <= 16 and target.kind.name == "cuda" and sm_version >= 80:
+        block_k = _choose_static_tile([64, 32, 16], k_extent)
+        num_stages = 2
+        smem_cap = _max_shared_mem(sm_version)
+        num_sms = _num_sms(target)
+        min_blocks = max(num_sms // 2, 1)
+
+        m_candidates = [t for t in [128, 64, 32, 16]
+                        if m_extent is None or m_extent >= t]
+        n_candidates = [t for t in [128, 64, 32, 16]
+                        if n_extent is None or n_extent >= t]
+        if not m_candidates:
+            m_candidates = [16]
+        if not n_candidates:
+            n_candidates = [16]
+
+        best = None
+        best_score = (-1, -1)
+        for bm in m_candidates:
+            for bn in n_candidates:
+                smem = _shared_mem_bytes(bm, bn, block_k, num_stages, element_bytes)
+                if smem > smem_cap:
+                    continue
+                grid = _grid_blocks(m_extent, n_extent, bm, bn)
+                volume = bm * bn
+                meets_occ = grid >= min_blocks
+                score = (meets_occ, volume)
+                if score > best_score:
+                    best_score = score
+                    best = (bm, bn)
+
+        block_m, block_n = best or (m_candidates[0], n_candidates[0])
         return _MatmulTileConfig(
-            block_m=_choose_static_tile([128, 64, 32, 16], m_extent),
-            block_n=_choose_static_tile([128, 64, 32, 16], n_extent),
-            block_k=_choose_static_tile([64, 32, 16], k_extent),
-            num_stages=2,
+            block_m=block_m,
+            block_n=block_n,
+            block_k=block_k,
+            num_stages=num_stages,
             num_threads=num_threads,
         )
 
@@ -99,7 +208,6 @@ def _choose_tile_config(
         )
 
     # fp32: larger tiles + pipelining on GPU
-    # Shared budget: 64*32*4*2 + 32*64*4*2 = 32 KB per stage pair
     if target.kind.name in {"cuda", "hip", "rocm"}:
         return _MatmulTileConfig(
             block_m=_choose_static_tile([64, 32, 16, 8], m_extent),

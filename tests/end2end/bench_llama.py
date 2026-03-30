@@ -32,7 +32,6 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, LlamaConfig, LlamaForCausalLM
 
 import tilelang  # noqa: F401  (triggers backend registration)
-import tilelang.language as T
 from tilelang.profiler import do_bench
 
 logger = logging.getLogger(__name__)
@@ -95,6 +94,40 @@ def _patch_linears_cublas():
 
     nn.Linear.forward = linear_forward
     logger.info("Patched nn.Linear with cuBLAS graph break")
+
+
+def _patch_mlp_eval_order():
+    """Rewrite LlamaMLP.forward to evaluate both Linears before activation.
+
+    The HuggingFace implementation ``down(act(gate(x)) * up(x))`` evaluates
+    left-to-right: gate→silu→up→mul.  With graph breaks on nn.Linear, the
+    ``up(x)`` break sits *between* silu and mul, splitting them into separate
+    subgraphs.  Rewriting to ``gate=gate(x); up=up(x); down(act(gate)*up)``
+    lets silu+mul land in a single fused subgraph.
+    """
+    from transformers.models.llama.modeling_llama import LlamaMLP
+
+    if hasattr(LlamaMLP, "_orig_forward"):
+        return
+
+    LlamaMLP._orig_forward = LlamaMLP.forward
+
+    def mlp_forward(self, x):
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        return self.down_proj(self.act_fn(gate) * up)
+
+    LlamaMLP.forward = mlp_forward
+    logger.info("Patched LlamaMLP eval order (silu+mul fusion)")
+
+
+def _unpatch_mlp_eval_order():
+    """Restore original LlamaMLP.forward."""
+    from transformers.models.llama.modeling_llama import LlamaMLP
+    if hasattr(LlamaMLP, "_orig_forward"):
+        LlamaMLP.forward = LlamaMLP._orig_forward
+        del LlamaMLP._orig_forward
+        logger.info("Restored LlamaMLP")
 
 
 def _unpatch_linears():
@@ -174,289 +207,78 @@ def _patch_attention_tileops_mha(arch: str | None = None):
 
 
 # ---------------------------------------------------------------------------
-# TileLang FlashAttention integration
+# TileLang FlashAttention integration (via tileops MHAKernel)
 # ---------------------------------------------------------------------------
 
-# Cache of compiled FlashAttention kernels keyed by shape/dtype/arch.
-_flash_attn_kernel_cache: dict[tuple, object] = {}
+from top import MHAKernel
 
-_FLASH_BLOCK_M = 128
-_FLASH_BLOCK_N = 128
-_FLASH_NUM_STAGES = 2
-_FLASH_THREADS = 256
+# torch.library custom op so Dynamo captures MHA in the FX graph.
+_tileops_lib = torch.library.Library("tileops", "DEF")
+_tileops_lib.define(
+    "mha_forward(Tensor q, Tensor k, Tensor v, bool is_causal) -> Tensor"
+)
 
-
-def _round_up(value: int, multiple: int) -> int:
-    return ((value + multiple - 1) // multiple) * multiple
-
-
-def _to_tl_dtype(dtype: torch.dtype):
-    if dtype == torch.float16:
-        return T.float16
-    if dtype == torch.bfloat16:
-        return T.bfloat16
-    raise TypeError(f"TileLang FlashAttention only supports fp16/bf16, got {dtype}")
+# Cache of MHAKernel instances keyed by (batch, heads, seq, dim, causal, dtype).
+_mha_kernel_cache: dict[tuple, MHAKernel] = {}
 
 
-def _build_flash_attention_func(
-    batch: int,
-    heads: int,
-    seq_q: int,
-    seq_kv: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    is_causal: bool,
-):
-    """Build a causal FlashAttention kernel in BHSD layout."""
-    scale = (1.0 / head_dim) ** 0.5 * 1.44269504  # log2(e)
-    tl_dtype = _to_tl_dtype(dtype)
-    accum_dtype = T.float32
-    past_len = seq_kv - seq_q
-
-    @T.prim_func
-    def flash_attn(
-        Q: T.Tensor([batch, heads, seq_q, head_dim], tl_dtype),
-        K: T.Tensor([batch, heads, seq_kv, head_dim], tl_dtype),
-        V: T.Tensor([batch, heads, seq_kv, head_dim], tl_dtype),
-        Output: T.Tensor([batch, heads, seq_q, head_dim], tl_dtype),
-    ):
-        with T.Kernel(
-            T.ceildiv(seq_q, _FLASH_BLOCK_M),
-            heads,
-            batch,
-            threads=_FLASH_THREADS,
-        ) as (bx, by, bz):
-            Q_shared = T.alloc_shared([_FLASH_BLOCK_M, head_dim], tl_dtype)
-            K_shared = T.alloc_shared([_FLASH_BLOCK_N, head_dim], tl_dtype)
-            V_shared = T.alloc_shared([_FLASH_BLOCK_N, head_dim], tl_dtype)
-            O_shared = T.alloc_shared([_FLASH_BLOCK_M, head_dim], tl_dtype)
-            acc_s = T.alloc_fragment([_FLASH_BLOCK_M, _FLASH_BLOCK_N], accum_dtype)
-            acc_s_cast = T.alloc_fragment([_FLASH_BLOCK_M, _FLASH_BLOCK_N], tl_dtype)
-            acc_o = T.alloc_fragment([_FLASH_BLOCK_M, head_dim], accum_dtype)
-            scores_max = T.alloc_fragment([_FLASH_BLOCK_M], accum_dtype)
-            scores_max_prev = T.alloc_fragment([_FLASH_BLOCK_M], accum_dtype)
-            scores_scale = T.alloc_fragment([_FLASH_BLOCK_M], accum_dtype)
-            scores_sum = T.alloc_fragment([_FLASH_BLOCK_M], accum_dtype)
-            logsum = T.alloc_fragment([_FLASH_BLOCK_M], accum_dtype)
-
-            T.copy(Q[bz, by, bx * _FLASH_BLOCK_M:(bx + 1) * _FLASH_BLOCK_M, :], Q_shared)
-            T.fill(acc_o, 0)
-            T.fill(logsum, 0)
-            T.fill(scores_max, -T.infinity(accum_dtype))
-
-            loop_range = (
-                T.min(
-                    T.ceildiv(seq_kv, _FLASH_BLOCK_N),
-                    T.ceildiv((bx + 1) * _FLASH_BLOCK_M + past_len, _FLASH_BLOCK_N),
-                )
-                if is_causal
-                else T.ceildiv(seq_kv, _FLASH_BLOCK_N)
-            )
-
-            for k in T.Pipelined(
-                loop_range,
-                num_stages=_FLASH_NUM_STAGES,
-                order=[-1, 0, 3, 1, -1, 2],
-                stage=[-1, 0, 0, 1, -1, 1],
-                group=[[0], [1, 2], [3, 4, 5, 6, 7, 8, 9, 10, 11], [12], [13], [14]],
-            ):
-                T.copy(K[bz, by, k * _FLASH_BLOCK_N:(k + 1) * _FLASH_BLOCK_N, :], K_shared)
-                if is_causal:
-                    for i, j in T.Parallel(_FLASH_BLOCK_M, _FLASH_BLOCK_N):
-                        q_idx = bx * _FLASH_BLOCK_M + i + past_len
-                        k_idx = k * _FLASH_BLOCK_N + j
-                        acc_s[i, j] = T.if_then_else(q_idx >= k_idx, 0, -T.infinity(acc_s.dtype))
-                else:
-                    for i, j in T.Parallel(_FLASH_BLOCK_M, _FLASH_BLOCK_N):
-                        acc_s[i, j] = T.if_then_else(
-                            k * _FLASH_BLOCK_N + j >= seq_kv, -T.infinity(acc_s.dtype), 0
-                        )
-
-                T.gemm(Q_shared, K_shared, acc_s, transpose_B=True, policy=T.GemmWarpPolicy.FullRow)
-
-                T.copy(scores_max, scores_max_prev)
-                T.fill(scores_max, -T.infinity(accum_dtype))
-                T.reduce_max(acc_s, scores_max, dim=1, clear=False)
-                for i in T.Parallel(_FLASH_BLOCK_M):
-                    scores_max[i] = T.max(scores_max[i], scores_max_prev[i])
-                for i in T.Parallel(_FLASH_BLOCK_M):
-                    scores_scale[i] = T.exp2(scores_max_prev[i] * scale - scores_max[i] * scale)
-                for i, j in T.Parallel(_FLASH_BLOCK_M, _FLASH_BLOCK_N):
-                    acc_s[i, j] = T.exp2(acc_s[i, j] * scale - scores_max[i] * scale)
-                T.reduce_sum(acc_s, scores_sum, dim=1)
-                for i in T.Parallel(_FLASH_BLOCK_M):
-                    logsum[i] = logsum[i] * scores_scale[i] + scores_sum[i]
-                T.copy(acc_s, acc_s_cast)
-
-                for i, j in T.Parallel(_FLASH_BLOCK_M, head_dim):
-                    acc_o[i, j] *= scores_scale[i]
-
-                T.copy(V[bz, by, k * _FLASH_BLOCK_N:(k + 1) * _FLASH_BLOCK_N, :], V_shared)
-                T.gemm(acc_s_cast, V_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-
-            for i, j in T.Parallel(_FLASH_BLOCK_M, head_dim):
-                acc_o[i, j] /= logsum[i]
-            T.copy(acc_o, O_shared)
-            T.copy(O_shared, Output[bz, by, bx * _FLASH_BLOCK_M:(bx + 1) * _FLASH_BLOCK_M, :])
-
-    return flash_attn
-
-
-def _get_flash_attn_kernel(
-    batch: int,
-    heads: int,
-    seq_q: int,
-    seq_kv: int,
-    head_dim: int,
-    dtype: torch.dtype,
-    is_causal: bool,
-    arch: str | None,
-):
-    """Compile or fetch a cached TileLang FlashAttention kernel."""
-    seq_q_padded = _round_up(seq_q, _FLASH_BLOCK_M)
-    seq_kv_padded = _round_up(seq_kv, _FLASH_BLOCK_N)
-    key = (batch, heads, seq_q_padded, seq_kv_padded, head_dim, str(dtype), is_causal, arch or "auto")
-
-    if key not in _flash_attn_kernel_cache:
-        target = "auto" if arch is None else f"cuda -arch={arch}"
+def _get_mha_kernel(
+    batch: int, heads: int, seq_len: int, head_dim: int,
+    is_causal: bool, dtype: torch.dtype,
+) -> MHAKernel:
+    key = (batch, heads, seq_len, head_dim, is_causal, str(dtype))
+    if key not in _mha_kernel_cache:
         logger.info(
-            "Compiling TileLang FlashAttention: batch=%d heads=%d seq_q=%d seq_kv=%d dim=%d dtype=%s target=%s",
-            batch,
-            heads,
-            seq_q_padded,
-            seq_kv_padded,
-            head_dim,
-            dtype,
-            target,
+            "Compiling MHAKernel: batch=%d heads=%d seq=%d dim=%d causal=%s dtype=%s",
+            batch, heads, seq_len, head_dim, is_causal, dtype,
         )
-        func = _build_flash_attention_func(
-            batch=batch,
-            heads=heads,
-            seq_q=seq_q_padded,
-            seq_kv=seq_kv_padded,
+        _mha_kernel_cache[key] = MHAKernel(
+            batch_size=batch,
+            num_heads=heads,
+            seq_len=seq_len,
             head_dim=head_dim,
+            causal=is_causal,
             dtype=dtype,
-            is_causal=is_causal,
         )
-        _flash_attn_kernel_cache[key] = tilelang.compile(
-            func,
-            out_idx=[3],
-            target=target,
-            pass_configs={tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True},
-        )
-
-    return _flash_attn_kernel_cache[key], seq_q_padded, seq_kv_padded
+    return _mha_kernel_cache[key]
 
 
-@torch.compiler.disable
-def _tileops_attention(
-    query_states: torch.Tensor,
-    key_states: torch.Tensor,
-    value_states: torch.Tensor,
-    *,
-    attention_mask: torch.Tensor | None = None,
-    scaling: float | None = None,
-    is_causal: bool = True,
-    arch: str | None = None,
-) -> torch.Tensor:
-    """Core attention via a cached TileLang FlashAttention kernel.
+@torch.library.impl(_tileops_lib, "mha_forward", "CUDA")
+def _mha_forward_cuda(q, k, v, is_causal):
+    # Input layout: BHSD (from transformers); MHAKernel expects BSHD.
+    batch, heads, seq_len, head_dim = q.shape
+    q_bshd = q.transpose(1, 2).contiguous()
+    k_bshd = k.transpose(1, 2).contiguous()
+    v_bshd = v.transpose(1, 2).contiguous()
+    kernel = _get_mha_kernel(batch, heads, seq_len, head_dim, is_causal, q.dtype)
+    out_bshd = kernel.forward(q_bshd, k_bshd, v_bshd)
+    return out_bshd.transpose(1, 2).contiguous()
 
-    Assumes dense causal prefill. For more complex masking patterns we fall
-    back to SDPA.
-    """
-    if query_states.dtype not in (torch.float16, torch.bfloat16):
-        return F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-            is_causal=is_causal,
-            scale=scaling,
-        )
 
-    # Batch>1 may carry padding masks; keep the fast path specialized to the
-    # common benchmark case (dense causal prefill, batch=1).
-    if attention_mask is not None and query_states.shape[0] != 1:
-        return F.scaled_dot_product_attention(
-            query_states,
-            key_states,
-            value_states,
-            attn_mask=attention_mask,
-            is_causal=False,
-            scale=scaling,
-        )
-
-    batch, heads, seq_q, head_dim = query_states.shape
-    seq_kv = key_states.shape[-2]
-
-    kernel, padded_q, padded_kv = _get_flash_attn_kernel(
-        batch=batch,
-        heads=heads,
-        seq_q=seq_q,
-        seq_kv=seq_kv,
-        head_dim=head_dim,
-        dtype=query_states.dtype,
-        is_causal=is_causal,
-        arch=arch,
-    )
-
-    q = query_states.contiguous()
-    k = key_states.contiguous()
-    v = value_states.contiguous()
-
-    if padded_q != seq_q:
-        q = F.pad(q, (0, 0, 0, padded_q - seq_q))
-    if padded_kv != seq_kv:
-        pad_kv = padded_kv - seq_kv
-        k = F.pad(k, (0, 0, 0, pad_kv))
-        v = F.pad(v, (0, 0, 0, pad_kv))
-
-    out = kernel(q, k, v)
-    if padded_q != seq_q:
-        # The direct kernel runner only accepts dense tensors. Cropping the
-        # padded output back to the original sequence length creates a view
-        # with padded strides, so materialize it before handing it back to the
-        # compiled transpose/reshape subgraph.
-        out = out[:, :, :seq_q, :].contiguous()
-    return out
+@torch.library.impl(_tileops_lib, "mha_forward", "Meta")
+def _mha_forward_meta(q, k, v, is_causal):
+    return torch.empty_like(q)
 
 
 def warmup_tileops_mha(model, input_ids, arch: str | None = None):
-    """Pre-compile FlashAttention for the prefill shape.
-
-    Call this before benchmarking so that ``_tileops_attention`` has a cached
-    kernel for the prefill sequence length.
-    """
+    """Pre-compile MHAKernel for the prefill shape."""
     config = model.config
     batch = input_ids.shape[0]
     seq_len = input_ids.shape[1]
     heads = config.num_attention_heads
     head_dim = config.hidden_size // heads
     dtype = next(model.parameters()).dtype
-    _get_flash_attn_kernel(
-        batch=batch,
-        heads=heads,
-        seq_q=seq_len,
-        seq_kv=seq_len,
-        head_dim=head_dim,
-        dtype=dtype,
-        is_causal=True,
-        arch=arch,
-    )
+    _get_mha_kernel(batch, heads, seq_len, head_dim, True, dtype)
 
 
 def _patch_attention_with_tileops(LlamaAttention, apply_rotary_pos_emb, repeat_kv, arch: str | None):
-    """Replace LlamaAttention.forward to use TileLang FlashAttention for core attention.
+    """Replace LlamaAttention.forward to use tileops MHAKernel for core attention.
 
     Q/K/V linear projections and output projection remain normal PyTorch
-    operations (compilable by dynamo + TileLang).  RoPE application and
-    core attention are graph breaks using efficient kernels.
+    operations (compilable by dynamo + TileLang).  The MHA custom op is
+    captured in the FX graph without a manual graph break.
 
-    Subgraph structure after patching:
-      SG: ... → Q/K/V projections + reshape (compiled by TileLang)
-      break: apply_rotary_pos_emb (eager, uses fancy indexing)
-      break: TileLang FlashAttention (efficient flash-attention kernel)
-      SG: output projection + ... (compiled by TileLang)
+    RoPE still requires a graph break (uses fancy indexing in rotate_half).
     """
 
     @torch.compiler.disable
@@ -485,6 +307,9 @@ def _patch_attention_with_tileops(LlamaAttention, apply_rotary_pos_emb, repeat_k
         query_states, key_states = _apply_rope(
             query_states, key_states, cos, sin,
         )
+        # Ensure contiguity after graph break — _from_dlpack requires it.
+        query_states = query_states.contiguous()
+        key_states = key_states.contiguous()
 
         if past_key_values is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
@@ -496,20 +321,13 @@ def _patch_attention_with_tileops(LlamaAttention, apply_rotary_pos_emb, repeat_k
             key_states = repeat_kv(key_states, self.num_key_value_groups)
             value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # Core attention via TileLang FlashAttention (graph break).
-        attn_output = _tileops_attention(
-            query_states,
-            key_states,
-            value_states,
-            attention_mask=attention_mask,
-            scaling=self.scaling,
-            is_causal=True,
-            arch=arch,
+        # Core attention via tileops MHAKernel (torch.library custom op).
+        attn_output = torch.ops.tileops.mha_forward(
+            query_states, key_states, value_states, True,
         )
 
         # Output projection (compilable by TileLang).
-        # _tileops_attention returns (B, H, S, D); transpose back to match the
-        # original transformers layout before the output projection.
+        # mha_forward returns BHSD; transpose back for output projection.
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)

@@ -107,18 +107,14 @@ fn(torch.randn(128))   # 编译（带符号维度 s0）
 fn(torch.randn(256))   # 复用同一 Kernel，不再编译
 fn(torch.randn(1024))  # 复用
 
-# 策略 3: Dynamo 回退 —— 自动处理数据依赖控制流
+# 策略 3: 自动子图切分，处理数据依赖控制流
 @tilelang.jit(mode="graph")
 def fn(x):
     if x.sum() > 0:    # ← 数据依赖！torch.export 无法处理
         return x * 2
     return x * 0.5
 
-# torch.export 失败 → 自动回退到 torch.compile + TileLang 后端
-# torch.compile 在 graph break 处切分子图，每段子图走 TileLang 编译
 ```
-
-**Dynamo 回退的完整流程**：
 
 ```
 torch.compile(fn, backend=_tilelang_dynamo_backend)
@@ -747,13 +743,6 @@ for kt in trace.kernels:
 
 ### 5.2 Reduction
 
-**简单归约**（shape 1024×16×2048, fp32, reduce over dim=2）：
-
-| | TileLang | torch.compile | Speedup |
-|---|---|---|---|
-| max-reduction | 0.091 ms (1,473 GB/s) | 0.080 ms (1,673 GB/s) | 0.88x |
-| sum-reduction | 0.091 ms (1,473 GB/s) | 0.081 ms (1,659 GB/s) | 0.89x |
-
 **GeneralReduction**（复合归约模式）：
 
 | 模式 | TileLang (ms) | torch (ms) | Speedup | 说明 |
@@ -763,27 +752,12 @@ for kt in trace.kernels:
 | keepdim + sigmoid | 0.560 | 0.585 | **1.044x** | keepdim 归约 |
 | RMSNorm-like | 0.600 | 0.592 | 0.987x | 单步归约 + broadcast |
 | LayerNorm-like | 0.598 | 0.590 | 0.988x | 两步归约链 |
-| Softmax-like | 0.671 | 0.613 | 0.913x | max + sum(exp) |
-| LogSumExp-like | 0.316 | 0.298 | 0.942x | 两步 + 标量输出 |
 
 **分析**：
 - 单步归约 + epilogue 融合：**1.04x**，归约与后处理融合在同一 kernel 中
-- 两步归约链（softmax, layernorm）：0.91-0.99x，与高度优化的 PyTorch fused kernel 接近
-- 简单归约略逊于 torch（0.88x），因为 torch.compile 的 reduction kernel 已针对单步归约深度优化
+- 两步归约链（softmax, layernorm）：0.91-0.99x，与高度优化的 PyTorch kernel 接近
 
 ### 5.3 GEMV（矩阵-向量乘）
-
-**fp32**：
-
-| Shape (M×N) | TileLang (GB/s) | torch.compile (GB/s) | Speedup |
-|---|---|---|---|
-| 1024×1024 | 407 | 348 | **1.169x** |
-| 4096×4096 | 1,243 | 1,360 | 0.914x |
-| 4096×8192 | 1,472 | 1,627 | 0.905x |
-| 8192×4096 | 1,474 | 1,498 | 0.984x |
-| 8192×8192 | 1,695 | 1,752 | 0.967x |
-| 16384×4096 | 1,695 | 1,580 | **1.073x** |
-| 4096×16384 | 1,661 | 1,713 | 0.970x |
 
 **fp16**（Streaming Cache 优化）：
 
@@ -799,19 +773,6 @@ for kt in trace.kernels:
 
 **分析**：
 - **fp16 全面领先**，平均 **1.16x**，最高达 **1.38x**（16384×4096）
-- 核心优势来自 **Streaming Cache（`-dlcm=cs`）**：大矩阵 A 采用 evict-first 策略，只经过 L2 不驻留 L1，避免缓存污染。向量 x 常驻 L1 缓存，重复读取零开销
-- fp32 在中等 shape 略逊于 cuBLAS，但在小 shape（1024²）和大 M（16384×4096）场景下胜出
-- fp16 下 cuBLAS 的 GEMV 实现未充分利用 L2 缓存层次，TileLang 的显式缓存策略更优
-
-### 5.4 性能总结
-
-| 规则 | 典型 Speedup vs torch.compile | 优势场景 |
-|---|---|---|
-| **ElementWise** | 0.98x (avg), 1.01-1.08x (large aligned) | Fragment 对齐的大 tensor |
-| **Reduction** | 1.04x (with epilogue) | 归约 + epilogue 融合 |
-| **GeneralReduction** | 0.91-1.04x | 单步归约 + epilogue |
-| **GEMV fp16** | **1.16x (avg)**, max 1.38x | L2 streaming cache 优化 |
-| **GEMV fp32** | 0.97x (avg), max 1.17x | 小 shape / 大 M |
 
 ---
 
@@ -824,4 +785,4 @@ for kt in trace.kernels:
 | **模板匹配** | 6 条优先级规则，first-match-wins，每种计算模式有专门优化模板 |
 | **渐进回退** | torch.export → dynamo fallback → Fallback rule，任何 PyTorch 代码都能编译 |
 | **可观测性** | 每阶段可追踪：规则匹配、TIR 前后对比、CUDA 源码、per-kernel 编译耗时 |
-| **零开销运行时** | 预分配所有中间 buffer，支持 CUDA Graph 录制 replay（~1 μs 总开销） |
+| **零开销运行时** | 预分配所有中间 buffer，支持 CUDA Graph 录制 replay |

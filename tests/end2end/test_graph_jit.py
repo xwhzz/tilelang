@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import torch.nn.functional as F
 import torch._dynamo
 
 import tilelang  # noqa: F401  (triggers backend registration)
 from tilelang.profiler import do_bench  # noqa: F401
+from tilelang.jit.backend import (
+    clear_compilation_traces,
+    clear_disk_cache,
+    clear_subgraph_cache,
+    get_compilation_traces,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +114,97 @@ def test_graph_jit_shape_cache():
 
 
 # ---------------------------------------------------------------------------
-# Test 3: float32 path
+# Test 3: backend cache reuse across identical subgraphs
+# ---------------------------------------------------------------------------
+
+def test_graph_jit_subgraph_cache_reuse():
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping.")
+        return
+
+    torch._dynamo.reset()
+    clear_subgraph_cache()
+    clear_compilation_traces()
+
+    def make_compiled():
+        @torch.compile(backend="tilelang")
+        def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+            return F.relu(a + b)
+
+        return fn
+
+    a = torch.randn(256, device="cuda")
+    b = torch.randn(256, device="cuda")
+
+    fn1 = make_compiled()
+    fn2 = make_compiled()
+
+    out1 = fn1(a, b)
+    torch._dynamo.reset()
+    out2 = fn2(a, b)
+    ref = F.relu(a + b)
+    torch.testing.assert_close(out1, ref, rtol=1e-5, atol=1e-5)
+    torch.testing.assert_close(out2, ref, rtol=1e-5, atol=1e-5)
+
+    paths = [trace.compilation_path for trace in get_compilation_traces()]
+    assert paths.count("dynamo_backend") == 1, paths
+    assert paths.count("cache_hit") == 1, paths
+    print("\033[92mtest_graph_jit_subgraph_cache_reuse: passed.\033[0m")
+
+
+# ---------------------------------------------------------------------------
+# Test 4: disk cache reuse for cacheable graphs
+# ---------------------------------------------------------------------------
+
+def test_graph_jit_disk_cache_reuse():
+    if not torch.cuda.is_available():
+        print("CUDA not available, skipping.")
+        return
+
+    torch._dynamo.reset()
+    clear_subgraph_cache()
+    clear_compilation_traces()
+    clear_disk_cache()
+
+    old_disk_cache = os.environ.get("TILELANG_DISK_CACHE")
+    os.environ["TILELANG_DISK_CACHE"] = "1"
+
+    try:
+        def make_compiled():
+            @torch.compile(backend="tilelang")
+            def fn(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+                return a + b
+
+            return fn
+
+        a = torch.randn(256, device="cuda")
+        b = torch.randn(256, device="cuda")
+
+        fn1 = make_compiled()
+        out1 = fn1(a, b)
+        torch.testing.assert_close(out1, a + b, rtol=1e-5, atol=1e-5)
+
+        clear_subgraph_cache()
+        torch._dynamo.reset()
+
+        fn2 = make_compiled()
+        out2 = fn2(a, b)
+        torch.testing.assert_close(out2, a + b, rtol=1e-5, atol=1e-5)
+
+        paths = [trace.compilation_path for trace in get_compilation_traces()]
+        assert "dynamo_backend" in paths, paths
+        assert "disk_cache_hit" in paths, paths
+        print("\033[92mtest_graph_jit_disk_cache_reuse: passed.\033[0m")
+    finally:
+        if old_disk_cache is None:
+            os.environ.pop("TILELANG_DISK_CACHE", None)
+        else:
+            os.environ["TILELANG_DISK_CACHE"] = old_disk_cache
+        clear_disk_cache()
+
+
+# ---------------------------------------------------------------------------
+# Test 5: float32 path
 # ---------------------------------------------------------------------------
 
 def test_graph_jit_float32():
@@ -135,7 +232,7 @@ def test_graph_jit_float32():
 
 
 # ---------------------------------------------------------------------------
-# Test 4: user-registered torch.library custom op (transparent handling)
+# Test 6: user-registered torch.library custom op (transparent handling)
 # ---------------------------------------------------------------------------
 
 _test4_lib = None
@@ -146,6 +243,7 @@ def test_graph_jit_torch_library_custom_op():
         return
 
     torch._dynamo.reset()
+    clear_compilation_traces()
 
     global _test4_lib
     _test4_lib = torch.library.Library("test_tl_graph", "DEF")
@@ -174,7 +272,7 @@ def test_graph_jit_torch_library_custom_op():
 
 
 # ---------------------------------------------------------------------------
-# Test 5: torch.library custom op mixed with standard ops
+# Test 7: torch.library custom op mixed with standard ops
 # ---------------------------------------------------------------------------
 
 _test5_lib = None
@@ -185,6 +283,7 @@ def test_graph_jit_torch_library_mixed():
         return
 
     torch._dynamo.reset()
+    clear_compilation_traces()
 
     global _test5_lib
     _test5_lib = torch.library.Library("test_tl_graph2", "DEF")
@@ -212,11 +311,14 @@ def test_graph_jit_torch_library_mixed():
     out = fn(a, b)
     ref = F.relu((a + b) * 3.0)
     torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    traces = get_compilation_traces()
+    assert traces, "Expected a compilation trace for mixed custom-op graph"
+    assert all(trace.compilation_path != "fallback_eager" for trace in traces)
     print("\033[92mtest_graph_jit_torch_library_mixed: passed.\033[0m")
 
 
 # ---------------------------------------------------------------------------
-# Test 7: trace inspection API
+# Test 8: trace inspection API
 # ---------------------------------------------------------------------------
 
 def test_graph_jit_trace():
@@ -225,8 +327,6 @@ def test_graph_jit_trace():
         return
 
     torch._dynamo.reset()
-    from tilelang.jit.backend import clear_compilation_traces, get_compilation_traces
-
     clear_compilation_traces()
 
     @torch.compile(backend="tilelang")
@@ -252,6 +352,8 @@ def test_graph_jit_trace():
 if __name__ == "__main__":
     test_graph_jit_mlp()
     test_graph_jit_shape_cache()
+    test_graph_jit_subgraph_cache_reuse()
+    test_graph_jit_disk_cache_reuse()
     test_graph_jit_float32()
     test_graph_jit_torch_library_custom_op()
     test_graph_jit_torch_library_mixed()

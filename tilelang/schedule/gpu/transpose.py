@@ -201,11 +201,18 @@ class Transpose(GPUScheduleRule):
 
         # Inline injective producers before the transpose block.
         for info in block_infos[:transpose_idx]:
-            sch.compute_inline(info.block_rv)
+            try:
+                sch.compute_inline(info.block_rv)
+            except Exception:  # pylint: disable=broad-except
+                return None
 
         # Inline injective consumers after the transpose block (reversed).
+        # May fail on output blocks — bail out and let another rule handle it.
         for info in reversed(block_infos[transpose_idx + 1:]):
-            sch.compute_inline(info.block_rv)
+            try:
+                sch.compute_inline(info.block_rv)
+            except Exception:  # pylint: disable=broad-except
+                return None
 
         # Get the read buffer name to construct shared cache buffer name.
         block_stmt = sch.get(transpose_block)
