@@ -124,3 +124,12 @@ maint/host_checks/logs/*
 
 # agent skills folder
 .humanize*
+
+# Untracked working files
+GraphNet/
+log.txt
+log_gemv.txt
+tests/gemv/log.txt
+tests/reduction/log_more.txt
+tests/gemv/bench_reduction
+tests/gemv/bench_reduction.cu
