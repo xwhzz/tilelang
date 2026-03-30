@@ -61,39 +61,45 @@ def test_llama_smoke_random_vs_different_weights():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_llama_smoke_wrong_compilation_fails():
-    """AC-4.3 negative: TileLang backend with corrupted scheduling produces wrong output."""
+    """AC-4.3 negative: corrupted TileLang scheduling produces wrong output.
+
+    Proves scheduling is load-bearing by replacing one scheduled kernel with
+    a zeros-producing stub, compiling through TileLang, and asserting the
+    output differs from the eager reference.
+    """
     import tilelang  # noqa: F401
     from tilelang.torch_compile.api import get_compilation_traces, clear_compilation_traces
     from unittest.mock import patch
 
-    # Use a simple model that compiles successfully through TileLang.
     def simple_model(x):
         return x * 2.0 + 1.0
 
     x = torch.randn(8, device="cuda", dtype=torch.float16)
     ref = simple_model(x)
 
-    # Real scheduling first to get the scheduled module, then corrupt one kernel
-    # by replacing its body with zeros-init. This keeps the TileLang pipeline
-    # active (n_compiled > 0) while producing wrong results.
-    _real_schedule = None
-
     def _corrupt_schedule(mod, arch, trace=None, pass_configs=None):
+        """Schedule normally, then corrupt one kernel to produce zeros."""
         from tilelang.torch_compile.analysis import _schedule_relax_module
-        scheduled_mod, result = _schedule_relax_module(mod, arch, trace, pass_configs)
-        # Corrupt: remove all scheduled functions so compilation fails
-        # and the subgraph falls to eager with no kernels.
-        # Actually, we want it to COMPILE but produce WRONG output.
-        # Simpler: skip scheduling so TIR is unscheduled → compile fails → eager.
-        # But that's what we had before. Instead: return scheduled module but
-        # mark everything as unscheduled so NormalizeScheduledIR strips it.
         from tilelang import tvm
         from tvm import tir
+
+        scheduled_mod, result = _schedule_relax_module(mod, arch, trace, pass_configs)
+
+        # Find the first scheduled PrimFunc and replace its body with
+        # a no-op that leaves the output buffer as zeros.
         for gvar, func in scheduled_mod.functions_items():
-            if isinstance(func, tir.PrimFunc) and func.attrs and func.attrs.get("tir.is_scheduled"):
-                # Remove the scheduled flag so lowering treats it as raw TIR
-                new_func = func.without_attr("tir.is_scheduled")
-                scheduled_mod[gvar] = new_func
+            if not isinstance(func, tir.PrimFunc):
+                continue
+            if not (func.attrs and func.attrs.get("tir.is_scheduled")):
+                continue
+            # Replace body with Evaluate(0) — output buffer stays uninitialized/zero.
+            corrupted = tir.PrimFunc(
+                func.params, tir.Evaluate(tir.const(0, "int32")),
+                buffer_map=func.buffer_map,
+            ).with_attrs(func.attrs)
+            scheduled_mod[gvar] = corrupted
+            break  # corrupt only one
+
         return scheduled_mod, result
 
     clear_compilation_traces()
@@ -104,18 +110,18 @@ def test_llama_smoke_wrong_compilation_fails():
             out = broken(x)
 
     traces = get_compilation_traces()
-    # The corrupted scheduling should cause either:
-    # 1. Compilation failure → eager fallback (diff ≈ 0 since eager is correct)
-    # 2. Wrong compiled output (diff > 0)
-    # Either way, if n_compiled > 0 AND diff > threshold, scheduling is proven load-bearing.
     compiled_traces = [t for t in traces if t.n_compiled is not None and t.n_compiled > 0]
-    if compiled_traces:
-        diff = (out - ref).abs().max().item()
-        assert diff > 0.01, (
-            f"Corrupted scheduling compiled {compiled_traces[0].n_compiled} kernels "
-            f"but output matches reference (diff={diff:.6f}). "
-            f"Scheduling is not load-bearing for this test graph."
-        )
+    # Must have compiled at least one kernel (not fallen to eager).
+    assert len(compiled_traces) > 0, (
+        "Corrupted scheduling should still produce compiled kernels, not eager fallback"
+    )
+    # Must produce wrong output (scheduling is load-bearing).
+    diff = (out - ref).abs().max().item()
+    assert diff > 0.01, (
+        f"Corrupted kernel compiled ({compiled_traces[0].n_compiled} kernels) "
+        f"but output matches reference (diff={diff:.6f}). "
+        f"Scheduling is not proven load-bearing."
+    )
 
 
 # ---- AC-3a: ExternPolicy ----
