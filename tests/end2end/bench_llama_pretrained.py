@@ -37,6 +37,18 @@ def greedy_generate(model, input_ids, max_new_tokens=32):
     return generated
 
 
+@torch.no_grad()
+def sampled_generate(model, input_ids, max_new_tokens=32, temperature=1.0):
+    """Token-by-token generation with multinomial sampling (seed-sensitive)."""
+    generated = input_ids.clone()
+    for _ in range(max_new_tokens):
+        logits = model(generated).logits[:, -1, :] / temperature
+        probs = torch.nn.functional.softmax(logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        generated = torch.cat([generated, next_token], dim=1)
+    return generated
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -53,6 +65,21 @@ def main():
 
     print(f"Loading {args.model} ...")
     tokenizer = AutoTokenizer.from_pretrained(args.model)
+
+    # Graph break on RoPE to prevent int64 position-encoding from poisoning
+    # the whole subgraph. This lets matmul/RMSNorm/MLP compile as TIR while
+    # SDPA and RoPE run as extern/eager.
+    from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+
+    if not hasattr(LlamaRotaryEmbedding, "_orig_forward"):
+        LlamaRotaryEmbedding._orig_forward = LlamaRotaryEmbedding.forward
+
+        @torch.compiler.disable
+        def rope_forward(self, x, position_ids):
+            return LlamaRotaryEmbedding._orig_forward(self, x, position_ids)
+
+        LlamaRotaryEmbedding.forward = rope_forward
+
     model = LlamaForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.float16, attn_implementation="sdpa",
     )
@@ -123,11 +150,13 @@ def main():
     del rand_model
     torch.cuda.empty_cache()
 
-    # Negative control 2: different prompt → different tokens
-    alt_ids = tokenizer("Once upon a time in a land far away", return_tensors="pt")["input_ids"].cuda()
-    alt_tokens = greedy_generate(model, alt_ids, args.max_new_tokens)
-    neg_same = (alt_tokens[:, :eager_tokens.shape[1]] == eager_tokens).all().item() if alt_tokens.shape[1] >= eager_tokens.shape[1] else False
-    print(f"Negative control (diff prompt): {'PASS (tokens differ)' if not neg_same else 'FAIL (tokens identical)'}")
+    # Negative control 2: different seeds → different sampled tokens
+    torch.manual_seed(SEED)
+    tokens_seed_a = sampled_generate(model, input_ids, max_new_tokens=min(8, args.max_new_tokens))
+    torch.manual_seed(SEED + 1)
+    tokens_seed_b = sampled_generate(model, input_ids, max_new_tokens=min(8, args.max_new_tokens))
+    seed_match = (tokens_seed_a == tokens_seed_b).all().item()
+    print(f"Negative control (diff seeds): {'PASS (tokens differ)' if not seed_match else 'FAIL (tokens identical)'}")
 
     # Trace composition
     from tilelang.torch_compile.api import get_compilation_traces

@@ -96,3 +96,37 @@ def test_fold_scalar_inputs_folds_0d_tensor():
     eps_nodes = [n for n in placeholders if n.name == "eps"]
     if eps_nodes:
         assert len(eps_nodes[0].users) == 0
+
+
+def test_unsupported_op_same_name_collision_raises():
+    """AC-3a: two distinct unsupported callables with same __name__ → ValueError."""
+    from tilelang.torch_compile.analysis import _build_unsupported_op_map, _ExternOpInfo
+
+    # Two distinct callables that share __name__ = "my_func".
+    def my_func_a(x):
+        return x + 1
+
+    def my_func_b(x):
+        return x * 2
+
+    my_func_a.__name__ = "my_func"
+    my_func_b.__name__ = "my_func"
+    my_func_a.__module__ = "test_module_a"
+    my_func_b.__module__ = "test_module_b"
+    my_func_a.__qualname__ = "my_func_a"
+    my_func_b.__qualname__ = "my_func_b"
+
+    # Build a minimal FX graph with both callables as call_function targets.
+    graph = fx.Graph()
+    x = graph.placeholder("x")
+    x.meta["example_value"] = torch.randn(4)
+    call_a = graph.call_function(my_func_a, args=(x,))
+    call_a.meta["example_value"] = torch.randn(4)
+    call_b = graph.call_function(my_func_b, args=(call_a,))
+    call_b.meta["example_value"] = torch.randn(4)
+    graph.output(call_b)
+    gm = fx.GraphModule(torch.nn.Module(), graph)
+
+    extern_ops: dict[str, _ExternOpInfo] = {}
+    with pytest.raises(ValueError, match="Unsupported op name collision"):
+        _build_unsupported_op_map(gm, extern_ops)

@@ -233,9 +233,9 @@ def test_trace_exact_counts_mixed():
     compiled_traces = [t for t in traces if t.n_compiled is not None]
     assert len(compiled_traces) > 0, "Expected at least one compiled trace"
     tr = compiled_traces[0]
-    # Exact: 1 extern (ext_op) + N compiled TIR kernels (N >= 1).
+    # Exact counts for `x+1 → ext_op(a) → b+x`: 2 compiled + 1 extern + 0 eager.
+    assert tr.n_compiled == 2, f"Expected exactly 2 compiled kernels, got {tr.n_compiled}"
     assert tr.n_extern == 1, f"Expected exactly 1 extern op, got {tr.n_extern}"
-    assert tr.n_compiled >= 1, f"Expected at least 1 compiled kernel, got {tr.n_compiled}"
     assert tr.n_fallback_eager == 0, f"Expected 0 eager fallback, got {tr.n_fallback_eager}"
 
 
@@ -256,10 +256,10 @@ def test_trace_counts_symbolic():
 
     traces = get_compilation_traces()
     sym_traces = [t for t in traces if t.compilation_path == "dynamo_symbolic"]
-    if sym_traces:
-        tr = sym_traces[0]
-        assert tr.n_compiled is not None, "Symbolic trace should have n_compiled"
-        assert tr.n_compiled >= 1
-        assert tr.n_extern is not None
-        assert tr.n_fallback_eager == 0
+    assert len(sym_traces) > 0, "Expected at least one dynamo_symbolic trace"
+    tr = sym_traces[0]
+    assert tr.n_compiled is not None, "Symbolic trace must have n_compiled"
+    assert tr.n_compiled >= 1, f"Expected compiled >= 1, got {tr.n_compiled}"
+    assert tr.n_extern is not None
+    assert tr.n_fallback_eager == 0, f"Expected 0 eager fallback, got {tr.n_fallback_eager}"
 
