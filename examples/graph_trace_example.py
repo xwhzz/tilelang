@@ -10,7 +10,7 @@ import torch
 import torch._dynamo
 
 import tilelang  # noqa: F401  (triggers backend registration)
-from tilelang.jit.backend import clear_compilation_traces, get_compilation_traces
+from tilelang.torch_compile.api import clear_compilation_traces, get_compilation_traces
 
 # ── 1. Define a small MLP and compile via tilelang backend ────────────
 

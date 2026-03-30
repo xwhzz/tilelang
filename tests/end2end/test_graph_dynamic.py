@@ -7,7 +7,7 @@ import torch.nn.functional as F
 import torch._dynamo
 
 import tilelang  # noqa: F401  (triggers backend registration)
-from tilelang.jit.backend import (
+from tilelang.torch_compile.api import (
     clear_compilation_traces,
     clear_subgraph_cache,
     get_compilation_traces,

@@ -12,23 +12,6 @@ from tvm import tir as _tir
 if TYPE_CHECKING:
     from .analysis import _TIRCallRecord
 
-# Known TIR function name patterns -> torch code templates.
-_TORCH_FALLBACK_PATTERNS: dict[str, str] = {
-    "take": "{args[0]}[{args[1]}.long()]",
-    "reshape": "{args[0]}.reshape({out_shape})",
-    "cast": "{args[0]}.to({out_dtype})",
-    "fused_cast_reshape": "{args[0]}.to({out_dtype}).reshape({out_shape})",
-}
-
-
-def _match_fallback_pattern(func_name: str) -> str | None:
-    """Match a TIR function name to a known torch fallback pattern."""
-    name = func_name.lower()
-    for pattern, template in _TORCH_FALLBACK_PATTERNS.items():
-        if name == pattern or name.startswith(pattern + "_"):
-            return template
-    return None
-
 
 def _safe_name(name: str) -> str:
     return name.replace(".", "_").replace("-", "_")
@@ -268,49 +251,38 @@ class WrapperCodeGen:
             dtype_str = self._torch_dtype_str(record.out_dtype)
 
             if record.is_torch_fallback:
-                if record.extern_op is not None:
-                    lines.append(f"{indent}# Extern {index}: {record.extern_op.qualname}")
+                if record.extern_op is None:
+                    # No extern backing — should not reach codegen.
+                    # compile_subgraph_direct returns None for this case.
+                    raise RuntimeError(
+                        f"Function {record.func_name} is fallback with no "
+                        f"extern op — should have triggered eager subgraph fallback"
+                    )
 
-                    def _literal_code(value) -> str:
-                        if isinstance(value, torch.device):
-                            return f'torch.device("{value}")'
-                        if isinstance(value, torch.dtype):
-                            return f"torch.{value}".replace("torch.torch.", "torch.")
-                        return repr(value)
+                lines.append(f"{indent}# Extern {index}: {record.extern_op.qualname}")
 
-                    call_parts: list[str] = []
-                    tensor_index = 0
-                    for kind, value in record.extern_op.arg_spec:
-                        if kind == "tensor":
-                            call_parts.append(self._torch_var(record.arg_names[tensor_index]))
-                            tensor_index += 1
-                        elif kind == "tensor_list":
-                            items = [self._torch_var(record.arg_names[i]) for i in value]
-                            call_parts.append(f"[{', '.join(items)}]")
-                            tensor_index = max(value) + 1 if value else tensor_index
-                        else:
-                            call_parts.append(_literal_code(value))
-                    for kwarg_name, kwarg_value in record.extern_op.literal_kwargs.items():
-                        call_parts.append(f"{kwarg_name}={_literal_code(kwarg_value)}")
-                    expr = f"_ext_{_safe_name(record.func_name)}({', '.join(call_parts)})"
-                else:
-                    lines.append(f"{indent}# Torch fallback {index}: {record.func_name}")
-                    torch_args = [self._torch_var(name) for name in record.arg_names]
-                    template = _match_fallback_pattern(record.func_name)
-                    if template is None:
-                        shape_code = self._shape_to_code(record.out_shape)
-                        expr = (
-                            f"torch.empty({shape_code}, dtype={dtype_str}, device={device})"
-                        )
-                        lines.append(
-                            f'{indent}# WARNING: no torch fallback pattern for "{record.func_name}"'
-                        )
+                def _literal_code(value) -> str:
+                    if isinstance(value, torch.device):
+                        return f'torch.device("{value}")'
+                    if isinstance(value, torch.dtype):
+                        return f"torch.{value}".replace("torch.torch.", "torch.")
+                    return repr(value)
+
+                call_parts: list[str] = []
+                tensor_index = 0
+                for kind, value in record.extern_op.arg_spec:
+                    if kind == "tensor":
+                        call_parts.append(self._torch_var(record.arg_names[tensor_index]))
+                        tensor_index += 1
+                    elif kind == "tensor_list":
+                        items = [self._torch_var(record.arg_names[i]) for i in value]
+                        call_parts.append(f"[{', '.join(items)}]")
+                        tensor_index = max(value) + 1 if value else tensor_index
                     else:
-                        expr = template.format(
-                            args=torch_args,
-                            out_shape=self._shape_to_code(record.out_shape),
-                            out_dtype=dtype_str,
-                        )
+                        call_parts.append(_literal_code(value))
+                for kwarg_name, kwarg_value in record.extern_op.literal_kwargs.items():
+                    call_parts.append(f"{kwarg_name}={_literal_code(kwarg_value)}")
+                expr = f"_ext_{_safe_name(record.func_name)}({', '.join(call_parts)})"
 
                 target_name = f"_out_{safe_out}" if is_output else f"_ws_{safe_out}"
                 lines.append(f"{indent}{target_name} = {expr}")
@@ -339,15 +311,11 @@ class WrapperCodeGen:
                 else:
                     safe_arg = _safe_name(arg_name)
                     if arg_name in self._fallback_outputs:
+                        # Extern op output → convert to TVM via DLPack.
                         torch_var = self._torch_var(arg_name)
-                        bridge = f"{torch_var}.contiguous()"
-                        # Cast fallback output to TIR kernel's expected dtype
-                        # when they differ (e.g. float32 fallback → float16 kernel).
-                        if arg_i < len(record.arg_dtypes):
-                            expected = record.arg_dtypes[arg_i]
-                            if expected:
-                                bridge = f"{bridge}.to({self._torch_dtype_str(expected)})"
-                        tvm_args.append(f"_from_dlpack({bridge})")
+                        tvm_args.append(
+                            f"_from_dlpack({torch_var}.contiguous())"
+                        )
                     elif arg_name in output_set:
                         tvm_args.append(f"_tvm_out_{safe_arg}")
                     else:

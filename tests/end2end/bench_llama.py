@@ -812,7 +812,7 @@ def run_benchmark(args: argparse.Namespace):
     if args.cublas_linears:
         _patch_linears_cublas()
 
-    from tilelang.jit.backend import clear_compilation_traces, get_compilation_traces
+    from tilelang.torch_compile.api import clear_compilation_traces, get_compilation_traces
     clear_compilation_traces()
 
     tl_options = {

@@ -484,10 +484,15 @@ class SubgraphCompiler:
         )
         if direct_result is None:
             trace.compilation_path = "fallback_eager"
+            trace.n_fallback_eager = 1
             self.state.add_trace(trace)
             return self.gm.forward
 
         param_names, call_seq, output_names, sym_var_map, rt_mod, constants = direct_result
+        trace.n_compiled = sum(1 for r in call_seq if not r.is_torch_fallback)
+        trace.n_extern = sum(1 for r in call_seq if r.extern_op is not None)
+        trace.n_fallback_eager = 0
+
         compiled = _build_compiled_module(
             param_names,
             call_seq,

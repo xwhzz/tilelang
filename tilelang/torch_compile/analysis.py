@@ -83,6 +83,10 @@ class GraphCompileTrace:
     kernels: list[KernelTrace] = field(default_factory=list)
     relax_functions: dict[str, str] = field(default_factory=dict)
     schedule_matches: dict[str, str] = field(default_factory=dict)
+    # Compilation composition counts (None on cache hits).
+    n_compiled: int | None = None
+    n_extern: int | None = None
+    n_fallback_eager: int | None = None
 
     def summary(self) -> str:
         lines = [
@@ -485,70 +489,61 @@ def compile_subgraph_direct(
             buf = func.buffer_map.get(param)
             record.arg_dtypes.append(str(buf.dtype) if buf is not None else "")
 
-    # Pre-filter: remove functions with non-float buffers (int64, bool)
-    # that TileLang's pipeline can't lower.  Mark them as torch fallback.
-    _float_dtypes = {"float16", "float32", "float64", "bfloat16"}
-    pre_failed: set[str] = set()
-    for name, func in list(tir_funcs.items()):
-        for param in func.params:
-            buf = func.buffer_map.get(param)
-            if buf is not None and str(buf.dtype) not in _float_dtypes:
-                pre_failed.add(name)
-                break
-    for name in pre_failed:
-        del tir_funcs[name]
+    # CompileCapability: reject TIR functions with non-float buffers.
+    compilable = compile_capability_check(tir_funcs)
+    non_compilable = set(tir_funcs) - set(compilable)
     for record in call_seq:
-        if record.func_name in pre_failed:
+        if record.func_name in non_compilable:
             record.is_torch_fallback = True
-            logger.info("Function %s has non-float buffers, using torch fallback", record.func_name)
+            logger.info("CompileCapability: %s excluded (non-float buffers)", record.func_name)
 
-    if not tir_funcs:
-        if not extern_stubs and not pre_failed:
+    if not compilable:
+        if not extern_stubs and not non_compilable:
             logger.debug("compile_subgraph_direct: no TIR PrimFuncs in module")
             return None
         return param_names, call_seq, output_names, sym_var_map, None, constants
 
+    # Bulk TIR compilation.
     try:
         rt_mod = _compile_tir_direct(
-            tir_funcs,
-            target,
-            save_so_path=save_so_path,
-            pass_configs=pass_configs,
+            compilable, target, save_so_path=save_so_path, pass_configs=pass_configs,
         )
         return param_names, call_seq, output_names, sym_var_map, rt_mod, constants
     except Exception:
         logger.debug("Bulk TIR compilation failed, trying per-function", exc_info=True)
 
-    needed_funcs = {record.func_name for record in call_seq}
-    compilable: dict[str, tir.PrimFunc] = {}
+    # Per-function probe: collect compilable, mark failed.
+    good: dict[str, tir.PrimFunc] = {}
     failed: set[str] = set()
-
-    for name in needed_funcs:
-        if name not in tir_funcs:
-            failed.add(name)
-            continue
+    for name, func in compilable.items():
         try:
-            _compile_tir_direct({name: tir_funcs[name]}, target, pass_configs=pass_configs)
-            compilable[name] = tir_funcs[name]
+            _compile_tir_direct({name: func}, target, pass_configs=pass_configs)
+            good[name] = func
         except Exception:
             logger.debug("TIR function %s failed compilation", name, exc_info=True)
             failed.add(name)
 
-    if not compilable:
-        logger.debug("compile_subgraph_direct: all TIR functions failed: %s", needed_funcs)
+    # Failure contract: if any failed function has no extern backing,
+    # the entire subgraph must fall back to eager (return None).
+    extern_names = {r.func_name for r in call_seq if r.extern_op is not None}
+    for name in failed:
+        if name not in extern_names:
+            logger.info(
+                "Function %s failed with no extern fallback — eager subgraph fallback", name,
+            )
+            return None
+
+    if not good:
+        logger.debug("compile_subgraph_direct: all TIR functions failed")
         return None
 
-    # Mark failed records as torch fallback.
     for record in call_seq:
         if record.func_name in failed:
             record.is_torch_fallback = True
             logger.info("Function %s will use torch fallback", record.func_name)
 
     rt_mod = _compile_tir_direct(
-        compilable,
-        target,
-        save_so_path=save_so_path,
-        pass_configs=pass_configs,
+        good, target, save_so_path=save_so_path, pass_configs=pass_configs,
     )
     return param_names, call_seq, output_names, sym_var_map, rt_mod, constants
 
@@ -600,44 +595,62 @@ def _create_extern_stub(
     return func
 
 
-_ALWAYS_EXTERN = {
-    "scaled_dot_product_attention",
-    "tensor",
-}
+_COMPILABLE_DTYPES = frozenset({"float16", "float32", "float64", "bfloat16"})
 
 
-def _iter_tensor_call_function_names(gm: torch.fx.GraphModule) -> list[str]:
-    names: list[str] = []
-    seen: set[str] = set()
-    for node in gm.graph.nodes:
-        if node.op != "call_function":
-            continue
-        name = getattr(node.target, "__name__", None)
-        if not name or name in seen:
-            continue
-        example_value = node.meta.get("example_value")
-        if example_value is None or not hasattr(example_value, "shape"):
-            continue
-        seen.add(name)
-        names.append(name)
-    return names
+def compile_capability_check(
+    tir_funcs: dict[str, tir.PrimFunc],
+) -> dict[str, tir.PrimFunc]:
+    """Return only TIR functions whose buffers are all float types.
+
+    TileLang's lowering pipeline cannot handle int64, bool, or other
+    non-float buffer dtypes.  Functions with such buffers are excluded.
+    """
+    compilable: dict[str, tir.PrimFunc] = {}
+    for name, func in tir_funcs.items():
+        ok = True
+        for param in func.params:
+            buf = func.buffer_map.get(param)
+            if buf is not None and str(buf.dtype) not in _COMPILABLE_DTYPES:
+                ok = False
+                break
+        if ok:
+            compilable[name] = func
+    return compilable
 
 
-def _infer_failed_op_name(
-    gm: torch.fx.GraphModule,
-    exc: Exception,
-    forced_ops: set[str],
-) -> str | None:
-    message = str(exc).lower()
-    candidates = sorted(
-        (name for name in _iter_tensor_call_function_names(gm) if name not in forced_ops),
-        key=len,
-        reverse=True,
-    )
-    for name in candidates:
-        if name.lower() in message:
-            return name
-    return None
+@dataclass
+class ExternPolicy:
+    """Classifies FX ops as extern (bypass TIR, call torch directly).
+
+    An op is extern if:
+    1. Its qualname is in ``permanent_extern_qualnames`` (e.g. SDPA), OR
+    2. It is a ``torch.library`` custom op (``OpOverloadPacket``), OR
+    3. It is absent from TVM's ``from_fx`` convert_map.
+    """
+
+    # Ops that are permanently extern regardless of TVM support.
+    # Keyed by qualname (str(target)) for OpOverloadPacket or __name__ for builtins.
+    permanent_extern_qualnames: frozenset[str] = frozenset({
+        "scaled_dot_product_attention",  # single optimized kernel, no fusion benefit
+        "tensor",                        # TVM converter rejects non-scalar inputs
+    })
+
+    def is_extern(self, target: Any, known_fx_ops: set[str]) -> bool:
+        """Return True if *target* should be an extern call."""
+        # torch.library custom ops are always extern.
+        if isinstance(target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
+            return True
+        name = getattr(target, "__name__", None)
+        if name is None:
+            return True
+        # Permanent extern entries.
+        if name in self.permanent_extern_qualnames:
+            return True
+        # Not in TVM's convert_map → extern.
+        if name not in known_fx_ops:
+            return True
+        return False
 
 
 def _build_unsupported_op_map(
@@ -647,7 +660,8 @@ def _build_unsupported_op_map(
     force_extern_ops: set[str] | None = None,
 ) -> dict[str, Any]:
     force_extern_ops = set(force_extern_ops or set())
-    known = _get_known_fx_ops() - _ALWAYS_EXTERN - force_extern_ops
+    known_fx = _get_known_fx_ops()
+    policy = ExternPolicy()
 
     unsupported: dict[str, Any] = {}
     nontensor_ops: set[str] = set()
@@ -655,12 +669,12 @@ def _build_unsupported_op_map(
         if node.op != "call_function":
             continue
         name = getattr(node.target, "__name__", "")
-        if name in known or name in unsupported or name in nontensor_ops:
+        if name in unsupported or name in nontensor_ops:
             continue
         example_value = node.meta.get("example_value")
         if example_value is None or not hasattr(example_value, "shape"):
             nontensor_ops.add(name)
-        else:
+        elif name in force_extern_ops or policy.is_extern(node.target, known_fx):
             unsupported[name] = node.target
 
     convert_map: dict[str, Any] = {}
@@ -829,27 +843,7 @@ def from_fx_with_fallback(
             **kwargs,
         )
         return FXLoweringResult(mod=mod, extern_ops=extern_ops)
-    except Exception as exc:
-        failed_op = _infer_failed_op_name(gm, exc, set())
-        if failed_op is None:
-            raise
-        logger.info(
-            "from_fx converter for %s failed, retrying with extern fallback",
-            failed_op,
-        )
-
-        retry_extern_ops: dict[str, _ExternOpInfo] = {}
-        retry_convert_map = _build_unsupported_op_map(
-            gm,
-            retry_extern_ops,
-            force_extern_ops={failed_op},
-        )
-        mod = from_fx(
-            gm,
-            input_info,
-            keep_params_as_input=True,
-            unwrap_unit_return_tuple=True,
-            custom_convert_map=retry_convert_map or None,
-            **kwargs,
-        )
-        return FXLoweringResult(mod=mod, extern_ops=retry_extern_ops)
+    except Exception:
+        # from_fx failed even after extern stubs. Let the caller
+        # fall back to eager for the whole subgraph.
+        raise
