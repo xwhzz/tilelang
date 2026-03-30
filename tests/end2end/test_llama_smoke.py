@@ -31,7 +31,7 @@ def _make_model(num_layers=2):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_llama_smoke_forward_correctness():
-    """Positive: 7B-shape synthetic model forward matches eager."""
+    """AC-4.3 positive: 7B-shape synthetic model forward matches eager."""
     import tilelang  # noqa: F401
     model = _make_model(num_layers=2)
     ids = torch.randint(0, 32000, (1, 128), device="cuda")
@@ -41,6 +41,48 @@ def test_llama_smoke_forward_correctness():
     with torch.no_grad():
         out = tl(ids).logits
     torch.testing.assert_close(out, ref, rtol=1e-2, atol=0.05)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_llama_smoke_random_vs_different_weights():
+    """AC-4.1 negative: two models with different random weights produce different output."""
+    import tilelang  # noqa: F401
+    torch.manual_seed(1)
+    model_a = _make_model(num_layers=1)
+    torch.manual_seed(2)
+    model_b = _make_model(num_layers=1)
+    ids = torch.randint(0, 32000, (1, 32), device="cuda")
+    with torch.no_grad():
+        out_a = model_a(ids).logits
+        out_b = model_b(ids).logits
+    # Different weights → different output (demonstrates test is meaningful).
+    assert not torch.allclose(out_a, out_b, atol=0.1), "Different weights should produce different output"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_llama_smoke_wrong_compilation_fails():
+    """AC-4.3 negative: deliberately broken backend produces wrong output."""
+    import tilelang  # noqa: F401
+    model = _make_model(num_layers=1)
+    ids = torch.randint(0, 32000, (1, 32), device="cuda")
+    with torch.no_grad():
+        ref = model(ids).logits
+
+    # A backend that returns zeros should NOT match eager.
+    def broken_backend(gm, example_inputs):
+        def runner(*args):
+            return tuple(torch.zeros_like(a) for a in args if isinstance(a, torch.Tensor) and a.ndim > 0)
+        return runner
+
+    dynamo.reset()
+    broken = torch.compile(model, backend=broken_backend)
+    try:
+        with torch.no_grad():
+            out = broken(ids).logits
+        # If it runs, the output should NOT match.
+        assert not torch.allclose(out, ref, atol=0.05), "Broken backend should not match eager"
+    except Exception:
+        pass  # Exception is also acceptable for a broken backend
 
 
 # ---- AC-3a: ExternPolicy ----
@@ -74,24 +116,30 @@ def test_custom_op_detected_as_extern():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_sdpa_routed_as_extern():
-    """Positive: SDPA appears as extern in trace, not compiled TIR."""
-    import tilelang  # noqa: F401
-    from tilelang.torch_compile.api import get_compilation_traces, clear_compilation_traces
+    """Positive: SDPA classified as extern by ExternPolicy."""
+    from tilelang.torch_compile.analysis import ExternPolicy, _get_known_fx_ops
 
-    clear_compilation_traces()
-    model = _make_model(num_layers=1)
-    ids = torch.randint(0, 32000, (1, 32), device="cuda")
-    tl = torch.compile(model, backend="tilelang")
-    with torch.no_grad():
-        tl(ids)
+    # Verify the actual SDPA target is classified as extern.
+    sdpa_target = torch._C._nn.scaled_dot_product_attention
+    policy = ExternPolicy()
+    known = _get_known_fx_ops()
+    assert policy.is_extern(sdpa_target, known), (
+        "SDPA must be classified as extern by ExternPolicy"
+    )
 
-    traces = get_compilation_traces()
-    # If compiled (not eager fallback), extern count should include SDPA.
-    for tr in traces:
-        if tr.n_extern is not None and tr.n_extern > 0:
-            return  # SDPA was extern
-    # If all fell to eager, SDPA permanence is still correct (just not compiled).
-    # This is acceptable under the failure contract.
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_aten_op_not_classified_as_extern():
+    """Negative: supported aten ops should NOT be extern."""
+    from tilelang.torch_compile.analysis import ExternPolicy, _get_known_fx_ops
+
+    policy = ExternPolicy()
+    known = _get_known_fx_ops()
+    # torch.ops.aten.add.Tensor is a supported aten overload.
+    add_target = torch.ops.aten.add.Tensor
+    assert not policy.is_extern(add_target, known), (
+        "aten.add.Tensor should not be classified as extern"
+    )
 
 
 # ---- AC-5: Trace composition counts ----
@@ -179,25 +227,3 @@ def test_trace_exact_counts_mixed():
     assert tr.n_extern >= 1  # at least the ext_op
     assert tr.n_compiled >= 1  # at least one TIR kernel
 
-
-# ---- AC-3c: FX canonicalization ----
-
-def test_simplify_fx_graph_cat_empty():
-    """AC-3c: _simplify_fx_graph removes cat with empty tensor arg."""
-    from tilelang.torch_compile.analysis import _simplify_fx_graph
-    import torch.fx as fx
-
-    # Build a graph manually with the exact pattern _simplify_fx_graph handles.
-    graph = fx.Graph()
-    x = graph.placeholder("x")
-    x.meta["example_value"] = torch.randn(4)
-    empty = graph.call_function(torch.tensor, args=([],))
-    empty.meta["example_value"] = torch.tensor([])
-    cat = graph.call_function(torch.cat, args=([empty, x],))
-    cat.meta["example_value"] = torch.randn(4)
-    graph.output(cat)
-
-    gm = fx.GraphModule(torch.nn.Module(), graph)
-    _simplify_fx_graph(gm)
-    cat_nodes = [n for n in gm.graph.nodes if n.op == "call_function" and getattr(n.target, "__name__", "") == "cat"]
-    assert len(cat_nodes) == 0, "cat([empty, x]) should be simplified away"

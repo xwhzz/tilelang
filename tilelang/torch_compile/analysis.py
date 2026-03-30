@@ -662,19 +662,24 @@ class ExternPolicy:
     """Classifies FX ops as extern (bypass TIR, call torch directly).
 
     An op is extern if:
-    1. Its identity key matches ``_PERMANENT_EXTERN``, OR
-    2. It is a ``torch.library`` custom op (``OpOverloadPacket``/``OpOverload``), OR
+    1. Its identity key matches permanent extern entries, OR
+    2. It is a custom ``torch.library`` op (non-aten namespace), OR
     3. It is absent from TVM's ``from_fx`` convert_map.
     """
 
+    # Aten namespaces that TVM's from_fx handles natively.
+    _KNOWN_NAMESPACES: frozenset[str] = frozenset({"aten", "prims", "prim"})
+
     def is_extern(self, target: Any, known_fx_ops: set[str]) -> bool:
         """Return True if *target* should be an extern call."""
-        if isinstance(target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
-            return True
-        # Check identity key first (stable, collision-free).
+        # Check permanent extern by identity key first.
         key = _op_identity_key(target)
         if key in _PERMANENT_EXTERN_KEYS:
             return True
+        # For OpOverload/OpOverloadPacket: extern only if custom (non-aten).
+        if isinstance(target, (torch._ops.OpOverloadPacket, torch._ops.OpOverload)):
+            ns = getattr(target, "namespace", "")
+            return ns not in self._KNOWN_NAMESPACES
         # Check __name__ for permanent entries and TVM convert_map.
         name = getattr(target, "__name__", None)
         if name is None:
@@ -806,7 +811,17 @@ def _build_unsupported_op_map(
 
             return _converter
 
+        if op_name in convert_map:
+            logger.warning(
+                "Unsupported op name collision: %s (identity keys: %s and %s). "
+                "Later converter wins.",
+                op_name, convert_map.get(f"_ikey_{op_name}", "?"), ikey,
+            )
         convert_map[op_name] = _make_converter(op_name, qualname, op_target)
+        convert_map[f"_ikey_{op_name}"] = ikey  # track for collision detection
+
+    # Remove tracking keys before returning.
+    convert_map = {k: v for k, v in convert_map.items() if not k.startswith("_ikey_")}
 
     def _noop(node, importer):
         return None
