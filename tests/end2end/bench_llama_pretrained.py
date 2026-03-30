@@ -101,7 +101,29 @@ def main():
     n_diff = (tl_tokens != eager_tokens).sum().item()
     print(f"Token match: {'PASS' if token_match else f'FAIL ({n_diff}/{args.max_new_tokens} differ)'}")
 
-    # Negative control: different prompt → different tokens
+    # Negative control 1: random-weight model → different from pretrained
+    from transformers import LlamaConfig as _LC
+    rand_config = _LC(
+        hidden_size=model.config.hidden_size,
+        intermediate_size=model.config.intermediate_size,
+        num_hidden_layers=1,
+        num_attention_heads=model.config.num_attention_heads,
+        num_key_value_heads=model.config.num_key_value_heads,
+        max_position_embeddings=model.config.max_position_embeddings,
+        vocab_size=model.config.vocab_size,
+        torch_dtype=torch.float16,
+        attn_implementation="sdpa",
+    )
+    torch.manual_seed(99)
+    rand_model = LlamaForCausalLM(rand_config).half().cuda().eval()
+    with torch.no_grad():
+        rand_logits = rand_model(input_ids).logits
+    rand_diff = (rand_logits - eager_logits).abs().max().item()
+    print(f"Negative control (random weights): diff={rand_diff:.2f} {'PASS (differs)' if rand_diff > 1.0 else 'FAIL (too similar)'}")
+    del rand_model
+    torch.cuda.empty_cache()
+
+    # Negative control 2: different prompt → different tokens
     alt_ids = tokenizer("Once upon a time in a land far away", return_tensors="pt")["input_ids"].cuda()
     alt_tokens = greedy_generate(model, alt_ids, args.max_new_tokens)
     neg_same = (alt_tokens[:, :eager_tokens.shape[1]] == eager_tokens).all().item() if alt_tokens.shape[1] >= eager_tokens.shape[1] else False

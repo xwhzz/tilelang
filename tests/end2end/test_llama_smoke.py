@@ -61,28 +61,37 @@ def test_llama_smoke_random_vs_different_weights():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_llama_smoke_wrong_compilation_fails():
-    """AC-4.3 negative: deliberately broken backend produces wrong output."""
+    """AC-4.3 negative: backend that zeros all outputs produces wrong logits."""
     import tilelang  # noqa: F401
     model = _make_model(num_layers=1)
     ids = torch.randint(0, 32000, (1, 32), device="cuda")
     with torch.no_grad():
         ref = model(ids).logits
 
-    # A backend that returns zeros should NOT match eager.
-    def broken_backend(gm, example_inputs):
+    # A backend that returns zeros for every tensor output.
+    def zeros_backend(gm, example_inputs):
+        orig_forward = gm.forward
+
         def runner(*args):
-            return tuple(torch.zeros_like(a) for a in args if isinstance(a, torch.Tensor) and a.ndim > 0)
+            result = orig_forward(*args)
+            if isinstance(result, torch.Tensor):
+                return torch.zeros_like(result)
+            if isinstance(result, (tuple, list)):
+                return type(result)(
+                    torch.zeros_like(r) if isinstance(r, torch.Tensor) else r
+                    for r in result
+                )
+            return result
         return runner
 
     dynamo.reset()
-    broken = torch.compile(model, backend=broken_backend)
-    try:
-        with torch.no_grad():
-            out = broken(ids).logits
-        # If it runs, the output should NOT match.
-        assert not torch.allclose(out, ref, atol=0.05), "Broken backend should not match eager"
-    except Exception:
-        pass  # Exception is also acceptable for a broken backend
+    broken = torch.compile(model, backend=zeros_backend)
+    with torch.no_grad():
+        out = broken(ids).logits
+    # Zeros should NOT match real logits.
+    assert not torch.allclose(out, ref, atol=0.05), (
+        "Zeroed output should not match eager — test validates that correctness checks are meaningful"
+    )
 
 
 # ---- AC-3a: ExternPolicy ----
@@ -222,8 +231,35 @@ def test_trace_exact_counts_mixed():
 
     traces = get_compilation_traces()
     compiled_traces = [t for t in traces if t.n_compiled is not None]
-    assert len(compiled_traces) > 0
+    assert len(compiled_traces) > 0, "Expected at least one compiled trace"
     tr = compiled_traces[0]
-    assert tr.n_extern >= 1  # at least the ext_op
-    assert tr.n_compiled >= 1  # at least one TIR kernel
+    # Exact: 1 extern (ext_op) + N compiled TIR kernels (N >= 1).
+    assert tr.n_extern == 1, f"Expected exactly 1 extern op, got {tr.n_extern}"
+    assert tr.n_compiled >= 1, f"Expected at least 1 compiled kernel, got {tr.n_compiled}"
+    assert tr.n_fallback_eager == 0, f"Expected 0 eager fallback, got {tr.n_fallback_eager}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_trace_counts_symbolic():
+    """AC-5: symbolic compilation trace has composition counts."""
+    import tilelang  # noqa: F401
+    from tilelang.torch_compile.api import get_compilation_traces, clear_compilation_traces
+
+    def model(x):
+        return x * 2.0 + 1.0
+
+    clear_compilation_traces()
+    compiled = torch.compile(model, backend="tilelang", dynamic=True)
+    x = torch.randn(4, device="cuda", dtype=torch.float16)
+    with torch.no_grad():
+        compiled(x)
+
+    traces = get_compilation_traces()
+    sym_traces = [t for t in traces if t.compilation_path == "dynamo_symbolic"]
+    if sym_traces:
+        tr = sym_traces[0]
+        assert tr.n_compiled is not None, "Symbolic trace should have n_compiled"
+        assert tr.n_compiled >= 1
+        assert tr.n_extern is not None
+        assert tr.n_fallback_eager == 0
 

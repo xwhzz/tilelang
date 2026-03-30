@@ -812,15 +812,17 @@ def _build_unsupported_op_map(
             return _converter
 
         if op_name in convert_map:
-            logger.warning(
-                "Unsupported op name collision: %s (identity keys: %s and %s). "
-                "Later converter wins.",
-                op_name, convert_map.get(f"_ikey_{op_name}", "?"), ikey,
+            raise ValueError(
+                f"Unsupported op name collision in custom_convert_map: "
+                f"two distinct unsupported callables share __name__={op_name!r} "
+                f"(identity keys: {convert_map.get(f'_ikey_{op_name}', '?')} and {ikey}). "
+                f"TVM's from_fx requires unique __name__ keys. "
+                f"Rename one of the ops or add it to the permanent extern set."
             )
         convert_map[op_name] = _make_converter(op_name, qualname, op_target)
-        convert_map[f"_ikey_{op_name}"] = ikey  # track for collision detection
+        convert_map[f"_ikey_{op_name}"] = ikey
 
-    # Remove tracking keys before returning.
+    # Remove tracking keys.
     convert_map = {k: v for k, v in convert_map.items() if not k.startswith("_ikey_")}
 
     def _noop(node, importer):
