@@ -36,6 +36,8 @@ from .reduction_utils import (  # noqa: F401
     _analyze_reduction_update,
     _extract_single_input_buffer,
     _collect_input_buffers,
+    _unwrap_to_buffer_load,
+    _classify_reduce_expr,
     _is_direct_buffer_load,
     _is_same_buffer_load,
     _is_square_of_buffer_load,

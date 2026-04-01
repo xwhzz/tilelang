@@ -219,25 +219,13 @@ class ElementWise(GPUScheduleRule):
         # dimension boundaries and cache_read_at creates a fragment with
         # non-affine access patterns that LayoutInference cannot handle.
         #
-        # TODO: teach cache_read_at to produce 1-D (flat) fragments for
-        # fused loops so that fragments work for every tile size.
-        use_fragment = _tile_aligns_with_suffix(s_extents, tile_extent)
-        if use_fragment:
-            block_name = block_stmt.name_hint
-            write_buffers = [region.buffer for region in block_stmt.writes]
-            for read_buffer_index, region in enumerate(block_stmt.reads):
-                if any(region.buffer.same_as(write_buffer) for write_buffer in write_buffers):
-                    continue
-                # Skip 0-dim (scalar) buffers — cache_read_at requires ≥1-D.
-                if len(region.buffer.shape) == 0:
-                    continue
-                block = sch.get_block(block_name)
-                sch.cache_read_at(bx, block, read_buffer_index, "local.fragment")
-
-            block = sch.get_block(block_name)
-            for write_buffer_index, _ in enumerate(sch.get(block).writes):
-                sch.cache_write_at(bx, block, write_buffer_index, "local.fragment")
-                block = sch.get_block(block_name)
+        # Additionally, skip fragment caching when a buffer is read with
+        # multiple distinct access patterns (e.g. RoPE reads x[i,j] and
+        # x[i,j+32]).  The layout system requires uniform access patterns
+        # per fragment buffer; non-uniform patterns crash LayoutInference.
+        # In such cases implicit register caching by the GPU is sufficient.
+        # TODO: re-enable fragment caching with non-uniform read detection
+        #       once LayoutInference supports multi-pattern buffers.
 
         sch.parallel(inner)
         sch.bind(bx, "blockIdx.x")

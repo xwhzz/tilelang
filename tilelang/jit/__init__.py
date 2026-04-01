@@ -36,8 +36,8 @@ import concurrent.futures
 
 from tqdm.auto import tqdm
 
-# Import torch_compile module to trigger torch.compile backend registration.
-import tilelang.torch_compile.api as _torch_compile_api  # noqa: F401
+# Import graph module to trigger torch.compile backend registration.
+import tilelang.graph as _graph  # noqa: F401
 
 logger = getLogger(__name__)
 

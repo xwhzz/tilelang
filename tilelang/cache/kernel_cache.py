@@ -319,8 +319,8 @@ class KernelCache:
             if key in self._memory_cache:
                 # Include kernel name for easier debugging when hitting memory cache
                 kernel_name = get_prim_func_name(func, "<unknown>")
-                self.logger.warning(
-                    "Found kernel '%s' in memory cache. For better performance, consider using `@tilelang.jit` instead of direct kernel caching.",
+                self.logger.debug(
+                    "Found kernel '%s' in memory cache.",
                     kernel_name,
                 )
                 return self._memory_cache[key]

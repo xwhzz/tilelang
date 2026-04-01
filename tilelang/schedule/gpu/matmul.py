@@ -400,6 +400,15 @@ class Matmul(GPUScheduleRule):
             if len(loops) != 4:
                 return None
 
+            # Skip tensor-core scheduling for tiny K — the pad_einsum +
+            # gemm path produces wrong results when K < block_k (e.g. K=1
+            # in RoPE frequency outer-products).  The Fallback rule handles
+            # these with plain CUDA cores.
+            iter_exts = [_as_static_int(iv.dom.extent) for iv in block_stmt.iter_vars]
+            k_ext = iter_exts[3] if len(iter_exts) >= 4 else None
+            if k_ext is not None and k_ext < 16:
+                return None
+
             config = _choose_tile_config(target, block_stmt, has_epilogue=bool(epilogue_names))
             epilogue_shared_scope = _choose_epilogue_shared_scope(target, use_tile_gemm)
 

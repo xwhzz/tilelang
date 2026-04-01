@@ -18,6 +18,7 @@ from .reduction_utils import (
     _analyze_reduction_update,
     _choose_num_threads,
     _choose_reduction_step,
+    _classify_reduce_expr,
     _collect_input_buffers,
     _block_writes_buffer,
     _find_buffer_index,
@@ -307,10 +308,18 @@ def _schedule_reduction_stage_at_bx(
             write_back=cache_reduce_write_back,
         )
 
-        can_lower_to_tile_reduce = is_single_source and (_is_direct_buffer_load(rhs_expr, input_buffers[0]) or square_single_source)
+        # Determine whether the reduction RHS can be lowered to T.reduce.
+        # _classify_reduce_expr generalises direct-load and square-of-load
+        # checks to also handle expressions with inlined element-wise ops
+        # (e.g. pow(cast(buf[i]), 2) → "sumsq").
+        reduce_type_for_lower = (
+            _classify_reduce_expr(rhs_expr, input_buffers[0], reduce_type)
+            if is_single_source and len(input_buffers) == 1
+            else None
+        )
+        can_lower_to_tile_reduce = reduce_type_for_lower is not None
         if reduce_loop is not None and can_lower_to_tile_reduce:
             read_buffer_index = read_buffer_indices[0]
-            reduce_type_for_lower = "sumsq" if square_single_source else reduce_type
             block = sch.get_block(block_name)
             block_stmt = sch.get(block)
             reduce_dim = _infer_reduce_dim(

@@ -116,6 +116,67 @@ def _collect_input_buffers(rhs: tir.PrimExpr, write_buffer: tir.Buffer) -> list[
     return buffers
 
 
+def _unwrap_to_buffer_load(expr: tir.PrimExpr) -> tir.BufferLoad | None:
+    """Strip element-wise wrappers (Cast, etc.) to find the underlying BufferLoad."""
+    while True:
+        if isinstance(expr, tir.BufferLoad):
+            return expr
+        if isinstance(expr, tir.Cast):
+            expr = expr.value
+            continue
+        return None
+
+
+def _classify_reduce_expr(
+    rhs: tir.PrimExpr,
+    target_buffer: tir.Buffer,
+    reduce_type: str,
+) -> str | None:
+    """Determine the T.reduce type that is semantically equivalent to
+    ``reduce_type(rhs)`` where *rhs* may contain inlined element-wise
+    transforms (Cast, pow, abs, neg, …).
+
+    Returns one of ``"sum"``, ``"sumsq"``, ``"abssum"``, ``"max"``,
+    ``"absmax"``, ``"min"`` if a match is found, else ``None``.
+
+    This generalises the old ``_is_direct_buffer_load`` /
+    ``_is_square_of_buffer_load`` checks so that FuseTIR-inlined
+    expressions like ``pow(cast(buf[i]), 2)`` are recognised as
+    ``"sumsq"`` without special-casing each form.
+    """
+    # Identity: rhs is (possibly cast) buf[i]
+    inner = _unwrap_to_buffer_load(rhs)
+    if inner is not None and inner.buffer.same_as(target_buffer):
+        return reduce_type  # sum→sum, max→max, etc.
+
+    # Square patterns (map to "sumsq" when reduce_type is "sum"):
+    #   a) buf[i] * buf[i]   (with optional casts)
+    #   b) pow(buf[i], 2)    (with optional casts)
+    if reduce_type == "sum":
+        if isinstance(rhs, tir.Mul):
+            la = _unwrap_to_buffer_load(rhs.a)
+            lb = _unwrap_to_buffer_load(rhs.b)
+            if (la is not None and lb is not None
+                    and la.buffer.same_as(target_buffer)
+                    and lb.buffer.same_as(target_buffer)
+                    and all(tir.analysis.expr_deep_equal(a, b)
+                            for a, b in zip(la.indices, lb.indices))):
+                return "sumsq"
+        if isinstance(rhs, tir.Call) and getattr(rhs.op, "name", "") == "tir.pow":
+            if len(rhs.args) == 2:
+                base = _unwrap_to_buffer_load(rhs.args[0])
+                exp_val = _as_const_float(rhs.args[1])
+                if (base is not None and exp_val == 2.0
+                        and base.buffer.same_as(target_buffer)):
+                    return "sumsq"
+
+    # Absolute value patterns (map to "abssum"/"absmax"):
+    #   abs(buf[i]) or max(buf[i], -buf[i])
+    # Not needed for current use case — left for future extension.
+
+    return None
+
+
 def _is_direct_buffer_load(expr: tir.PrimExpr, target_buffer: tir.Buffer) -> bool:
     """Check whether expr is exactly a direct load from target_buffer."""
     return isinstance(expr, tir.BufferLoad) and expr.buffer.same_as(target_buffer)

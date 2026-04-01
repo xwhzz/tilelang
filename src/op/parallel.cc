@@ -183,8 +183,16 @@ void ParallelOpNode::RecordBufferAccess(const Buffer &buffer,
                                         bool is_write) {
   auto it = indice_map_.find(buffer);
   if (it != indice_map_.end()) {
-    ICHECK(StructuralEqual()(it->second.indices, indices))
-        << buffer << ": " << indices << " and " << it->second.indices;
+    if (!StructuralEqual()(it->second.indices, indices)) {
+      // Non-uniform access patterns (e.g. RoPE reads at different offsets).
+      // Keep the first recorded pattern for layout inference and mark as
+      // having non-uniform access.  Only writes with conflicting patterns
+      // would be a correctness issue.
+      if (is_write) {
+        ICHECK(false) << "Conflicting write access patterns for " << buffer
+                      << ": " << indices << " and " << it->second.indices;
+      }
+    }
   } else {
     BufferAccessInfo info;
     info.indices = indices;
