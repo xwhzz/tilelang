@@ -859,14 +859,14 @@ class GeneralReduction(GPUScheduleRule):
         )
 
         # Lower to tile-level T.reduce only for single-source reductions.
-        can_lower_main_reduce = (
-            len(read_buffer_indices) == 1
-            and reduce_loop is not None
-            and (_is_direct_buffer_load(rhs_expr, input_buffers[0]) or single_source_square)
+        reduce_type_for_lower = (
+            _classify_reduce_expr(rhs_expr, input_buffers[0], reduce_type)
+            if len(read_buffer_indices) == 1 and len(input_buffers) == 1
+            else None
         )
+        can_lower_main_reduce = reduce_type_for_lower is not None and reduce_loop is not None
         if can_lower_main_reduce:
             read_buffer_index = read_buffer_indices[0]
-            reduce_type_for_lower = "sumsq" if single_source_square else reduce_type
             reduction_block = sch.get_block(reduction_name)
             reduction_stmt = sch.get(reduction_block)
             reduce_dim = _infer_reduce_dim(
