@@ -221,12 +221,27 @@ class Transpose(GPUScheduleRule):
         shared_buf_name = read_buf.name + "_shared_dyn"
 
         i, j = loops
+        i_ext = _as_const_int(sch.get(i).extent)
+        j_ext = _as_const_int(sch.get(j).extent)
+
         config = _choose_transpose_config(
             target,
             read_buf.dtype,
             sch.get(i).extent,
             sch.get(j).extent,
         )
+
+        # When one dimension is fully covered by the tile, the
+        # cache_read_at read pattern becomes sparse in shared memory
+        # (bounding box >> actual elements) and LayoutInference
+        # cannot reshape the fragment to match.  Let the ElementWise
+        # or Fallback rule handle these small transposes instead.
+        if i_ext is not None and i_ext <= config.tile_n:
+            if j_ext is not None and j_ext > config.tile_m:
+                return None
+        if j_ext is not None and j_ext <= config.tile_m:
+            if i_ext is not None and i_ext > config.tile_n:
+                return None
 
         bi, ii = sch.split(i, factors=[None, config.tile_n], preserve_unit_iters=True)
         bj, jj = sch.split(j, factors=[None, config.tile_m], preserve_unit_iters=True)

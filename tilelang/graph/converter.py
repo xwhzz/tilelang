@@ -391,14 +391,15 @@ def _get_matmul_mnk(node: fx.Node) -> tuple[int, int, int] | None:
         return None  # symbolic (SymInt) shapes — can't determine statically
 
 
-def default_extern_dispatch(node: fx.Node, *, gemm_threshold: int = 128) -> bool:
+def default_extern_dispatch(node: fx.Node, *, gemv_threshold: int = 1) -> bool:
     """Default predicate for dispatching FX nodes to torch.
 
     Dispatches to torch (cuBLAS/FlashAttention) when:
     - The op is ``scaled_dot_product_attention``
-    - The op is a matmul-family op where all of M, N, K >= ``gemm_threshold``
+    - The op is a matmul-family op that is NOT a GEMV (M >= ``gemv_threshold``)
 
-    Everything else is compiled by TileLang.
+    GEMV (M < ``gemv_threshold``) stays in TileLang — these are memory-bound
+    and TileLang's GEMV schedule rule handles them well.
 
     Users can replace this with a custom callable to control dispatch::
 
@@ -407,7 +408,7 @@ def default_extern_dispatch(node: fx.Node, *, gemm_threshold: int = 128) -> bool
             if node.target.__name__ == "layer_norm":
                 return True
             # Use default for everything else
-            return default_extern_dispatch(node, gemm_threshold=256)
+            return default_extern_dispatch(node, gemv_threshold=8)
 
         compiled = torch.compile(model, backend="tilelang")
         # Or via fx_to_relax(gm, inputs, extern_dispatch=my_dispatch)
@@ -419,7 +420,8 @@ def default_extern_dispatch(node: fx.Node, *, gemm_threshold: int = 128) -> bool
     mnk = _get_matmul_mnk(node)
     if mnk is not None:
         M, N, K = mnk
-        return M >= gemm_threshold and N >= gemm_threshold and K >= gemm_threshold
+        # GEMV (small M) → TileLang; GEMM → cuBLAS
+        return M >= gemv_threshold
 
     return False
 
