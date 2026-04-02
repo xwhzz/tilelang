@@ -6,7 +6,7 @@ import torch
 from torch import fx
 
 from tilelang import tvm as tvm
-from tvm import relax
+from tvm import relax, tir
 from tvm.relax.frontend.torch.fx_translator import TorchFXImporter
 
 from tilelang.graph.utils import torch_dtype_to_tvm
@@ -284,9 +284,16 @@ class TileLangFXImporter(TorchFXImporter):
 
                 for node in graph.nodes:
                     if node.op == "placeholder":
+                        ev = node.meta.get("example_value")
+                        # SymInt placeholder — store as tir.Var for dynamic shapes
+                        if ev is not None and isinstance(ev, torch.SymInt):
+                            if _is_truly_symbolic(ev):
+                                self.env[node] = _sym_var(str(ev))
+                            else:
+                                self.env[node] = tir.const(int(ev), "int64")
+                            continue
                         if "grapharg" in node.meta and node.meta["grapharg"].fake_tensor is None:
                             continue
-                        ev = node.meta.get("example_value")
                         if ev is not None and not hasattr(ev, "shape"):
                             continue
                         assert len(inputs) > 0
