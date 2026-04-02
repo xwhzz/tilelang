@@ -517,7 +517,16 @@ def _shape_code(shape, sym_var_map, bracket="["):
                 pidx, didx = sym_var_map[s.name]
                 parts.append(f"_tensor_inputs[{pidx}].shape[{didx}]")
             else:
-                parts.append(str(int(s)))
+                # May be a symbolic expression (e.g. FloorDiv(256, s50))
+                try:
+                    parts.append(str(int(s)))
+                except (TypeError, ValueError):
+                    # Generate runtime expression by substituting symbolic vars
+                    expr_str = str(s)
+                    for var_name, (pidx, didx) in sym_var_map.items():
+                        expr_str = expr_str.replace(
+                            var_name, f"_tensor_inputs[{pidx}].shape[{didx}]")
+                    parts.append(expr_str)
         return f"{bracket}{', '.join(parts)}{close}"
     return repr(list(shape) if bracket == "[" else tuple(shape))
 

@@ -163,11 +163,20 @@ bool ArgBinder::BindNullable(const PrimExpr &arg, const PrimExpr &value,
       }
       PrimExpr arg_simplified = analyzer_.Simplify(arg);
       PrimExpr value_simplified = analyzer_.Simplify(value);
-      arith::IntConstraints constraints(undefs, {},
+      // Re-check: variables may have been bound by earlier dimensions
+      // in the same buffer (two-pass effect).
+      auto undefs_post = ffi::Array<Var>(getUndefVars({arg_simplified}));
+      if (undefs_post.empty()) {
+        // All vars resolved — just assert equality
+        PrimExpr cond = (arg_simplified == value_simplified);
+        BinderAddAssert(&analyzer_, cond, arg_name, &asserts_, nullable_guard);
+        return true;
+      }
+      arith::IntConstraints constraints(undefs_post, {},
                                         {arg_simplified == value_simplified});
       auto sol = arith::SolveLinearEquations(constraints);
       if (!sol->dst->variables.empty()) {
-        LOG(FATAL) << "TVM is unable to solve variables " << undefs
+        LOG(FATAL) << "TVM is unable to solve variables " << undefs_post
                    << " from equation " << constraints;
       }
       for (const auto &v : undefs) {
