@@ -283,6 +283,65 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
     return instructions, param_names, output_vars, constants
 
 
+def _eliminate_dead_instructions(instructions, output_vars):
+    """Remove instructions whose outputs are never referenced."""
+    # Collect all var references across all instructions
+    referenced = set(output_vars)
+    for instr in instructions:
+        if isinstance(instr, KernelCallInstr):
+            referenced.update(a for a in instr.arg_vars if isinstance(a, str))
+        elif isinstance(instr, TorchFallbackInstr):
+            referenced.update(a for a in instr.arg_vars if isinstance(a, str))
+        elif isinstance(instr, ReshapeInstr):
+            referenced.add(instr.input_var)
+        elif isinstance(instr, AliasInstr):
+            referenced.add(instr.source_var)
+        elif isinstance(instr, TupleInstr):
+            referenced.update(instr.element_vars)
+        elif isinstance(instr, TupleGetItemInstr):
+            referenced.add(instr.tuple_var)
+
+    # Remove fallback instructions that produce unused outputs AND whose
+    # DPS output arg is also unused. Kernel calls are never eliminated
+    # (they have side effects on output buffers).
+    live = []
+    for instr in instructions:
+        if isinstance(instr, TorchFallbackInstr):
+            var = instr.var
+            # Check if the result var AND all output args are unreferenced
+            all_args_dead = (var not in referenced and
+                             all(a not in referenced
+                                 for a in instr.arg_vars if isinstance(a, str)))
+            if all_args_dead:
+                continue
+        live.append(instr)
+
+    # Second pass: remove allocs whose var is no longer referenced
+    referenced2 = set(output_vars)
+    for instr in live:
+        if isinstance(instr, KernelCallInstr):
+            referenced2.update(a for a in instr.arg_vars if isinstance(a, str))
+        elif isinstance(instr, TorchFallbackInstr):
+            referenced2.update(a for a in instr.arg_vars if isinstance(a, str))
+        elif isinstance(instr, ReshapeInstr):
+            referenced2.add(instr.input_var)
+        elif isinstance(instr, AliasInstr):
+            referenced2.add(instr.source_var)
+        elif isinstance(instr, TupleInstr):
+            referenced2.update(instr.element_vars)
+        elif isinstance(instr, TupleGetItemInstr):
+            referenced2.add(instr.tuple_var)
+
+    result = []
+    for instr in live:
+        var = getattr(instr, "var", None)
+        if isinstance(instr, AllocInstr) and var not in referenced2:
+            continue
+        result.append(instr)
+
+    return result
+
+
 def _sanitize_var(name: str) -> str:
     """Make a var name safe for use as a Python identifier."""
     return name.replace(".", "_").replace("-", "_").replace(" ", "_")
@@ -953,6 +1012,7 @@ def generate_wrapper(
     """
     fallback_calls = fallback_calls or {}
     instructions, param_names, output_vars, constants = _compile_instructions(mod)
+    instructions = _eliminate_dead_instructions(instructions, output_vars)
 
     # Build symbolic var → (param_index, dim_index) map
     main_func = None
