@@ -27,6 +27,7 @@ class KernelCallInstr:
     """Call a compiled TileLang kernel."""
     kernel_name: str
     arg_vars: list[str]
+    sym_vars: list[str] = None  # symbolic var names to pass as extra int args
 
 
 @dataclass
@@ -248,11 +249,22 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                             pass
                         elif hasattr(f, "name_hint"):
                             arg_vars.append(_unique_name(f))
-                instructions.append(KernelCallInstr(kernel_name=kernel_name, arg_vars=arg_vars))
+                # Find symbolic var params in the TIR function
+                tir_func = mod[gvar]
+                sym_vars = []
+                if isinstance(tir_func, tir.PrimFunc):
+                    for p in tir_func.params:
+                        if p not in tir_func.buffer_map and isinstance(p, tir.Var):
+                            sym_vars.append(p.name)
+                instructions.append(KernelCallInstr(
+                    kernel_name=kernel_name, arg_vars=arg_vars,
+                    sym_vars=sym_vars if sym_vars else None))
 
             elif _is_call_to_global_var(value):
                 kernel_name = value.op.name_hint
                 arg_vars = []
+                sym_vars = []
+                tir_func = mod[value.op] if value.op in mod.functions else None
                 for arg in value.args:
                     if isinstance(arg, relax.Constant):
                         cname = f"__inline_const_{len(constants)}"
@@ -262,8 +274,14 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                         arg_vars.append(_unique_name(arg))
                     else:
                         arg_vars.append(arg)
-
-                instructions.append(KernelCallInstr(kernel_name=kernel_name, arg_vars=arg_vars))
+                # Check for symbolic params in the TIR function
+                if isinstance(tir_func, tir.PrimFunc):
+                    for p in tir_func.params:
+                        if p not in tir_func.buffer_map and isinstance(p, tir.Var):
+                            sym_vars.append(p.name)
+                instructions.append(KernelCallInstr(
+                    kernel_name=kernel_name, arg_vars=arg_vars,
+                    sym_vars=sym_vars if sym_vars else None))
 
             elif isinstance(value, relax.Tuple):
                 element_vars = [_resolve_expr_name(f) for f in value.fields]
@@ -505,28 +523,74 @@ def _plan_memory_reuse(instructions, output_vars):
     return alloc_to_slot, pool_specs
 
 
+def _tir_expr_to_python(expr, sym_var_map):
+    """Convert a TIR PrimExpr to a Python runtime expression string."""
+    if isinstance(expr, tir.IntImm):
+        return str(int(expr))
+    if isinstance(expr, tir.Var):
+        if expr.name in sym_var_map:
+            pidx, didx = sym_var_map[expr.name]
+            return f"_tensor_inputs[{pidx}].shape[{didx}]"
+        return expr.name
+    if isinstance(expr, tir.Max):
+        a = _tir_expr_to_python(expr.a, sym_var_map)
+        b = _tir_expr_to_python(expr.b, sym_var_map)
+        return f"max({a}, {b})"
+    if isinstance(expr, tir.Min):
+        a = _tir_expr_to_python(expr.a, sym_var_map)
+        b = _tir_expr_to_python(expr.b, sym_var_map)
+        return f"min({a}, {b})"
+    if isinstance(expr, tir.FloorDiv):
+        a = _tir_expr_to_python(expr.a, sym_var_map)
+        b = _tir_expr_to_python(expr.b, sym_var_map)
+        return f"({a} // {b})"
+    if isinstance(expr, tir.FloorMod):
+        a = _tir_expr_to_python(expr.a, sym_var_map)
+        b = _tir_expr_to_python(expr.b, sym_var_map)
+        return f"({a} % {b})"
+    if isinstance(expr, (tir.Add, tir.Sub, tir.Mul, tir.Div)):
+        a = _tir_expr_to_python(expr.a, sym_var_map)
+        b = _tir_expr_to_python(expr.b, sym_var_map)
+        op = {tir.Add: "+", tir.Sub: "-", tir.Mul: "*", tir.Div: "/"}[type(expr)]
+        return f"({a} {op} {b})"
+    if isinstance(expr, tir.Cast):
+        return _tir_expr_to_python(expr.value, sym_var_map)
+    if isinstance(expr, tir.Select):
+        cond = _tir_expr_to_python(expr.condition, sym_var_map)
+        t = _tir_expr_to_python(expr.true_value, sym_var_map)
+        f = _tir_expr_to_python(expr.false_value, sym_var_map)
+        return f"({t} if {cond} else {f})"
+    # Comparison ops
+    for cls, op in [(tir.LT, "<"), (tir.LE, "<="), (tir.GT, ">"), (tir.GE, ">="),
+                    (tir.EQ, "=="), (tir.NE, "!=")]:
+        if isinstance(expr, cls):
+            a = _tir_expr_to_python(expr.a, sym_var_map)
+            b = _tir_expr_to_python(expr.b, sym_var_map)
+            return f"({a} {op} {b})"
+    # tir.Call: if_then_else and others
+    if isinstance(expr, tir.Call):
+        op_name = getattr(expr.op, "name", "")
+        if op_name == "tir.if_then_else":
+            cond = _tir_expr_to_python(expr.args[0], sym_var_map)
+            t = _tir_expr_to_python(expr.args[1], sym_var_map)
+            f = _tir_expr_to_python(expr.args[2], sym_var_map)
+            return f"({t} if {cond} else {f})"
+        args = ", ".join(_tir_expr_to_python(a, sym_var_map) for a in expr.args)
+        return f"{op_name}({args})"
+    # Fallback: try int conversion
+    try:
+        return str(int(expr))
+    except (TypeError, ValueError):
+        return str(expr)
+
+
 def _shape_code(shape, sym_var_map, bracket="["):
     """Generate shape code, resolving symbolic dims."""
     close = "]" if bracket == "[" else ")"
-    if any(isinstance(s, tir.Var) for s in shape):
-        parts = []
-        for s in shape:
-            if isinstance(s, int):
-                parts.append(str(s))
-            elif isinstance(s, tir.Var):
-                pidx, didx = sym_var_map[s.name]
-                parts.append(f"_tensor_inputs[{pidx}].shape[{didx}]")
-            else:
-                # May be a symbolic expression (e.g. FloorDiv(256, s50))
-                try:
-                    parts.append(str(int(s)))
-                except (TypeError, ValueError):
-                    # Generate runtime expression by substituting symbolic vars
-                    expr_str = str(s)
-                    for var_name, (pidx, didx) in sym_var_map.items():
-                        expr_str = expr_str.replace(
-                            var_name, f"_tensor_inputs[{pidx}].shape[{didx}]")
-                    parts.append(expr_str)
+    has_symbolic = any(not isinstance(s, int) and not isinstance(s, tir.IntImm)
+                       for s in shape)
+    if has_symbolic:
+        parts = [_tir_expr_to_python(s, sym_var_map) for s in shape]
         return f"{bracket}{', '.join(parts)}{close}"
     return repr(list(shape) if bracket == "[" else tuple(shape))
 
@@ -562,12 +626,24 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
                     f"{shape_str}, dtype=_torch.{dtype_str}, device=_device)")
 
         elif isinstance(instr, KernelCallInstr):
-            args = ", ".join(
+            tensor_args = ", ".join(
                 f"{_sanitize_var(a)}.contiguous() if not {_sanitize_var(a)}.is_contiguous() else {_sanitize_var(a)}"
                 if isinstance(a, str) else repr(a)
                 for a in instr.arg_vars
             )
-            lines.append(f"    _K[{instr.kernel_name!r}]({args})")
+            if instr.sym_vars:
+                # Append symbolic variable values (resolved from input shapes)
+                sym_parts = []
+                for sv in instr.sym_vars:
+                    if sv in sym_var_map:
+                        pidx, didx = sym_var_map[sv]
+                        sym_parts.append(f"_tensor_inputs[{pidx}].shape[{didx}]")
+                    else:
+                        sym_parts.append(sv)
+                all_args = tensor_args + ", " + ", ".join(sym_parts) if tensor_args else ", ".join(sym_parts)
+            else:
+                all_args = tensor_args
+            lines.append(f"    _K[{instr.kernel_name!r}]({all_args})")
 
         elif isinstance(instr, TorchFallbackInstr):
             op_name = instr.op_name

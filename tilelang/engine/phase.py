@@ -156,7 +156,7 @@ def NormalizeScheduledIR(mod: IRModule) -> IRModule:
     ElementWise, Matmul) and standard TVM-scheduled (Fallback).
     """
     mod = tir.transform.Simplify()(mod)
-    mod = tir.transform.ForceNarrowIndexToInt32()(mod)
+    mod = tilelang.transform.ForceNarrowIndexToInt32()(mod)
     mod = tir.transform.LowerInitBlock()(mod)
     mod = tir.transform.ConvertBlocksToOpaque()(mod)
     mod = tilelang.transform.ReserveRootBlock()(mod)

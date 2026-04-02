@@ -646,3 +646,17 @@ def StripBlockInit():
     redundant.
     """
     return _ffi_api.StripBlockInit()  # type: ignore
+
+def ForceNarrowIndexToInt32():
+    """Force narrow index types to int32.
+
+    This pass rewrites index variables with narrow integer types (e.g., int16, int8)
+    to int32 to avoid potential issues with codegen and hardware that may not support
+    narrow index types.
+
+    Returns
+    -------
+    fpass : tvm.transform.Pass
+        The result pass
+    """
+    return _ffi_api.ForceNarrowIndexToInt32()  # type: ignore
