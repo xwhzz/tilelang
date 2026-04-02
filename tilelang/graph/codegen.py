@@ -66,6 +66,15 @@ class AliasInstr:
 
 
 @dataclass
+class RelaxOpInstr:
+    """Un-lowered Relax op (dynamic shapes prevented TIR lowering)."""
+    var: str
+    op_name: str  # e.g. "relax.multiply", "relax.astype"
+    arg_vars: list[str]
+    attrs: dict  # op-specific attributes (e.g. dtype for astype)
+
+
+@dataclass
 class TorchFallbackInstr:
     """Call an unsupported op via torch at runtime."""
     var: str
@@ -268,6 +277,35 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                 instructions.append(ReshapeInstr(
                     var=var_name, input_var=input_var, shape=shape))
 
+            elif isinstance(value, relax.Call) and isinstance(value.op, ir.Op):
+                # Un-lowered Relax op (dynamic shapes prevented LegalizeOps
+                # from creating TIR).  Emit as a runtime torch call.
+                op_name = value.op.name
+                arg_vars = []
+                for a in value.args:
+                    if isinstance(a, relax.Constant):
+                        cname = f"__inline_const_{len(constants)}"
+                        constants[cname] = torch.from_numpy(a.data.numpy())
+                        arg_vars.append(cname)
+                    elif hasattr(a, "name_hint"):
+                        arg_vars.append(_unique_name(a))
+                    # Skip non-tensor args like ShapeExpr
+                attrs = {}
+                if value.attrs:
+                    try:
+                        for key in value.attrs.keys():
+                            attrs[key] = value.attrs[key]
+                    except AttributeError:
+                        for field in dir(value.attrs):
+                            if not field.startswith("_") and field not in ("handle", "same_as"):
+                                try:
+                                    attrs[field] = getattr(value.attrs, field)
+                                except Exception:
+                                    pass
+                instructions.append(RelaxOpInstr(
+                    var=var_name, op_name=op_name,
+                    arg_vars=arg_vars, attrs=attrs))
+
             else:
                 logger.debug("Unhandled binding type for %s: %s", var_name, type(value))
 
@@ -394,6 +432,8 @@ def _plan_memory_reuse(instructions, output_vars):
             refs.add(instr.source_var)
         elif isinstance(instr, ReshapeInstr):
             refs.add(instr.input_var)
+        elif isinstance(instr, RelaxOpInstr):
+            refs.update(instr.arg_vars)
         elif isinstance(instr, TupleInstr):
             refs.update(instr.element_vars)
         elif isinstance(instr, TupleGetItemInstr):
@@ -561,6 +601,34 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
             lines.append(f"    {result_var} = _F[{op_name!r}]({all_args})")
             if dps_var and isinstance(dps_var, str):
                 lines.append(f"    {_sanitize_var(dps_var)} = {result_var}")
+
+        elif isinstance(instr, RelaxOpInstr):
+            v = _sanitize_var(instr.var)
+            args = ", ".join(_sanitize_var(a) for a in instr.arg_vars)
+            op = instr.op_name
+            if op == "relax.multiply":
+                lines.append(f"    {v} = {_sanitize_var(instr.arg_vars[0])} * {_sanitize_var(instr.arg_vars[1])}")
+            elif op == "relax.add":
+                lines.append(f"    {v} = {_sanitize_var(instr.arg_vars[0])} + {_sanitize_var(instr.arg_vars[1])}")
+            elif op == "relax.power":
+                lines.append(f"    {v} = {_sanitize_var(instr.arg_vars[0])} ** {_sanitize_var(instr.arg_vars[1])}")
+            elif op == "relax.mean":
+                # mean over last axis
+                lines.append(f"    {v} = {_sanitize_var(instr.arg_vars[0])}.mean(dim=-1, keepdim=True)")
+            elif op == "relax.astype":
+                dtype = str(instr.attrs.get("dtype", "float16"))
+                torch_dtype = {"float16": "torch.float16", "float32": "torch.float32",
+                               "int32": "torch.int32", "int64": "torch.int64"}.get(dtype, f"torch.{dtype}")
+                lines.append(f"    {v} = {_sanitize_var(instr.arg_vars[0])}.to({torch_dtype})")
+            elif op == "relax.divide":
+                lines.append(f"    {v} = {_sanitize_var(instr.arg_vars[0])} / {_sanitize_var(instr.arg_vars[1])}")
+            elif op == "relax.sqrt":
+                lines.append(f"    {v} = _torch.sqrt({_sanitize_var(instr.arg_vars[0])})")
+            elif op == "relax.rsqrt":
+                lines.append(f"    {v} = _torch.rsqrt({_sanitize_var(instr.arg_vars[0])})")
+            else:
+                short_name = op.replace("relax.", "")
+                lines.append(f"    {v} = _torch.{short_name}({args})")
 
         elif isinstance(instr, ReshapeInstr):
             shape_str = _shape_code(instr.shape, sym_var_map, "(")
