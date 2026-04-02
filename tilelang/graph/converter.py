@@ -204,39 +204,9 @@ class TileLangFXImporter(TorchFXImporter):
         result = self.block_builder.emit(call)
 
         # Store full call info keyed by op_name (stable across pipeline transforms)
-        # Optimize SDPA: if using a causal bool mask, switch to is_causal=True
-        # to avoid mask-conversion overhead (saves ~0.7ms on LLaMA).
-        if op_name == "scaled_dot_product_attention" and self._is_causal_sdpa(node):
-            # Remove the mask tensor from args and kwargs
-            flat_tensor_args_no_mask = flat_tensor_args[:3]  # Q, K, V only
-            kwargs = dict(kwargs)
-            kwargs.pop("attn_mask", None)
-            kwargs["is_causal"] = True
-            # Rebuild the Relax call without the mask tensor
-            extern = relax.ExternFunc(f"torch_fallback.{op_name}")
-            call = relax.call_dps_packed(extern, flat_tensor_args_no_mask, out_sinfo)
-            result = self.block_builder.emit(call)
-            arg_template = arg_template[:3]  # Q, K, V only
-
         self.fallback_calls[op_name] = (node.target, arg_template, kwargs)
 
         return result
-
-    @staticmethod
-    def _is_causal_sdpa(node: fx.Node) -> bool:
-        """Check if an SDPA node uses a standard causal (lower-triangular) mask."""
-        mask_node = node.kwargs.get("attn_mask")
-        if mask_node is None:
-            return False
-        val = mask_node.meta.get("val", mask_node.meta.get("example_value"))
-        if val is None or not isinstance(val, torch.Tensor):
-            return False
-        # Must be bool dtype, square in last two dims (causal mask shape)
-        if val.dtype != torch.bool:
-            return False
-        if val.ndim < 2 or val.shape[-1] != val.shape[-2]:
-            return False
-        return True
 
     def from_fx(
         self,
