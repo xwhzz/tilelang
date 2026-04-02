@@ -48,14 +48,23 @@ def compile_tir_functions(
     from tilelang.jit import par_compile
     jit_kernels = par_compile(funcs, target=target)
 
-    # Extract raw Executable from each JITKernel to bypass
-    # the Python adapter layer on every call.
+    # For static-shape kernels, extract raw Executable to bypass the
+    # Python adapter layer.  For dynamic-shape kernels, keep the
+    # JITKernel which resolves symbolic vars from tensor shapes.
     compiled = {}
-    for name, kernel in zip(names, jit_kernels):
-        exe = kernel.adapter.executable
-        if exe is None:
-            exe = runtime.Executable(kernel.artifact.rt_mod)
-        compiled[name] = exe
-        logger.debug("Compiled: %s", name)
+    for name, kernel, func in zip(names, jit_kernels, funcs):
+        has_dynamic = any(
+            isinstance(s, tir.Var)
+            for p in func.params if p in func.buffer_map
+            for s in func.buffer_map[p].shape
+        )
+        if has_dynamic:
+            compiled[name] = kernel
+        else:
+            exe = kernel.adapter.executable
+            if exe is None:
+                exe = runtime.Executable(kernel.artifact.rt_mod)
+            compiled[name] = exe
+        logger.debug("Compiled: %s%s", name, " (dynamic)" if has_dynamic else "")
 
     return compiled

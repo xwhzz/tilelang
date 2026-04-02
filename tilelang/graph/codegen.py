@@ -234,12 +234,27 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                     var=var_name, op_name=op_name, arg_vars=arg_vars,
                     shape=shape, dtype=dtype))
 
+            elif (isinstance(value, relax.Call) and isinstance(value.op, ir.Op)
+                  and value.op.name == "relax.vm.call_tir_dyn"):
+                # Dynamic-shape TIR call: call_tir_dyn(GlobalVar, Tuple(inputs..., ShapeExpr))
+                gvar = value.args[0]
+                kernel_name = gvar.name_hint
+                packed_tuple = value.args[1]
+                arg_vars = []
+                if isinstance(packed_tuple, relax.Tuple):
+                    for f in packed_tuple.fields:
+                        if isinstance(f, relax.ShapeExpr):
+                            # Output shape descriptor — skip (alloc handled separately)
+                            pass
+                        elif hasattr(f, "name_hint"):
+                            arg_vars.append(_unique_name(f))
+                instructions.append(KernelCallInstr(kernel_name=kernel_name, arg_vars=arg_vars))
+
             elif _is_call_to_global_var(value):
                 kernel_name = value.op.name_hint
                 arg_vars = []
                 for arg in value.args:
                     if isinstance(arg, relax.Constant):
-                        # Pre-convert at compile time to avoid per-call overhead
                         cname = f"__inline_const_{len(constants)}"
                         constants[cname] = torch.from_numpy(arg.data.numpy())
                         arg_vars.append(cname)
