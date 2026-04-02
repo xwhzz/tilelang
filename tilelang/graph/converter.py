@@ -57,14 +57,19 @@ def _sym_var(name: str) -> "tir.Var":
 
 
 def _is_truly_symbolic(s) -> bool:
-    """Check if a SymInt is truly symbolic (not a concrete value wrapped in SymInt)."""
+    """Check if a SymInt represents a symbolic (not concrete) dimension.
+
+    Dynamo may concretize the SymInt's value by the time the backend
+    runs, so we check the underlying SymNode.expr — if it's a sympy
+    Symbol (not a plain integer), the dimension is dynamic.
+    """
     if not isinstance(s, torch.SymInt):
         return False
-    try:
-        int(s)
-        return False  # concrete — int() succeeds
-    except Exception:
-        return True   # truly symbolic — int() fails
+    node = s.node
+    if hasattr(node, "expr"):
+        import sympy
+        return isinstance(node.expr, sympy.Symbol)
+    return False
 
 
 def _struct_info_from_fake(val) -> relax.TensorStructInfo:

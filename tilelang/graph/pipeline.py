@@ -8,6 +8,7 @@ from tvm.target import Target
 
 from tilelang.schedule.gpu import default_schedule_rules
 from tilelang.graph.fuse_skip_reduction import FuseSkipReduction
+from tilelang.relax import FuseTIR
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ def run_pipeline(mod: tvm.IRModule, target: Target) -> tvm.IRModule:
             # relax.transform.FoldConstant(),
             relax.transform.FuseOps(),
             FuseSkipReduction(),
-            relax.transform.FuseTIR(),
+            FuseTIR(),
             relax.transform.DeadCodeElimination(),
             dl.ApplyDefaultSchedule(*rules),
             relax.transform.RewriteDataflowReshape(),
