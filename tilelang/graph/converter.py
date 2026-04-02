@@ -20,9 +20,6 @@ def extract_input_info(gm, example_inputs):
     Uses node.meta["val"] from placeholder nodes which preserves SymInt
     for dynamic dimensions. Falls back to example_inputs for shapes.
     """
-    from tvm import tir
-
-    shape_vars: dict[str, tir.Var] = {}
     input_info = []
 
     # Collect placeholder metadata from FX graph
@@ -40,11 +37,8 @@ def extract_input_info(gm, example_inputs):
     for tensor in sources:
         shape = []
         for s in tensor.shape:
-            if isinstance(s, torch.SymInt):
-                key = str(s)
-                if key not in shape_vars:
-                    shape_vars[key] = tir.Var(key, "int64")
-                shape.append(shape_vars[key])
+            if _is_truly_symbolic(s):
+                shape.append(_sym_var(str(s)))
             else:
                 shape.append(int(s))
         dtype_str = torch_dtype_to_tvm(tensor.dtype)
@@ -52,9 +46,39 @@ def extract_input_info(gm, example_inputs):
     return input_info
 
 
+def _sym_var(name: str) -> "tir.Var":
+    """Get or create a shared tir.Var for a SymInt dimension name."""
+    from tvm import tir
+    if not hasattr(_sym_var, "_cache"):
+        _sym_var._cache = {}
+    if name not in _sym_var._cache:
+        _sym_var._cache[name] = tir.Var(name, "int64")
+    return _sym_var._cache[name]
+
+
+def _is_truly_symbolic(s) -> bool:
+    """Check if a SymInt is truly symbolic (not a concrete value wrapped in SymInt)."""
+    if not isinstance(s, torch.SymInt):
+        return False
+    try:
+        int(s)
+        return False  # concrete — int() succeeds
+    except Exception:
+        return True   # truly symbolic — int() fails
+
+
 def _struct_info_from_fake(val) -> relax.TensorStructInfo:
-    """Build Relax TensorStructInfo from a FakeTensor."""
-    shape = [int(s) for s in val.shape]
+    """Build Relax TensorStructInfo from a FakeTensor.
+
+    Preserves truly symbolic SymInt dimensions as tir.Var for dynamic
+    shape support.  Concrete SymInts are resolved to plain ints.
+    """
+    shape = []
+    for s in val.shape:
+        if _is_truly_symbolic(s):
+            shape.append(_sym_var(str(s)))
+        else:
+            shape.append(int(s))
     dtype = torch_dtype_to_tvm(val.dtype)
     return relax.TensorStructInfo(shape, dtype)
 

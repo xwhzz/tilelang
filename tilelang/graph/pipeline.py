@@ -34,7 +34,9 @@ def run_pipeline(mod: tvm.IRModule, target: Target) -> tvm.IRModule:
         seq = tvm.transform.Sequential([
             relax.transform.LegalizeOps(),
             relax.transform.AnnotateTIROpPattern(),
-            relax.transform.FoldConstant(),
+            # FoldConstant is skipped — it uses emit_te which can't
+            # handle symbolic shapes from dynamic dim propagation.
+            # relax.transform.FoldConstant(),
             relax.transform.FuseOps(),
             FuseSkipReduction(),
             relax.transform.FuseTIR(),
