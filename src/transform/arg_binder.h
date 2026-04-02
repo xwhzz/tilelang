@@ -186,6 +186,25 @@ private:
   std::vector<Stmt> asserts_;
   /*! \brief internal analyzer. */
   arith::Analyzer analyzer_;
+
+  /*! \brief Deferred bindings for expressions whose symbolic vars
+   *  weren't yet bound when first encountered. */
+  struct DeferredBinding {
+    PrimExpr arg;
+    PrimExpr value;
+    std::string arg_name;
+    PrimExpr nullable_guard;
+  };
+  std::vector<DeferredBinding> deferred_bindings_;
+
+ public:
+  /*! \brief Retry all deferred bindings (call after all buffers are processed). */
+  void FlushDeferred() {
+    for (auto &db : deferred_bindings_) {
+      BindNullable(db.arg, db.value, db.arg_name, true, db.nullable_guard);
+    }
+    deferred_bindings_.clear();
+  }
 };
 } // namespace tl
 } // namespace tvm

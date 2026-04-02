@@ -163,11 +163,11 @@ bool ArgBinder::BindNullable(const PrimExpr &arg, const PrimExpr &value,
       }
       PrimExpr arg_simplified = analyzer_.Simplify(arg);
       PrimExpr value_simplified = analyzer_.Simplify(value);
-      // Re-check: variables may have been bound by earlier dimensions
-      // in the same buffer (two-pass effect).
+      // Re-check undefs after simplification — variables may have been
+      // bound by earlier dimensions in the same or other buffers.
       auto undefs_post = ffi::Array<Var>(getUndefVars({arg_simplified}));
       if (undefs_post.empty()) {
-        // All vars resolved — just assert equality
+        // All variables resolved — just assert equality.
         PrimExpr cond = (arg_simplified == value_simplified);
         BinderAddAssert(&analyzer_, cond, arg_name, &asserts_, nullable_guard);
         return true;
@@ -176,8 +176,10 @@ bool ArgBinder::BindNullable(const PrimExpr &arg, const PrimExpr &value,
                                         {arg_simplified == value_simplified});
       auto sol = arith::SolveLinearEquations(constraints);
       if (!sol->dst->variables.empty()) {
-        LOG(FATAL) << "TVM is unable to solve variables " << undefs_post
-                   << " from equation " << constraints;
+        // Store for deferred retry — the variable may be bound by a
+        // later dimension.
+        deferred_bindings_.push_back({arg, value, arg_name, nullable_guard});
+        return false;
       }
       for (const auto &v : undefs) {
         auto value_opt = sol->src_to_dst.Get(v);
@@ -1137,6 +1139,10 @@ void ArgBinder::BindDLTensors(
       def_handle_dtype_.Set(vptr, tir::TypeAnnotation(buffer->dtype));
     }
   }
+
+  // Retry deferred bindings now that all buffers' simple Var dims
+  // have been bound.
+  FlushDeferred();
 }
 
 } // namespace tl
