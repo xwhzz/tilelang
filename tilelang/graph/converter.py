@@ -420,8 +420,8 @@ def default_extern_dispatch(node: fx.Node, *, gemv_threshold: int = 1) -> bool:
     mnk = _get_matmul_mnk(node)
     if mnk is not None:
         M, N, K = mnk
-        # GEMV (small M) → TileLang; GEMM → cuBLAS
-        return M >= gemv_threshold
+        # GEMV (M <= gemv_threshold) → TileLang; GEMM → cuBLAS
+        return M > gemv_threshold
 
     return False
 

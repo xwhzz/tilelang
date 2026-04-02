@@ -513,7 +513,12 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
                 continue
             _, arg_template, raw_kwargs = call_info
 
-            if instr.arg_vars:
+            # DPS convention: last arg is the output buffer when
+            # it was emitted by call_dps_packed (the codegen sees the
+            # alloc → call → alias pattern).  Detect by checking if the
+            # number of arg_vars exceeds the template's tensor count.
+            n_template_tensors = sum(1 for tag, _ in arg_template if tag is True)
+            if instr.arg_vars and len(instr.arg_vars) > n_template_tensors:
                 input_vars = instr.arg_vars[:-1]
                 dps_var = instr.arg_vars[-1]
             else:
@@ -776,7 +781,12 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
             _, arg_template, raw_kwargs = call_info
             result_var = _sanitize_var(instr.var)
 
-            if instr.arg_vars:
+            # DPS convention: last arg is the output buffer when
+            # it was emitted by call_dps_packed (the codegen sees the
+            # alloc → call → alias pattern).  Detect by checking if the
+            # number of arg_vars exceeds the template's tensor count.
+            n_template_tensors = sum(1 for tag, _ in arg_template if tag is True)
+            if instr.arg_vars and len(instr.arg_vars) > n_template_tensors:
                 input_vars = instr.arg_vars[:-1]
                 dps_var = instr.arg_vars[-1]
             else:
@@ -1034,10 +1044,16 @@ def generate_wrapper(
     _const_device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
     gpu_constants = {k: v.to(device=_const_device) for k, v in constants.items()}
 
-    # Build fallback op_fn lookup: op_name → callable
+    # Build fallback op_fn lookup: op_name → callable.
+    # For call_method nodes, op_fn is a string (method name) — wrap it
+    # so the first positional arg is used as self.
     fb_fns = {}
     for op_name, (op_fn, _, _) in fallback_calls.items():
-        fb_fns[op_name] = op_fn
+        if isinstance(op_fn, str):
+            method_name = op_fn
+            fb_fns[op_name] = lambda *args, _m=method_name, **kw: getattr(args[0], _m)(*args[1:], **kw)
+        else:
+            fb_fns[op_name] = op_fn
 
     # Plan memory reuse
     alloc_to_slot, pool_specs = _plan_memory_reuse(instructions, output_vars)
