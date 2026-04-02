@@ -65,23 +65,30 @@ def _choose_tile_and_threads(
     partial tile automatically.
     """
     max_threads = min(int(utils.max_threads_per_block(target)), 1024)
-    tile_cap = max(max_threads, min(max_threads * 8, 8192))
 
     const_extent = _as_const_int(extent)
     if const_extent is None:
-        return tile_cap, max_threads
+        return max_threads * 8, max_threads
     if const_extent <= 0:
         return 1, 1
 
-    # Choose the largest power-of-2 thread count that does not exceed the
-    # extent, then round the tile up to a multiple of that thread count.
-    threads = _largest_pow2_at_most(min(const_extent, max_threads))
-    # Round extent up to the nearest multiple of threads.
-    tile = (const_extent + threads - 1) // threads * threads
-    tile = min(tile, tile_cap)
-    # Ensure tile is still a multiple of threads after capping.
-    tile = tile // threads * threads
-    return max(tile, threads), max(threads, 1)
+    # Choose thread count and tile to balance SM occupancy and per-thread
+    # work.  256 threads with ~16 elems/thread is empirically good for
+    # large memory-bound kernels on H100/A100.  For smaller extents,
+    # reduce to avoid too few blocks.
+    threads = min(256, _largest_pow2_at_most(const_extent))
+    threads = max(threads, 32)
+
+    # Target enough blocks for full GPU occupancy (~1k-2k on H100)
+    # but cap elements-per-thread at 16.
+    elems_per_thread = min(16, max((const_extent // threads + 1023) // 1024, 4))
+    tile = threads * elems_per_thread
+
+    # Final adjustment: ensure tile doesn't exceed extent
+    if tile > const_extent:
+        tile = (const_extent + threads - 1) // threads * threads
+
+    return max(tile, threads), threads
 
 
 def _tile_aligns_with_suffix(s_extents: list[int | None], tile: int) -> bool:
