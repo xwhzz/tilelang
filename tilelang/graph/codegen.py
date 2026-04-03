@@ -13,12 +13,36 @@ from tilelang.graph.utils import tvm_dtype_to_torch
 
 logger = logging.getLogger(__name__)
 
+_DTYPE_BYTES = {
+    "float16": 2, "bfloat16": 2, "float32": 4, "float64": 8,
+    "int8": 1, "int16": 2, "int32": 4, "int64": 8,
+    "uint8": 1, "bool": 1,
+}
+
+
+@dataclass
+class AllocStorageInstr:
+    """Allocate a raw storage buffer (from StaticPlanBlockMemory)."""
+    var: str
+    size: object  # total bytes: int (static) or tir.PrimExpr (dynamic)
+    dtype: str  # storage dtype (usually "uint8")
+
+
+@dataclass
+class AllocTensorInstr:
+    """Allocate a tensor view from a storage buffer."""
+    var: str
+    storage_var: str  # references an AllocStorageInstr var
+    offset: int  # byte offset into storage
+    shape: list  # list of int or tir.Var
+    dtype: torch.dtype
+
 
 @dataclass
 class AllocInstr:
-    """Allocate an output tensor."""
+    """Allocate an output tensor (legacy — for un-lowered alloc_tensor)."""
     var: str
-    shape: list  # list of int or str (referencing a var for dynamic shapes)
+    shape: list
     dtype: torch.dtype
 
 
@@ -27,6 +51,7 @@ class KernelCallInstr:
     """Call a compiled TileLang kernel."""
     kernel_name: str
     arg_vars: list[str]
+    flatten_args: bool = False  # True when kernel expects 1D (from transform_layout)
     sym_vars: list[str] = None  # symbolic var names to pass as extra int args
 
 
@@ -214,6 +239,45 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                 constants[var_name] = torch.from_numpy(nd_arr.numpy())
                 instructions.append(ConstantInstr(var=var_name))
 
+            elif (isinstance(value, relax.Call) and isinstance(value.op, ir.Op)
+                  and value.op.name == "relax.memory.alloc_storage"):
+                # R.memory.alloc_storage(ShapeExpr([size]), device_idx, scope, dtype)
+                size_shape = value.args[0]
+                if isinstance(size_shape, relax.ShapeExpr):
+                    sv = size_shape.values[0]
+                    size = int(sv) if isinstance(sv, tir.IntImm) else sv
+                else:
+                    size = 0
+                dtype_arg = value.args[3]
+                dtype_str = str(dtype_arg.value) if hasattr(dtype_arg, "value") else "uint8"
+                instructions.append(AllocStorageInstr(
+                    var=var_name, size=size, dtype=dtype_str))
+
+            elif (isinstance(value, relax.Call) and isinstance(value.op, ir.Op)
+                  and value.op.name == "relax.memory.alloc_tensor"):
+                # R.memory.alloc_tensor(storage, offset, shape, dtype)
+                storage_var = _unique_name(value.args[0])
+                offset_arg = value.args[1]
+                offset = int(offset_arg.value) if hasattr(offset_arg, "value") else 0
+                shape_expr = value.args[2]
+                shape = _get_shape_values(shape_expr)
+                dtype_arg = value.args[3]
+                dtype_str = str(dtype_arg.value) if hasattr(dtype_arg, "value") else "float16"
+                instructions.append(AllocTensorInstr(
+                    var=var_name, storage_var=storage_var,
+                    offset=offset, shape=shape,
+                    dtype=tvm_dtype_to_torch(dtype_str)))
+
+            elif (isinstance(value, relax.Call) and isinstance(value.op, ir.Op)
+                  and value.op.name in ("relax.null_value",)):
+                # VM infrastructure — skip at runtime
+                pass
+
+            elif (isinstance(value, relax.Call) and isinstance(value.op, relax.ExternFunc)
+                  and str(value.op.global_symbol).startswith("vm.builtin.")):
+                # VM validation ops (check_tensor_info, match_shape) — skip
+                pass
+
             elif _is_alloc_tensor_op(value):
                 shape_expr = value.args[0]
                 dtype_imm = value.args[1]
@@ -256,9 +320,15 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                     for p in tir_func.params:
                         if p not in tir_func.buffer_map and isinstance(p, tir.Var):
                             sym_vars.append(p.name)
+                # Detect if kernel expects 1D (flattened) buffers
+                flatten = False
+                if isinstance(tir_func, tir.PrimFunc):
+                    flatten = all(len(b.shape) <= 1
+                                 for b in tir_func.buffer_map.values())
                 instructions.append(KernelCallInstr(
                     kernel_name=kernel_name, arg_vars=arg_vars,
-                    sym_vars=sym_vars if sym_vars else None))
+                    sym_vars=sym_vars if sym_vars else None,
+                    flatten_args=flatten))
 
             elif _is_call_to_global_var(value):
                 kernel_name = value.op.name_hint
@@ -274,14 +344,18 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
                         arg_vars.append(_unique_name(arg))
                     else:
                         arg_vars.append(arg)
-                # Check for symbolic params in the TIR function
+                # Check for symbolic params and flattened buffers
+                flatten = False
                 if isinstance(tir_func, tir.PrimFunc):
                     for p in tir_func.params:
                         if p not in tir_func.buffer_map and isinstance(p, tir.Var):
                             sym_vars.append(p.name)
+                    flatten = all(len(b.shape) <= 1
+                                 for b in tir_func.buffer_map.values())
                 instructions.append(KernelCallInstr(
                     kernel_name=kernel_name, arg_vars=arg_vars,
-                    sym_vars=sym_vars if sym_vars else None))
+                    sym_vars=sym_vars if sym_vars else None,
+                    flatten_args=flatten))
 
             elif isinstance(value, relax.Tuple):
                 element_vars = [_resolve_expr_name(f) for f in value.fields]
@@ -354,9 +428,8 @@ def _compile_instructions(mod: tvm.IRModule) -> tuple[list, list[str], list[str]
     return instructions, param_names, output_vars, constants
 
 
-def _eliminate_dead_instructions(instructions, output_vars):
-    """Remove instructions whose outputs are never referenced."""
-    # Collect all var references across all instructions
+def _collect_refs(instructions, output_vars):
+    """Collect all var names referenced by instructions."""
     referenced = set(output_vars)
     for instr in instructions:
         if isinstance(instr, KernelCallInstr):
@@ -371,6 +444,14 @@ def _eliminate_dead_instructions(instructions, output_vars):
             referenced.update(instr.element_vars)
         elif isinstance(instr, TupleGetItemInstr):
             referenced.add(instr.tuple_var)
+        elif isinstance(instr, AllocTensorInstr):
+            referenced.add(instr.storage_var)
+    return referenced
+
+
+def _eliminate_dead_instructions(instructions, output_vars):
+    """Remove instructions whose outputs are never referenced."""
+    referenced = _collect_refs(instructions, output_vars)
 
     # Remove fallback instructions that produce unused outputs AND whose
     # DPS output arg is also unused. Kernel calls are never eliminated
@@ -379,7 +460,6 @@ def _eliminate_dead_instructions(instructions, output_vars):
     for instr in instructions:
         if isinstance(instr, TorchFallbackInstr):
             var = instr.var
-            # Check if the result var AND all output args are unreferenced
             all_args_dead = (var not in referenced and
                              all(a not in referenced
                                  for a in instr.arg_vars if isinstance(a, str)))
@@ -387,26 +467,13 @@ def _eliminate_dead_instructions(instructions, output_vars):
                 continue
         live.append(instr)
 
-    # Second pass: remove allocs whose var is no longer referenced
-    referenced2 = set(output_vars)
-    for instr in live:
-        if isinstance(instr, KernelCallInstr):
-            referenced2.update(a for a in instr.arg_vars if isinstance(a, str))
-        elif isinstance(instr, TorchFallbackInstr):
-            referenced2.update(a for a in instr.arg_vars if isinstance(a, str))
-        elif isinstance(instr, ReshapeInstr):
-            referenced2.add(instr.input_var)
-        elif isinstance(instr, AliasInstr):
-            referenced2.add(instr.source_var)
-        elif isinstance(instr, TupleInstr):
-            referenced2.update(instr.element_vars)
-        elif isinstance(instr, TupleGetItemInstr):
-            referenced2.add(instr.tuple_var)
+    # Second pass: remove allocs/storages whose var is no longer referenced
+    referenced2 = _collect_refs(live, output_vars)
 
     result = []
     for instr in live:
         var = getattr(instr, "var", None)
-        if isinstance(instr, AllocInstr) and var not in referenced2:
+        if isinstance(instr, (AllocInstr, AllocStorageInstr)) and var not in referenced2:
             continue
         result.append(instr)
 
@@ -604,7 +671,9 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
     lines.append("def _compiled_wrapper(_tensor_inputs, _device, _C, _K, _F, _pool):")
 
     for i, pname in enumerate(param_names):
-        lines.append(f"    {_sanitize_var(pname)} = _tensor_inputs[{i}]")
+        v = _sanitize_var(pname)
+        lines.append(f"    {v} = _tensor_inputs[{i}]")
+        lines.append(f"    if {v}.device != _device: {v} = {v}.to(_device)")
 
     for cname in constants:
         lines.append(f"    {_sanitize_var(cname)} = _C[{cname!r}]")
@@ -613,12 +682,33 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
         if isinstance(instr, ConstantInstr):
             pass
 
+        elif isinstance(instr, AllocStorageInstr):
+            v = _sanitize_var(instr.var)
+            if isinstance(instr.size, int):
+                size_str = str(instr.size)
+            else:
+                size_str = _tir_expr_to_python(instr.size, sym_var_map)
+            lines.append(f"    {v} = _torch.empty({size_str}, dtype=_torch.uint8, device=_device)")
+
+        elif isinstance(instr, AllocTensorInstr):
+            v = _sanitize_var(instr.var)
+            sv = _sanitize_var(instr.storage_var)
+            dtype_str = str(instr.dtype).replace("torch.", "")
+            shape_str = _shape_code(instr.shape, sym_var_map, "[")
+            elem_size = _DTYPE_BYTES.get(dtype_str, 2)
+            numel_str = " * ".join(
+                str(s) if isinstance(s, int) else _tir_expr_to_python(s, sym_var_map)
+                for s in instr.shape)
+            # Slice bytes from storage, reinterpret as target dtype, reshape
+            lines.append(
+                f"    {v} = {sv}[{instr.offset}:{instr.offset}+{elem_size}*({numel_str})]"
+                f".view(_torch.{dtype_str}).reshape({shape_str})")
+
         elif isinstance(instr, AllocInstr):
             if instr.var in alloc_to_slot:
                 slot = alloc_to_slot[instr.var]
                 lines.append(f"    {_sanitize_var(instr.var)} = _pool[{slot}]")
             else:
-                # Dynamic shape — allocate at runtime
                 shape_str = _shape_code(instr.shape, sym_var_map, "[")
                 dtype_str = str(instr.dtype).replace("torch.", "")
                 lines.append(
@@ -626,11 +716,16 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
                     f"{shape_str}, dtype=_torch.{dtype_str}, device=_device)")
 
         elif isinstance(instr, KernelCallInstr):
-            tensor_args = ", ".join(
-                f"{_sanitize_var(a)}.contiguous() if not {_sanitize_var(a)}.is_contiguous() else {_sanitize_var(a)}"
-                if isinstance(a, str) else repr(a)
-                for a in instr.arg_vars
-            )
+            if instr.flatten_args:
+                tensor_args = ", ".join(
+                    f"{_sanitize_var(a)}.contiguous().view(-1)"
+                    if isinstance(a, str) else repr(a)
+                    for a in instr.arg_vars)
+            else:
+                tensor_args = ", ".join(
+                    f"{_sanitize_var(a)}.contiguous() if not {_sanitize_var(a)}.is_contiguous() else {_sanitize_var(a)}"
+                    if isinstance(a, str) else repr(a)
+                    for a in instr.arg_vars)
             if instr.sym_vars:
                 # Append symbolic variable values (resolved from input shapes)
                 sym_parts = []
@@ -756,6 +851,86 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
     return "\n".join(lines)
 
 
+_c_expr_counter = [0]
+
+
+def _tir_expr_to_c_long(expr, sym_var_map, lines, dest):
+    """Emit C code computing a TIR PrimExpr into ``dest`` (a C ``long`` variable).
+
+    Handles the same expression set as ``_tir_expr_to_python``.
+    Uses unique temp names to avoid shadowing in nested expressions.
+    """
+    a = lines.append
+    if isinstance(expr, tir.IntImm):
+        a(f"    {dest} = {int(expr)}L;")
+    elif isinstance(expr, tir.Var):
+        if expr.name in sym_var_map:
+            pidx, didx = sym_var_map[expr.name]
+            a(f"    {{ PyObject* _d = PyObject_CallMethod("
+              f"PyList_GET_ITEM(inputs, {pidx}), \"size\", \"i\", {didx});")
+            a(f"    {dest} = PyLong_AsLong(_d); Py_DECREF(_d); }}")
+        else:
+            a(f"    {dest} = 0; /* unresolved var {expr.name} */")
+    elif isinstance(expr, tir.Cast):
+        _tir_expr_to_c_long(expr.value, sym_var_map, lines, dest)
+    elif isinstance(expr, (tir.Add, tir.Sub, tir.Mul, tir.Div,
+                           tir.FloorDiv, tir.FloorMod,
+                           tir.Max, tir.Min)):
+        uid = _c_expr_counter[0]; _c_expr_counter[0] += 1
+        lv, rv = f"_el{uid}", f"_er{uid}"
+        a(f"    long {lv}, {rv};")
+        _tir_expr_to_c_long(expr.a, sym_var_map, lines, lv)
+        _tir_expr_to_c_long(expr.b, sym_var_map, lines, rv)
+        op_map = {tir.Add: "+", tir.Sub: "-", tir.Mul: "*", tir.Div: "/",
+                  tir.FloorDiv: "/", tir.FloorMod: "%"}
+        op_str = op_map.get(type(expr))
+        if op_str:
+            a(f"    {dest} = {lv} {op_str} {rv};")
+        elif isinstance(expr, tir.Max):
+            a(f"    {dest} = ({lv} > {rv}) ? {lv} : {rv};")
+        else:
+            a(f"    {dest} = ({lv} < {rv}) ? {lv} : {rv};")
+    elif isinstance(expr, tir.Select):
+        uid = _c_expr_counter[0]; _c_expr_counter[0] += 1
+        cv, tv, fv = f"_ec{uid}", f"_et{uid}", f"_ef{uid}"
+        a(f"    long {cv}, {tv}, {fv};")
+        _tir_expr_to_c_long(expr.condition, sym_var_map, lines, cv)
+        _tir_expr_to_c_long(expr.true_value, sym_var_map, lines, tv)
+        _tir_expr_to_c_long(expr.false_value, sym_var_map, lines, fv)
+        a(f"    {dest} = {cv} ? {tv} : {fv};")
+    elif isinstance(expr, (tir.LT, tir.LE, tir.GT, tir.GE, tir.EQ, tir.NE)):
+        uid = _c_expr_counter[0]; _c_expr_counter[0] += 1
+        lv, rv = f"_el{uid}", f"_er{uid}"
+        a(f"    long {lv}, {rv};")
+        _tir_expr_to_c_long(expr.a, sym_var_map, lines, lv)
+        _tir_expr_to_c_long(expr.b, sym_var_map, lines, rv)
+        cmp_map = {tir.LT: "<", tir.LE: "<=", tir.GT: ">",
+                   tir.GE: ">=", tir.EQ: "==", tir.NE: "!="}
+        a(f"    {dest} = ({lv} {cmp_map[type(expr)]} {rv});")
+    else:
+        try:
+            a(f"    {dest} = {int(expr)}L;")
+        except (TypeError, ValueError):
+            a(f"    {dest} = 0; /* unsupported: {type(expr).__name__} */")
+
+
+def _emit_c_shape_dims(shape, sym_var_map, lines, prefix):
+    """Emit C code producing a list of PyObject* dims for a shape.
+
+    Returns a list of C variable names (PyObject* PyLong values).
+    The caller must Py_DECREF each when done.
+    """
+    a = lines.append
+    dim_vars = []
+    for di, s in enumerate(shape):
+        dv = f"{prefix}_{di}"
+        a(f"    long {dv}_v;")
+        _tir_expr_to_c_long(s, sym_var_map, lines, f"{dv}_v")
+        a(f"    PyObject* {dv} = PyLong_FromLong({dv}_v);")
+        dim_vars.append(dv)
+    return dim_vars
+
+
 def _emit_c_source(instructions, param_names, output_vars, constants,
                    fallback_calls, sym_var_map, alloc_to_slot, pool_specs):
     """Generate C extension source for the wrapper (Python C API)."""
@@ -801,10 +976,14 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
     a("static PyObject* _device = NULL;")
     a("")
 
-    # Collect dtype strings needed for dynamic allocs and fallback kwargs
+    # Collect dtype strings needed for allocs and fallback kwargs
     dynamic_dtypes = set()
     for instr in instructions:
-        if isinstance(instr, AllocInstr) and instr.var not in alloc_to_slot:
+        if isinstance(instr, AllocStorageInstr):
+            dynamic_dtypes.add("uint8")
+        elif isinstance(instr, AllocTensorInstr):
+            dynamic_dtypes.add(str(instr.dtype).replace("torch.", ""))
+        elif isinstance(instr, AllocInstr) and instr.var not in alloc_to_slot:
             dynamic_dtypes.add(str(instr.dtype).replace("torch.", ""))
     for instr in instructions:
         if isinstance(instr, TorchFallbackInstr):
@@ -864,9 +1043,15 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
     a("    PyObject* _tmp_kwargs = NULL;")
     a("")
 
-    # Unpack inputs
+    # Unpack inputs — move CPU tensors to target device
     for i, pname in enumerate(param_names):
-        a(f"    {_sanitize_var(pname)} = PyList_GET_ITEM(inputs, {i});")
+        v = _sanitize_var(pname)
+        a(f"    {v} = PyList_GET_ITEM(inputs, {i});")
+        a(f"    {{ PyObject* _dev = PyObject_GetAttrString({v}, \"device\");")
+        a(f"    PyObject* _dt = PyObject_GetAttrString(_dev, \"type\");")
+        a(f"    int _is_cuda = PyUnicode_CompareWithASCIIString(_dt, \"cuda\") == 0;")
+        a(f"    Py_DECREF(_dt); Py_DECREF(_dev);")
+        a(f"    if (!_is_cuda) {{ {v} = PyObject_CallMethod({v}, \"to\", \"O\", _device); CHK({v}); }} }}")
 
     # Bind constants
     for i, cname in enumerate(const_names):
@@ -874,9 +1059,83 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
     a("")
 
     # Emit instructions
+    _instr_id = 0
     for instr in instructions:
+        _instr_id += 1
         if isinstance(instr, ConstantInstr):
             pass
+
+        elif isinstance(instr, AllocStorageInstr):
+            v = _sanitize_var(instr.var)
+            if isinstance(instr.size, int):
+                a(f"    /* alloc_storage: {instr.size} bytes */")
+                a(f"    {{ PyObject* _sz = PyLong_FromLong({instr.size}L);")
+            else:
+                # Dynamic size — compute from symbolic dims
+                a(f"    /* alloc_storage: dynamic */")
+                a(f"    {{ long _sz_val;")
+                _tir_expr_to_c_long(instr.size, sym_var_map, lines, "_sz_val")
+                a(f"    PyObject* _sz = PyLong_FromLong(_sz_val);")
+            a(f"    _tmp_args = PyTuple_Pack(1, _sz); Py_DECREF(_sz);")
+            a(f"    _tmp_kwargs = PyDict_New();")
+            a(f'    PyDict_SetItemString(_tmp_kwargs, "dtype", _dtype_uint8);')
+            a(f'    PyDict_SetItemString(_tmp_kwargs, "device", _device);')
+            a(f"    {v} = PyObject_Call(_torch_empty, _tmp_args, _tmp_kwargs);")
+            a(f"    Py_DECREF(_tmp_args); Py_DECREF(_tmp_kwargs); CHK({v}); }}")
+
+        elif isinstance(instr, AllocTensorInstr):
+            v = _sanitize_var(instr.var)
+            sv = _sanitize_var(instr.storage_var)
+            dtype_str = str(instr.dtype).replace("torch.", "")
+            elem_size = _DTYPE_BYTES.get(dtype_str, 2)
+            # Compute numel for byte-slice end
+            if all(isinstance(s, int) for s in instr.shape):
+                numel = 1
+                for s in instr.shape:
+                    numel *= s
+                end = instr.offset + elem_size * numel
+                # storage[offset:end].view(dtype).reshape(shape)
+                a(f"    /* alloc_tensor from {sv}[{instr.offset}:{end}] -> {dtype_str} {instr.shape} */")
+                a(f"    {{ PyObject* _sl = PySlice_New(PyLong_FromLong({instr.offset}L),"
+                  f" PyLong_FromLong({end}L), Py_None);")
+                a(f"    PyObject* _sliced = PyObject_GetItem({sv}, _sl); Py_DECREF(_sl); CHK(_sliced);")
+                a(f'    PyObject* _viewed = PyObject_CallMethod(_sliced, "view", "O", _dtype_{dtype_str});')
+                a(f"    Py_DECREF(_sliced); CHK(_viewed);")
+                # Build shape tuple
+                n_dims = len(instr.shape)
+                dim_strs = ", ".join(f"PyLong_FromLong({s}L)" for s in instr.shape)
+                a(f"    PyObject* _shape = PyTuple_Pack({n_dims}, {dim_strs});")
+                a(f'    {v} = PyObject_CallMethod(_viewed, "reshape", "O", _shape);')
+                a(f"    Py_DECREF(_viewed); Py_DECREF(_shape); CHK({v}); }}")
+            else:
+                # Dynamic shapes — compute numel and dims at runtime
+                a(f"    /* alloc_tensor (dynamic) from {sv} -> {dtype_str} */")
+                a(f"    {{ long _numel = 1;")
+                for s in instr.shape:
+                    a(f"    {{ long _dv;")
+                    _tir_expr_to_c_long(s, sym_var_map, lines, "_dv")
+                    a(f"    _numel *= _dv; }}")
+                a(f"    PyObject* _start = PyLong_FromLong({instr.offset}L);")
+                a(f"    PyObject* _end = PyLong_FromLong({instr.offset}L + {elem_size}L * _numel);")
+                a(f"    PyObject* _sl = PySlice_New(_start, _end, Py_None);")
+                a(f"    Py_DECREF(_start); Py_DECREF(_end);")
+                a(f"    PyObject* _sliced = PyObject_GetItem({sv}, _sl); Py_DECREF(_sl); CHK(_sliced);")
+                a(f'    PyObject* _viewed = PyObject_CallMethod(_sliced, "view", "O", _dtype_{dtype_str});')
+                a(f"    Py_DECREF(_sliced); CHK(_viewed);")
+                # Build shape tuple with runtime dims
+                dim_vars_c = []
+                for di, s in enumerate(instr.shape):
+                    dv = f"_adim_{v}_{di}"
+                    a(f"    long {dv}_v;")
+                    _tir_expr_to_c_long(s, sym_var_map, lines, f"{dv}_v")
+                    a(f"    PyObject* {dv} = PyLong_FromLong({dv}_v);")
+                    dim_vars_c.append(dv)
+                n_dims = len(dim_vars_c)
+                a(f"    PyObject* _shape = PyTuple_Pack({n_dims}, {', '.join(dim_vars_c)});")
+                for dv in dim_vars_c:
+                    a(f"    Py_DECREF({dv});")
+                a(f'    {v} = PyObject_CallMethod(_viewed, "reshape", "O", _shape);')
+                a(f"    Py_DECREF(_viewed); Py_DECREF(_shape); CHK({v}); }}")
 
         elif isinstance(instr, AllocInstr):
             v = _sanitize_var(instr.var)
@@ -886,19 +1145,7 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
             else:
                 # Dynamic or output alloc — call torch.empty at runtime
                 dtype_str = str(instr.dtype).replace("torch.", "")
-                # Build shape dims with unique temp vars to avoid overwrite
-                dim_vars = []
-                for di, s in enumerate(instr.shape):
-                    dv = f"_dim{di}"
-                    if isinstance(s, int):
-                        a(f"    PyObject* {dv} = PyLong_FromLong({s}L);")
-                    elif isinstance(s, tir.Var):
-                        pidx, didx = sym_var_map[s.name]
-                        a(f"    PyObject* {dv} = PyObject_CallMethod("
-                          f"PyList_GET_ITEM(inputs, {pidx}), \"size\", \"i\", {didx});")
-                    else:
-                        a(f"    PyObject* {dv} = PyLong_FromLong({int(s)}L);")
-                    dim_vars.append(dv)
+                dim_vars = _emit_c_shape_dims(instr.shape, sym_var_map, lines, "_dim")
                 n_dims = len(dim_vars)
                 a(f"    _tmp_args = PyTuple_Pack({n_dims}, {', '.join(dim_vars)});")
                 for dv in dim_vars:
@@ -912,16 +1159,22 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
 
         elif isinstance(instr, KernelCallInstr):
             idx = kernel_idx[instr.kernel_name]
-            # Ensure contiguity for each tensor arg before calling kernel
+            # Ensure contiguity (+ flatten to 1D if kernel expects it)
             contig_vars = []
             for ai_k, arg_v in enumerate(instr.arg_vars):
                 sv = _sanitize_var(arg_v) if isinstance(arg_v, str) else "Py_None"
                 if isinstance(arg_v, str):
-                    cv = f"_carg_{idx}_{ai_k}"
-                    a(f"    PyObject* {cv} = {sv};")
-                    a(f"    {{PyObject* _ic = PyObject_CallMethod({sv}, \"is_contiguous\", NULL);")
-                    a(f"     if (_ic && _ic == Py_False) {{ Py_DECREF(_ic); {cv} = PyObject_CallMethod({sv}, \"contiguous\", NULL); CHK({cv}); }}")
-                    a(f"     else {{ Py_XDECREF(_ic); }}}}")
+                    cv = f"_carg_{_instr_id}_{ai_k}"
+                    if instr.flatten_args:
+                        a(f"    PyObject* {cv};")
+                        a(f"    {{ PyObject* _ct = PyObject_CallMethod({sv}, \"contiguous\", NULL); CHK(_ct);")
+                        a(f"    {cv} = PyObject_CallMethod(_ct, \"view\", \"l\", (long)-1);")
+                        a(f"    Py_DECREF(_ct); CHK({cv}); }}")
+                    else:
+                        a(f"    PyObject* {cv} = {sv};")
+                        a(f"    {{PyObject* _ic = PyObject_CallMethod({sv}, \"is_contiguous\", NULL);")
+                        a(f"     if (_ic && _ic == Py_False) {{ Py_DECREF(_ic); {cv} = PyObject_CallMethod({sv}, \"contiguous\", NULL); CHK({cv}); }}")
+                        a(f"     else {{ Py_XDECREF(_ic); }}}}")
                     contig_vars.append(cv)
                 else:
                     contig_vars.append(sv)
@@ -934,7 +1187,7 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
             for ai_k, arg_v in enumerate(instr.arg_vars):
                 if isinstance(arg_v, str):
                     sv = _sanitize_var(arg_v)
-                    cv = f"_carg_{idx}_{ai_k}"
+                    cv = f"_carg_{_instr_id}_{ai_k}"
                     a(f"    if ({cv} != {sv}) Py_DECREF({cv});")
             a(f"    CHK(_tmp); Py_DECREF(_tmp);")
 
@@ -1066,18 +1319,7 @@ def _emit_c_source(instructions, param_names, output_vars, constants,
         elif isinstance(instr, ReshapeInstr):
             v = _sanitize_var(instr.var)
             src = _sanitize_var(instr.input_var)
-            dim_vars = []
-            for di, s in enumerate(instr.shape):
-                dv = f"_rdim_{v}_{di}"
-                if isinstance(s, int):
-                    a(f"    PyObject* {dv} = PyLong_FromLong({s}L);")
-                elif isinstance(s, tir.Var):
-                    pidx, didx = sym_var_map[s.name]
-                    a(f"    PyObject* {dv} = PyObject_CallMethod("
-                      f"PyList_GET_ITEM(inputs, {pidx}), \"size\", \"i\", {didx});")
-                else:
-                    a(f"    PyObject* {dv} = PyLong_FromLong({int(s)}L);")
-                dim_vars.append(dv)
+            dim_vars = _emit_c_shape_dims(instr.shape, sym_var_map, lines, f"_rdim_{v}")
             n_dims = len(dim_vars)
             a(f"    _tmp = PyTuple_Pack({n_dims}, {', '.join(dim_vars)});")
             for dv in dim_vars:
@@ -1223,17 +1465,28 @@ def generate_wrapper(
         else:
             fb_fns[op_name] = op_fn
 
-    # Plan memory reuse
-    alloc_to_slot, pool_specs = _plan_memory_reuse(instructions, output_vars)
+    # Memory planning: if StaticPlanBlockMemory produced AllocStorageInstr,
+    # the IR already handles memory reuse — no need for _plan_memory_reuse.
+    # Fall back to our own pool for legacy AllocInstr.
+    has_storage_instrs = any(isinstance(i, AllocStorageInstr) for i in instructions)
+    if has_storage_instrs:
+        alloc_to_slot = {}
+        pool_specs = []
+    else:
+        alloc_to_slot, pool_specs = _plan_memory_reuse(instructions, output_vars)
 
     pool = [
         torch.empty(shape, dtype=dtype, device=_const_device)
         for shape, dtype in pool_specs
     ]
     n_allocs = sum(1 for i in instructions if isinstance(i, AllocInstr))
-    logger.debug("Memory pool: %d slots for %d allocations (%.0f%% reuse)",
-                 len(pool), n_allocs,
-                 (1 - len(pool) / max(n_allocs, 1)) * 100)
+    n_storages = sum(1 for i in instructions if isinstance(i, AllocStorageInstr))
+    if has_storage_instrs:
+        logger.debug("Memory managed by StaticPlanBlockMemory: %d storages", n_storages)
+    elif n_allocs:
+        logger.debug("Memory pool: %d slots for %d allocations (%.0f%% reuse)",
+                     len(pool), n_allocs,
+                     (1 - len(pool) / max(n_allocs, 1)) * 100)
 
     use_c = not os.environ.get("TILELANG_USE_PYTHON_WRAPPER")
     c_module = None

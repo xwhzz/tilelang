@@ -15,10 +15,10 @@ from tilelang.carver.matmul_analysis import auto_inline_producers, normalize_to_
 from .. import Schedule as TileSchedule
 from . import utils
 from .base import GPUScheduleRule
-from .element_wise import _resolve_target_from_config
 
-tir = tvm.tir
-Target = tvm.target.Target
+from tvm import tir
+from tvm.target import Target
+
 
 
 @dataclass(frozen=True)
@@ -562,10 +562,3 @@ class Matmul(GPUScheduleRule):
         except Exception:  # pylint: disable=broad-except
             return None
 
-    def apply_config(
-        self,
-        func: tir.PrimFunc,
-        config,
-    ) -> None | tir.Schedule | list[tir.Schedule]:
-        target = _resolve_target_from_config(config)
-        return self.apply(func, target, False)

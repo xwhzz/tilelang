@@ -42,6 +42,8 @@ def compile_tir_functions(
     if not funcs:
         return {}
 
+    logger.info("Compiling %d TIR functions: %s", len(funcs), names)
+
     from tilelang.jit import par_compile
     jit_kernels = par_compile(funcs, target=target)
 

@@ -16,16 +16,11 @@ from tilelang import tvm
 from .. import Schedule as TileSchedule
 from . import utils
 from .base import GPUScheduleRule
-from .element_wise import _resolve_target_from_config
 
-tir = tvm.tir
-Target = tvm.target.Target
-normalize_prim_func = tvm.dlight.normalize_prim_func
-try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
-BlockInfo = tvm.dlight.analysis.BlockInfo
-is_gemv = tvm.dlight.analysis.is_gemv
-normalize = tvm.dlight.analysis.normalize
-
+from tvm import tir
+from tvm.target import Target
+from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
+from tvm.dlight.analysis import BlockInfo, is_gemv, normalize
 
 def _as_const_int(expr: tir.PrimExpr) -> int | None:
     if isinstance(expr, tir.IntImm):
@@ -321,7 +316,3 @@ class GEMV(GPUScheduleRule):
             vector_buffer,
             output_buffer,
         )
-
-    def apply_config(self, func: tir.PrimFunc, config) -> None | tir.Schedule | list[tir.Schedule]:
-        target = _resolve_target_from_config(config)
-        return self.apply(func, target, False)

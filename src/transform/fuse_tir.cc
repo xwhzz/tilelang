@@ -1294,10 +1294,12 @@ class TIRFuseMutator : public ExprMutator {
   std::unordered_map<GlobalVar, Replacement> replacements_;
 };
 
-IRModule FuseTIR(IRModule mod) {
+namespace {
+IRModule FuseTIR_impl(IRModule mod) {
   mod = TIRFuseMutator::Transform(mod);
   return mod;
 }
+}  // namespace
 
 // using namespace tir::transform;
 
@@ -1305,7 +1307,7 @@ namespace transform {
 
 Pass FuseTIR() {
   auto pass_func =  //
-      [=](IRModule m, PassContext pc) { return relax::FuseTIR(m); };
+      [=](IRModule m, PassContext pc) { return FuseTIR_impl(m); };
   auto inner_pass = CreateModulePass(/*pass_function=*/pass_func,   //
                                      /*opt_level=*/0,               //
                                      /*pass_name=*/"FuseTIRInner",  //

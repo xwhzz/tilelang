@@ -47,6 +47,14 @@ def run_pipeline(mod: tvm.IRModule, target: Target) -> tvm.IRModule:
             relax.transform.ToNonDataflow(),
             relax.transform.RemovePurityChecking(),
             relax.transform.CallTIRRewrite(),
+            # Memory planning: StaticPlanBlockMemory analyzes lifetimes and
+            # shares storage across non-overlapping allocs.  LowerAllocTensor
+            # converts R.builtin.alloc_tensor → R.memory.alloc_storage +
+            # R.memory.alloc_tensor with concrete byte offsets.
+            # ComputePrimValue / VMShapeLower are VM-specific and NOT used
+            # here — our codegen resolves symbolic shapes from input tensors.
+            relax.transform.StaticPlanBlockMemory(),
+            relax.transform.LowerAllocTensor(),
         ])
         mod = seq(mod)
 

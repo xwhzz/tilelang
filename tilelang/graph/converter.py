@@ -4,6 +4,7 @@ import logging
 
 import torch
 from torch import fx
+from torch.fx.experimental.symbolic_shapes import is_symbolic
 
 from tilelang import tvm as tvm
 from tvm import relax, tir
@@ -14,15 +15,44 @@ from tilelang.graph.utils import torch_dtype_to_tvm
 logger = logging.getLogger(__name__)
 
 
-def extract_input_info(gm, example_inputs):
+class SymbolicShapeEnv:
+    """Maps SymInt dimension names to shared ``tir.Var`` instances.
+
+    One instance per ``TileLangFXImporter`` — avoids process-global state.
+    """
+
+    def __init__(self):
+        self._cache: dict[str, tir.Var] = {}
+
+    def resolve(self, s) -> "int | tir.Var":
+        """Convert a shape dimension to int (static) or tir.Var (symbolic)."""
+        if is_symbolic(s):
+            name = str(s)
+            if name not in self._cache:
+                self._cache[name] = tir.Var(name, "int64")
+            return self._cache[name]
+        return int(s)
+
+    def resolve_shape(self, shape) -> list:
+        """Convert each dimension of a shape."""
+        return [self.resolve(s) for s in shape]
+
+    def struct_info_from_fake(self, val) -> relax.TensorStructInfo:
+        """Build Relax TensorStructInfo from a FakeTensor."""
+        shape = self.resolve_shape(val.shape)
+        dtype = torch_dtype_to_tvm(val.dtype)
+        return relax.TensorStructInfo(shape, dtype)
+
+
+def extract_input_info(gm, example_inputs, sym_env=None):
     """Extract (shape, dtype_str) pairs using FX graph metadata.
 
     Uses node.meta["val"] from placeholder nodes which preserves SymInt
     for dynamic dimensions. Falls back to example_inputs for shapes.
     """
-    input_info = []
+    if sym_env is None:
+        sym_env = SymbolicShapeEnv()
 
-    # Collect placeholder metadata from FX graph
     placeholders = []
     for node in gm.graph.nodes:
         if node.op == "placeholder":
@@ -30,62 +60,15 @@ def extract_input_info(gm, example_inputs):
             if val is not None and isinstance(val, torch.Tensor):
                 placeholders.append(val)
 
-    # Use FX metadata (has SymInt) if available, else example_inputs
     sources = placeholders if placeholders else [
         inp for inp in example_inputs if isinstance(inp, torch.Tensor)]
 
+    input_info = []
     for tensor in sources:
-        shape = []
-        for s in tensor.shape:
-            if _is_truly_symbolic(s):
-                shape.append(_sym_var(str(s)))
-            else:
-                shape.append(int(s))
+        shape = tuple(sym_env.resolve_shape(tensor.shape))
         dtype_str = torch_dtype_to_tvm(tensor.dtype)
-        input_info.append((tuple(shape), dtype_str))
+        input_info.append((shape, dtype_str))
     return input_info
-
-
-def _sym_var(name: str) -> "tir.Var":
-    """Get or create a shared tir.Var for a SymInt dimension name."""
-    from tvm import tir
-    if not hasattr(_sym_var, "_cache"):
-        _sym_var._cache = {}
-    if name not in _sym_var._cache:
-        _sym_var._cache[name] = tir.Var(name, "int64")
-    return _sym_var._cache[name]
-
-
-def _is_truly_symbolic(s) -> bool:
-    """Check if a SymInt represents a symbolic (not concrete) dimension.
-
-    Dynamo may concretize the SymInt's value by the time the backend
-    runs, so we check the underlying SymNode.expr — if it's a sympy
-    Symbol (not a plain integer), the dimension is dynamic.
-    """
-    if not isinstance(s, torch.SymInt):
-        return False
-    node = s.node
-    if hasattr(node, "expr"):
-        import sympy
-        return isinstance(node.expr, sympy.Symbol)
-    return False
-
-
-def _struct_info_from_fake(val) -> relax.TensorStructInfo:
-    """Build Relax TensorStructInfo from a FakeTensor.
-
-    Preserves truly symbolic SymInt dimensions as tir.Var for dynamic
-    shape support.  Concrete SymInts are resolved to plain ints.
-    """
-    shape = []
-    for s in val.shape:
-        if _is_truly_symbolic(s):
-            shape.append(_sym_var(str(s)))
-        else:
-            shape.append(int(s))
-    dtype = torch_dtype_to_tvm(val.dtype)
-    return relax.TensorStructInfo(shape, dtype)
 
 
 class TileLangFXImporter(TorchFXImporter):
@@ -148,10 +131,22 @@ class TileLangFXImporter(TorchFXImporter):
         axis = node.kwargs.get("dim", 0)
         return self.block_builder.emit(relax.op.concat(non_empty, axis=axis))
 
+    def _item(self, node: fx.Node) -> relax.Expr:
+        """Handle .item() — extract scalar from 0-dim or 1-element tensor."""
+        x = self.env[node.args[0]]
+        sinfo = x.struct_info_ if hasattr(x, "struct_info_") else None
+        if sinfo and isinstance(sinfo, relax.TensorStructInfo):
+            shape = sinfo.shape
+            if shape is not None and len(shape) == 0:
+                # 0-dim tensor: .item() is identity in Relax terms
+                return x
+        return self.block_builder.emit(relax.op.take(x, relax.const(0, "int64"), axis=0))
+
     def __init__(self, *args, extern_dispatch=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.fallback_calls: dict[str, tuple] = {}
         self.extern_dispatch = extern_dispatch or default_extern_dispatch
+        self.sym_env = SymbolicShapeEnv()
 
     def _convert_or_fallback(self, node: fx.Node, key):
         """Try the converter for key; extern-dispatch ops fallback to torch."""
@@ -217,7 +212,7 @@ class TileLangFXImporter(TorchFXImporter):
         # Build output struct info from FakeTensor metadata
         val = node.meta.get("val", node.meta.get("example_value"))
         if val is not None and isinstance(val, torch.Tensor):
-            out_sinfo = _struct_info_from_fake(val)
+            out_sinfo = self.sym_env.struct_info_from_fake(val)
         else:
             out_sinfo = relax.ObjectStructInfo()
 
@@ -287,10 +282,11 @@ class TileLangFXImporter(TorchFXImporter):
                         ev = node.meta.get("example_value")
                         # SymInt placeholder — store as tir.Var for dynamic shapes
                         if ev is not None and isinstance(ev, torch.SymInt):
-                            if _is_truly_symbolic(ev):
-                                self.env[node] = _sym_var(str(ev))
+                            resolved = self.sym_env.resolve(ev)
+                            if isinstance(resolved, tir.Var):
+                                self.env[node] = resolved
                             else:
-                                self.env[node] = tir.const(int(ev), "int64")
+                                self.env[node] = tir.const(resolved, "int64")
                             continue
                         if "grapharg" in node.meta and node.meta["grapharg"].fake_tensor is None:
                             continue
@@ -364,8 +360,8 @@ def fx_to_relax(
     Returns (module, fallback_calls) where fallback_calls maps op names
     to (callable, arg_template, kwargs) for runtime dispatch.
     """
-    input_info = extract_input_info(gm, example_inputs)
     importer = TileLangFXImporter(extern_dispatch=extern_dispatch)
+    input_info = extract_input_info(gm, example_inputs, sym_env=importer.sym_env)
     mod = importer.from_fx(
         gm, input_info,
         keep_params_as_input=False,
@@ -450,7 +446,7 @@ def default_extern_dispatch(node: fx.Node, *, gemv_threshold: int = 1) -> bool:
         # Or via fx_to_relax(gm, inputs, extern_dispatch=my_dispatch)
     """
     fn_name = node.target.__name__ if node.op == "call_function" else ""
-    if fn_name == "scaled_dot_product_attention":
+    if fn_name in ("scaled_dot_product_attention", "embedding"):
         return True
 
     mnk = _get_matmul_mnk(node)

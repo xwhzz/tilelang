@@ -198,10 +198,31 @@ private:
   std::vector<DeferredBinding> deferred_bindings_;
 
  public:
-  /*! \brief Retry all deferred bindings (call after all buffers are processed). */
+  /*!
+   * \brief Retry all deferred bindings with worklist + progress detection.
+   *
+   * Iterates until either all bindings resolve or no progress is made.
+   * Logs a warning for any bindings that remain unresolvable.
+   */
   void FlushDeferred() {
-    for (auto &db : deferred_bindings_) {
-      BindNullable(db.arg, db.value, db.arg_name, true, db.nullable_guard);
+    constexpr int kMaxIter = 16;  // guard against infinite loops
+    for (int iter = 0; iter < kMaxIter && !deferred_bindings_.empty(); ++iter) {
+      std::vector<DeferredBinding> remaining;
+      for (auto &db : deferred_bindings_) {
+        bool ok = BindNullable(db.arg, db.value, db.arg_name, true, db.nullable_guard);
+        if (!ok) {
+          remaining.push_back(std::move(db));
+        }
+      }
+      if (remaining.size() == deferred_bindings_.size()) {
+        // No progress — stop to avoid infinite loop
+        for (auto &db : remaining) {
+          LOG(WARNING) << "ArgBinder: unresolvable deferred binding for '"
+                       << db.arg_name << "': " << db.arg << " = " << db.value;
+        }
+        break;
+      }
+      deferred_bindings_ = std::move(remaining);
     }
     deferred_bindings_.clear();
   }

@@ -94,26 +94,7 @@ class FuseSkipReduction:
 
 def _collect_used_vars(expr):
     """Collect all Var references in a Relax expression."""
-    vars_used = set()
-
-    def _visit(e):
-        if isinstance(e, relax.Var):
-            vars_used.add(e)
-        elif isinstance(e, relax.Call):
-            if isinstance(e.op, relax.Var):
-                vars_used.add(e.op)
-            for arg in e.args:
-                _visit(arg)
-            for sa in e.sinfo_args:
-                pass  # struct info doesn't reference vars
-        elif isinstance(e, relax.Tuple):
-            for f in e.fields:
-                _visit(f)
-        elif isinstance(e, relax.TupleGetItem):
-            _visit(e.tuple_value)
-
-    _visit(expr)
-    return vars_used
+    return set(relax.analysis.free_vars(expr))
 
 
 def _is_standalone_call_tir(value, mod):
@@ -417,16 +398,28 @@ def _inline_producers_into_func(mod, consumer_func, consumer_args, chains, bindi
 
 
 def _remap_vars(expr, env):
-    """Replace Var references in an expression using the env mapping."""
+    """Replace Var references in an expression using the env mapping.
+
+    Only remaps Var nodes in arguments and tuple fields. Preserves
+    sinfo_args and attrs untouched (required for call_tir correctness).
+    """
+    if not env:
+        return expr
     if isinstance(expr, relax.Var):
         return env.get(expr, expr)
-    elif isinstance(expr, relax.Call):
-        new_args = [_remap_vars(a, env) for a in expr.args]
+    if isinstance(expr, relax.Call):
         new_op = env.get(expr.op, expr.op) if isinstance(expr.op, relax.Var) else expr.op
+        new_args = [_remap_vars(a, env) for a in expr.args]
         return relax.Call(new_op, new_args, expr.attrs, expr.sinfo_args, expr.span)
-    elif isinstance(expr, relax.Tuple):
-        new_fields = [_remap_vars(f, env) for f in expr.fields]
-        return relax.Tuple(new_fields, expr.span)
-    elif isinstance(expr, relax.TupleGetItem):
+    if isinstance(expr, relax.Tuple):
+        return relax.Tuple([_remap_vars(f, env) for f in expr.fields], expr.span)
+    if isinstance(expr, relax.TupleGetItem):
         return relax.TupleGetItem(_remap_vars(expr.tuple_value, env), expr.index, expr.span)
+    if isinstance(expr, relax.ShapeExpr):
+        return expr  # shape expressions don't contain Var references
+    if isinstance(expr, relax.If):
+        return relax.If(
+            _remap_vars(expr.cond, env),
+            _remap_vars(expr.true_branch, env),
+            _remap_vars(expr.false_branch, env), expr.span)
     return expr
