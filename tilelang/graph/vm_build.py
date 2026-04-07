@@ -36,11 +36,12 @@ logger = logging.getLogger(__name__)
 def _register_torch_fallbacks(fallback_calls: dict) -> list[str]:
     """Register torch fallback ops as TVM packed functions for the VM.
 
-    The converter emits ``call_dps_packed("torch_fallback.<op>", inputs, out)``
-    for ops dispatched via ``extern_dispatch``.  The VM resolves these at
-    runtime through the TVM FFI registry.
+    The converter emits ``Call(ExternFunc("torch_fallback.<op>"), inputs)``
+    for ops dispatched via ``extern_dispatch``.  The VM resolves these
+    at runtime through the TVM FFI registry.  The fallback function
+    returns the result directly (no pre-allocation or copy).
 
-    Returns the list of registered function names (for cleanup).
+    Returns the list of registered function names.
     """
     registered = []
     for op_name, (op_fn, arg_template, kwargs) in fallback_calls.items():

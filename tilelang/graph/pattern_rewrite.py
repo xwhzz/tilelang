@@ -1,34 +1,57 @@
 """Pattern-based kernel replacement framework for Relax IR.
 
-Leverages TVM's ``tvm.relax.dpl`` (dataflow pattern language) to match
-DAG patterns in the Relax IR, then replaces matched subgraphs with
-user-provided TIR PrimFuncs built via ``te.compute``.
+Matches DAG patterns in the Relax IR using TVM's dataflow pattern
+language, then replaces matched subgraphs with optimized TIR PrimFuncs.
 
-Runs **before LegalizeOps** — the IR contains high-level Relax ops
+Runs **before LegalizeOps** so the IR contains high-level Relax ops
 (``R.astype``, ``R.mean``, ``R.rsqrt``, etc.) which are easy to match.
+
+Pattern Registration Protocol
+-----------------------------
+Each pattern has three components:
+
+1. **pattern_fn** ``() -> (root_pattern, annotations_dict)``
+   Builds the DFPattern DAG.  Annotations are named wildcards whose
+   matched Relax vars are extracted as ``InputInfo`` for the builder.
+   Annotation vars are allowed to be externally used (they're inputs,
+   not intermediates).
+
+2. **builder_fn** ``(inputs: dict[str, InputInfo], params: dict) -> PrimFunc``
+   Constructs the replacement TIR function.  ``inputs`` maps annotation
+   names to ``InputInfo(var, shape, dtype)``.  ``params`` comes from the
+   check function.  The function can be built with ``te.compute`` (for
+   schedule-rule kernels) or ``@T.prim_func`` (for TileLang DSL kernels
+   with ``tir.is_scheduled=True``).
+
+3. **check_fn** ``(matched_bindings, annotations) -> CheckResult | dict | None``
+   Validates the match and extracts op-specific parameters.  Return
+   ``None`` to reject.  Return a ``CheckResult`` (or legacy dict) with:
+   - ``params``: passed to builder_fn
+   - ``extra_outputs``: multi-output vars (see below)
+   - ``opaque``: if True, sets ``op_pattern=8`` (kOpaque) on the TIR
+
+Multi-Output Patterns
+---------------------
+When ``check_fn`` returns ``extra_outputs=[var]``, the fused kernel
+produces multiple tensors.  The framework emits a ``call_tir`` with
+tuple return and ``TupleGetItem`` extraction.  Extra output vars are
+removed from their original bindings and remapped to the TupleGetItem
+results.  Use ``bb.emit_output()`` to convert DataflowVars to regular
+Vars before storing in env.
+
+TIR Attributes
+--------------
+- ``tir.is_tilelang_kernel``: TileLang DSL kernel — skip
+  NormalizeScheduledIR (already scheduled with thread bindings).
+- ``tir.is_scheduled``: Function has explicit schedule — skip
+  schedule-rule application by ApplyDefaultSchedule.
+- ``op_pattern=8``: kOpaque — prevents FuseOps from merging this
+  call_tir with neighboring ops (avoids FuseTIR conflicts).
 
 Usage::
 
-    from tvm.relax.dpl.pattern import wildcard, is_op
-    from tilelang.graph.pattern_rewrite import register_pattern, PatternRewritePass
-
-    # 1. Define pattern graph (DAG — diamonds OK)
-    def rmsnorm_pattern():
-        x, w = wildcard(), wildcard()
-        x_cast = is_op("relax.astype")(x)
-        ...
-        out = is_op("relax.multiply")(mul1, w)
-        return out, {"x": x, "w": w}
-
-    # 2. Define TIR builder
-    def rmsnorm_tir(x_shape, x_dtype, w_shape, w_dtype):
-        return _make_rmsnorm_tir(x_shape[:-1], x_shape[-1], x_dtype)
-
-    # 3. Register
-    register_pattern("rmsnorm", rmsnorm_pattern, rmsnorm_tir)
-
-    # 4. Use in pipeline (before LegalizeOps)
-    PatternRewritePass()   # applies all registered patterns
+    register_pattern("my_pattern", pattern_fn, builder_fn, check_fn)
+    # In pipeline: PatternRewritePass() before LegalizeOps
 """
 
 import logging
