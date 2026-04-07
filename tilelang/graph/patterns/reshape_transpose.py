@@ -10,6 +10,7 @@ from tvm.relax.dpl.pattern import wildcard, is_op
 from tvm import tir, te, relax
 
 from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.utils import get_static_shape
 
 
 # ---------------------------------------------------------------------------
@@ -27,24 +28,19 @@ def _reshape_permute_check(matched_bindings, annotations):
     x_var = annotations.get("x")
     if x_var is None:
         return None
-    x_si = x_var.struct_info_ if hasattr(x_var, "struct_info_") else None
-    if not isinstance(x_si, relax.TensorStructInfo) or x_si.shape is None:
-        return None
-    x_shape = [int(s) for s in x_si.shape.values if isinstance(s, tir.IntImm)]
-    if len(x_shape) != len(x_si.shape.values) or len(x_shape) != 3:
+    x_shape = get_static_shape(x_var)
+    if x_shape is None or len(x_shape) != 3:
         return None
 
     # Find the permute_dims output to get the target shape
     for name, b in matched_bindings.items():
         val = b.value
         if isinstance(val, relax.Call) and hasattr(val.op, "name") and "permute_dims" in val.op.name:
-            si = b.var.struct_info_
-            if isinstance(si, relax.TensorStructInfo) and si.shape:
-                out_shape = [int(s) for s in si.shape.values if isinstance(s, tir.IntImm)]
-                if len(out_shape) == 4:
-                    B, H, S, D = out_shape
-                    if x_shape == [B, S, H * D]:
-                        return {"B": B, "H": H, "S": S, "D": D, "out_shape": out_shape}
+            out_shape = get_static_shape(b.var)
+            if out_shape is not None and len(out_shape) == 4:
+                B, H, S, D = out_shape
+                if x_shape == [B, S, H * D]:
+                    return {"B": B, "H": H, "S": S, "D": D, "out_shape": out_shape}
     return None
 
 
@@ -77,24 +73,19 @@ def _permute_reshape_check(matched_bindings, annotations):
     x_var = annotations.get("x")
     if x_var is None:
         return None
-    x_si = x_var.struct_info_ if hasattr(x_var, "struct_info_") else None
-    if not isinstance(x_si, relax.TensorStructInfo) or x_si.shape is None:
-        return None
-    x_shape = [int(s) for s in x_si.shape.values if isinstance(s, tir.IntImm)]
-    if len(x_shape) != len(x_si.shape.values) or len(x_shape) != 4:
+    x_shape = get_static_shape(x_var)
+    if x_shape is None or len(x_shape) != 4:
         return None
 
     # Find reshape output to get the target shape
     for name, b in matched_bindings.items():
         val = b.value
         if isinstance(val, relax.Call) and hasattr(val.op, "name") and "reshape" in val.op.name:
-            si = b.var.struct_info_
-            if isinstance(si, relax.TensorStructInfo) and si.shape:
-                out_shape = [int(s) for s in si.shape.values if isinstance(s, tir.IntImm)]
-                if len(out_shape) == 3:
-                    B, H, S, D = x_shape
-                    if out_shape == [B, S, H * D]:
-                        return {"B": B, "H": H, "S": S, "D": D, "out_shape": out_shape}
+            out_shape = get_static_shape(b.var)
+            if out_shape is not None and len(out_shape) == 3:
+                B, H, S, D = x_shape
+                if out_shape == [B, S, H * D]:
+                    return {"B": B, "H": H, "S": S, "D": D, "out_shape": out_shape}
     return None
 
 

@@ -397,29 +397,4 @@ def _inline_producers_into_func(mod, consumer_func, consumer_args, chains, bindi
     return new_func, new_call_args
 
 
-def _remap_vars(expr, env):
-    """Replace Var references in an expression using the env mapping.
-
-    Only remaps Var nodes in arguments and tuple fields. Preserves
-    sinfo_args and attrs untouched (required for call_tir correctness).
-    """
-    if not env:
-        return expr
-    if isinstance(expr, relax.Var):
-        return env.get(expr, expr)
-    if isinstance(expr, relax.Call):
-        new_op = env.get(expr.op, expr.op) if isinstance(expr.op, relax.Var) else expr.op
-        new_args = [_remap_vars(a, env) for a in expr.args]
-        return relax.Call(new_op, new_args, expr.attrs, expr.sinfo_args, expr.span)
-    if isinstance(expr, relax.Tuple):
-        return relax.Tuple([_remap_vars(f, env) for f in expr.fields], expr.span)
-    if isinstance(expr, relax.TupleGetItem):
-        return relax.TupleGetItem(_remap_vars(expr.tuple_value, env), expr.index, expr.span)
-    if isinstance(expr, relax.ShapeExpr):
-        return expr  # shape expressions don't contain Var references
-    if isinstance(expr, relax.If):
-        return relax.If(
-            _remap_vars(expr.cond, env),
-            _remap_vars(expr.true_branch, env),
-            _remap_vars(expr.false_branch, env), expr.span)
-    return expr
+from tilelang.graph.utils import remap_expr as _remap_vars

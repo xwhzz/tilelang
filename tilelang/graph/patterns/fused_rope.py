@@ -15,6 +15,7 @@ from tvm.relax.dpl.pattern import wildcard, is_op
 from tvm import tir, te
 
 from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.utils import get_static_shape
 
 
 def _fused_rope_pattern():
@@ -50,16 +51,11 @@ def _fused_rope_check(matched_bindings, annotations):
     if x_var is None or cos_var is None:
         return None
 
-    x_si = x_var.struct_info_ if hasattr(x_var, "struct_info_") else None
-    cos_si = cos_var.struct_info_ if hasattr(cos_var, "struct_info_") else None
-    if not isinstance(x_si, relax.TensorStructInfo) or x_si.shape is None:
+    x_shape = get_static_shape(x_var)
+    cos_shape = get_static_shape(cos_var)
+    if x_shape is None or cos_shape is None:
         return None
-    if not isinstance(cos_si, relax.TensorStructInfo) or cos_si.shape is None:
-        return None
-
-    x_shape = [int(s) for s in x_si.shape.values if isinstance(s, tir.IntImm)]
-    cos_shape = [int(s) for s in cos_si.shape.values if isinstance(s, tir.IntImm)]
-    if len(x_shape) != len(x_si.shape.values) or len(x_shape) < 2:
+    if len(x_shape) < 2:
         return None
 
     head_dim = cos_shape[-1]

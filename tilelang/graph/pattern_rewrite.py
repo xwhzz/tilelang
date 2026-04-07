@@ -111,20 +111,7 @@ def _expr_uses_var(expr, var):
     return False
 
 
-def _remap_expr(expr, env):
-    """Recursively remap Var references through env."""
-    if isinstance(expr, relax.Var):
-        return env.get(expr, expr)
-    if isinstance(expr, relax.Call):
-        new_op = env.get(expr.op, expr.op) if isinstance(expr.op, relax.Var) else expr.op
-        new_args = [_remap_expr(a, env) for a in expr.args]
-        return relax.Call(new_op, new_args, expr.attrs, expr.sinfo_args, expr.span)
-    if isinstance(expr, relax.Tuple):
-        return relax.Tuple([_remap_expr(f, env) for f in expr.fields], expr.span)
-    if isinstance(expr, relax.TupleGetItem):
-        return relax.TupleGetItem(
-            _remap_expr(expr.tuple_value, env), expr.index, expr.span)
-    return expr
+from tilelang.graph.utils import remap_expr as _remap_expr
 
 
 # ---------------------------------------------------------------------------

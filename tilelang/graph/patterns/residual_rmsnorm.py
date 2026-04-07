@@ -12,6 +12,7 @@ from tvm import tir, relax
 
 import tilelang.language as T
 from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.utils import get_static_shape
 
 
 def _residual_rmsnorm_pattern():
@@ -41,16 +42,9 @@ def _residual_rmsnorm_check(matched_bindings, annotations):
     if hidden_var is None or w_var is None:
         return None
 
-    hidden_si = hidden_var.struct_info_ if hasattr(hidden_var, "struct_info_") else None
-    w_si = w_var.struct_info_ if hasattr(w_var, "struct_info_") else None
-    if not isinstance(hidden_si, relax.TensorStructInfo) or hidden_si.shape is None:
-        return None
-    if not isinstance(w_si, relax.TensorStructInfo) or w_si.shape is None:
-        return None
-
-    hidden_shape = [int(s) for s in hidden_si.shape.values if isinstance(s, tir.IntImm)]
-    w_shape = [int(s) for s in w_si.shape.values if isinstance(s, tir.IntImm)]
-    if len(hidden_shape) != len(hidden_si.shape.values):
+    hidden_shape = get_static_shape(hidden_var)
+    w_shape = get_static_shape(w_var)
+    if hidden_shape is None or w_shape is None:
         return None
 
     N = hidden_shape[-1]
