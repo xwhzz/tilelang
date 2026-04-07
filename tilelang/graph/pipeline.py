@@ -7,6 +7,7 @@ from tvm import relax, dlight as dl
 from tvm.target import Target
 
 from tilelang.schedule.gpu import default_schedule_rules
+from tilelang.graph.fuse_skip_reduction import FuseSkipReduction
 from tilelang.graph.pattern_rewrite import PatternRewritePass
 import tilelang.graph.patterns  # noqa: F401 — registers built-in patterns
 from tilelang.relax import FuseTIR
@@ -42,6 +43,7 @@ def run_pipeline(mod: tvm.IRModule, target: Target) -> tvm.IRModule:
             relax.transform.AnnotateTIROpPattern(),
             relax.transform.DeadCodeElimination(),
             relax.transform.FuseOps(),
+            FuseSkipReduction(),
             FuseTIR(),
             relax.transform.DeadCodeElimination(),
             dl.ApplyDefaultSchedule(*rules),
