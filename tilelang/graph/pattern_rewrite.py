@@ -45,6 +45,32 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class CheckResult:
+    """Return type for pattern check functions.
+
+    Attributes
+    ----------
+    params : dict
+        Op-specific parameters (e.g. ``head_dim``, ``N``).
+        Passed to the builder function.
+    extra_outputs : list[relax.Var]
+        Intermediate vars that become extra outputs of the fused kernel
+        (multi-output patterns). Their original bindings are removed and
+        replaced by TupleGetItem on the call_tir result.
+    opaque : bool
+        If True, the TIR function is marked with ``op_pattern=8``
+        (kOpaque) to prevent FuseOps from merging it with neighbors.
+    """
+    params: dict
+    extra_outputs: list = None
+    opaque: bool = False
+
+    def __post_init__(self):
+        if self.extra_outputs is None:
+            self.extra_outputs = []
+
+
+@dataclass
 class _RegisteredPattern:
     name: str
     pattern_fn: object     # () -> (DFPattern, dict[str, DFPattern])
@@ -112,6 +138,22 @@ def _expr_uses_var(expr, var):
 
 
 from tilelang.graph.utils import remap_expr as _remap_expr
+
+
+def _normalize_tir_for_fusion(tir_func):
+    """Normalize TIR index types to int32 for FuseTIR compatibility.
+
+    Pattern-rewritten TIR from ``te.compute`` uses int64 shapes,
+    while legalized TIR uses int32 (from ``ForceNarrowIndexToInt32``).
+    This ensures they can be fused by FuseTIR.
+    """
+    try:
+        import tilelang.transform
+        _tmp = tvm.IRModule({"_tmp": tir_func})
+        _tmp = tilelang.transform.ForceNarrowIndexToInt32()(_tmp)
+        return _tmp["_tmp"]
+    except Exception:
+        return tir_func  # non-critical: FuseOps may not merge this function
 
 
 # ---------------------------------------------------------------------------
@@ -228,31 +270,35 @@ class PatternRewritePass:
                     continue
 
                 # Semantic check: validate and extract op-specific params
-                extracted_params = {}
+                check_result = CheckResult(params={})
                 if reg.check_fn is not None:
-                    # Build matched bindings dict for the check function
                     matched_bindings_dict = {}
                     for b in bindings:
                         if b.var in matched_binding_vars:
                             matched_bindings_dict[b.var.name_hint] = b
-                    result = reg.check_fn(matched_bindings_dict, matched_annotations)
-                    if result is None:
+                    raw = reg.check_fn(matched_bindings_dict, matched_annotations)
+                    if raw is None:
                         continue  # check rejected this match
-                    extracted_params = result
+                    # Accept both dict (legacy) and CheckResult
+                    if isinstance(raw, CheckResult):
+                        check_result = raw
+                    else:
+                        check_result = CheckResult(
+                            params={k: v for k, v in raw.items()
+                                    if not k.startswith("_")},
+                            extra_outputs=raw.get("_extra_output_vars", []),
+                            opaque=raw.get("_opaque", False))
 
-                # If check_fn returned _extra_output_vars, these intermediates
-                # are allowed to be externally used — they become extra outputs
-                # of the fused kernel (multi-output pattern).
-                extra_output_vars = extracted_params.get("_extra_output_vars", [])
-                if extra_output_vars:
-                    intermediates -= set(extra_output_vars)
+                # Extra output vars are allowed to be externally used
+                if check_result.extra_outputs:
+                    intermediates -= set(check_result.extra_outputs)
 
                 all_replacements.append((
                     matched_root_var,
                     matched_binding_vars,
                     intermediates,
                     input_infos,
-                    extracted_params,
+                    check_result,
                     reg.builder_fn,
                     reg.name,
                 ))
@@ -267,36 +313,21 @@ class PatternRewritePass:
         remove_vars = set()  # vars to skip during rebuild
         rewrite_map = {}     # root_var → (tir_gvar, input_infos, name)
 
-        for root_var, matched_bvars, intermediates_set, input_infos, extracted_params, builder_fn, name in all_replacements:
+        for root_var, matched_bvars, intermediates_set, input_infos, check_result, builder_fn, name in all_replacements:
             try:
-                tir_func = builder_fn(input_infos, extracted_params)
-                # Normalize index types to int32 so FuseTIR can merge
-                # pattern-rewritten TIR with legalized TIR (which uses int32
-                # from ForceNarrowIndexToInt32 in NormalizeScheduledIR).
-                try:
-                    import tilelang.transform
-                    _tmp = tvm.IRModule({"_tmp": tir_func})
-                    _tmp = tilelang.transform.ForceNarrowIndexToInt32()(_tmp)
-                    tir_func = _tmp["_tmp"]
-                except Exception:
-                    pass  # non-critical: FuseOps may not merge this function
-
-                # Set opaque only if explicitly requested (e.g. fused_rope
-                # where annotation vars create FuseOps boundary issues).
-                if extracted_params.get("_opaque", False):
+                tir_func = builder_fn(input_infos, check_result.params)
+                tir_func = _normalize_tir_for_fusion(tir_func)
+                if check_result.opaque:
                     tir_func = tir_func.with_attr("op_pattern", 8)  # kOpaque
             except Exception as e:
                 logger.debug("Pattern %s builder failed: %s", name, e)
                 continue
 
             tir_gvar = bb.add_func(tir_func, f"fused_{name}")
-            # Only remove TRUE intermediates — not annotation inputs.
-            # Extra output vars are also removed (their original binding
-            # is replaced by TupleGetItem from call_tir_inplace).
             remove_vars |= intermediates_set
-            for ev in extracted_params.get("_extra_output_vars", []):
+            for ev in check_result.extra_outputs:
                 remove_vars.add(ev)
-            rewrite_map[root_var] = (tir_gvar, input_infos, extracted_params, name)
+            rewrite_map[root_var] = (tir_gvar, input_infos, check_result, name)
 
         if not rewrite_map:
             return mod
@@ -313,12 +344,11 @@ class PatternRewritePass:
                         continue
 
                     if binding.var in rewrite_map:
-                        tir_gvar, input_infos, params, name = rewrite_map[binding.var]
-                        extra_outputs = params.get("_extra_output_vars", [])
+                        tir_gvar, input_infos, check_result, name = rewrite_map[binding.var]
+                        extra_outputs = check_result.extra_outputs
                         if extra_outputs:
-                            # Multi-output: emit call_tir, then TupleGetItem for each output
                             results = _emit_multi_output(
-                                bb, env, tir_gvar, input_infos, params,
+                                bb, env, tir_gvar, input_infos, check_result,
                                 binding, extra_outputs, call_tir_op)
                             # Map the primary output
                             var = results[0]
