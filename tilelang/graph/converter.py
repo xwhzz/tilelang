@@ -217,14 +217,11 @@ class TileLangFXImporter(TorchFXImporter):
             out_sinfo = relax.ObjectStructInfo()
 
         # Emit an opaque call (acts as fusion barrier).
-        # Use call_dps_packed only for tensor outputs; scalar outputs
-        # (ObjectStructInfo) use a regular Call.
+        # Always use regular Call (not call_dps_packed) so the callee
+        # allocates and returns the output directly — avoids the extra
+        # pre-allocation + DtoD memcpy that call_dps_packed requires.
         extern = relax.ExternFunc(f"torch_fallback.{op_name}")
-        is_tensor_output = isinstance(out_sinfo, relax.TensorStructInfo)
-        if flat_tensor_args and is_tensor_output:
-            call = relax.call_dps_packed(extern, flat_tensor_args, out_sinfo)
-        else:
-            call = relax.Call(extern, flat_tensor_args, sinfo_args=[out_sinfo])
+        call = relax.Call(extern, flat_tensor_args, sinfo_args=[out_sinfo])
         result = self.block_builder.emit(call)
 
         # Store full call info keyed by op_name (stable across pipeline transforms)

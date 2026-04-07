@@ -39,10 +39,14 @@ class _BackendConfig:
 
     def __init__(self):
         self.extern_dispatch: Callable[..., bool] | None = None
+        self.use_vm: bool = False  # Use Relax VM runtime instead of Python/C wrapper
+        self.vm_clone_output: bool = True  # Clone VM outputs (False for benchmarking)
 
     def reset(self):
         """Restore all options to defaults."""
         self.extern_dispatch = None
+        self.use_vm = False
+        self.vm_clone_output = True
 
 
 backend_config = _BackendConfig()
@@ -82,12 +86,18 @@ def tilelang_backend(
     target = _detect_target(example_inputs)
     tensor_inputs = [inp for inp in example_inputs if isinstance(inp, torch.Tensor)]
 
-    relax_mod, fallback_calls = fx_to_relax(gm, tensor_inputs, extern_dispatch=dispatch)
-    optimized_mod = run_pipeline(relax_mod, target)
-    compiled_kernels = compile_tir_functions(optimized_mod, target)
-    wrapper = generate_wrapper(optimized_mod, compiled_kernels, fallback_calls)
+    if backend_config.use_vm:
+        relax_mod, fallback_calls = fx_to_relax(gm, tensor_inputs, extern_dispatch=dispatch)
+        from tilelang.graph.vm_build import build_vm_runner
+        wrapper = build_vm_runner(relax_mod, target, fallback_calls=fallback_calls,
+                                 clone_output=backend_config.vm_clone_output)
+    else:
+        relax_mod, fallback_calls = fx_to_relax(gm, tensor_inputs, extern_dispatch=dispatch)
+        optimized_mod = run_pipeline(relax_mod, target)
+        compiled_kernels = compile_tir_functions(optimized_mod, target)
+        wrapper = generate_wrapper(optimized_mod, compiled_kernels, fallback_calls)
+        graph_cache.save_relax_mod(key, optimized_mod)
 
     graph_cache.put_memory_cached(key, wrapper)
-    graph_cache.save_relax_mod(key, optimized_mod)
 
     return wrapper

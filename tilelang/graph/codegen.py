@@ -685,10 +685,12 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
         elif isinstance(instr, AllocStorageInstr):
             v = _sanitize_var(instr.var)
             if isinstance(instr.size, int):
-                size_str = str(instr.size)
+                # Static size: use pre-allocated storage from _pool dict
+                lines.append(f"    {v} = _pool[{instr.var!r}]")
             else:
+                # Dynamic size: allocate per call
                 size_str = _tir_expr_to_python(instr.size, sym_var_map)
-            lines.append(f"    {v} = _torch.empty({size_str}, dtype=_torch.uint8, device=_device)")
+                lines.append(f"    {v} = _torch.empty({size_str}, dtype=_torch.uint8, device=_device)")
 
         elif isinstance(instr, AllocTensorInstr):
             v = _sanitize_var(instr.var)
@@ -841,9 +843,10 @@ def _emit_python_source(instructions, param_names, output_vars, constants,
             lines.append(
                 f"    {_sanitize_var(instr.var)} = {_sanitize_var(instr.tuple_var)}[{instr.index}]")
 
-    # Return
+    # Return — clone outputs that may be views of the pre-allocated storage pool
+    # to prevent the caller from holding references that block pool reuse.
     if len(output_vars) == 1:
-        lines.append(f"    return {_sanitize_var(output_vars[0])}")
+        lines.append(f"    return {_sanitize_var(output_vars[0])}.clone()")
     else:
         outs = ", ".join(_sanitize_var(v) for v in output_vars)
         lines.append(f"    return ({outs},)")
@@ -1466,14 +1469,21 @@ def generate_wrapper(
             fb_fns[op_name] = op_fn
 
     # Memory planning: if StaticPlanBlockMemory produced AllocStorageInstr,
-    # the IR already handles memory reuse — no need for _plan_memory_reuse.
+    # pre-allocate static storages once (reused across calls).
     # Fall back to our own pool for legacy AllocInstr.
     has_storage_instrs = any(isinstance(i, AllocStorageInstr) for i in instructions)
     if has_storage_instrs:
         alloc_to_slot = {}
         pool_specs = []
+        # Pre-allocate static-size storages
+        storage_pool = {}
+        for instr in instructions:
+            if isinstance(instr, AllocStorageInstr) and isinstance(instr.size, int):
+                storage_pool[instr.var] = torch.empty(
+                    instr.size, dtype=torch.uint8, device=_const_device)
     else:
         alloc_to_slot, pool_specs = _plan_memory_reuse(instructions, output_vars)
+        storage_pool = {}
 
     pool = [
         torch.empty(shape, dtype=dtype, device=_const_device)
@@ -1536,10 +1546,16 @@ def generate_wrapper(
     exec(compile(source, "<tilelang_wrapper>", "exec"), code_globals)
     compiled_fn = code_globals["_compiled_wrapper"]
 
+    # Merge both pool types into one dict for the wrapper
+    merged_pool = storage_pool.copy()
+    # Legacy pool uses integer indices
+    for i, t in enumerate(pool):
+        merged_pool[i] = t
+
     def wrapper(*inputs):
         tensor_inputs = [inp for inp in inputs if isinstance(inp, torch.Tensor)]
         return compiled_fn(tensor_inputs,
                            tensor_inputs[0].device if tensor_inputs else _const_device,
-                           gpu_constants, compiled_kernels, fb_fns, pool)
+                           gpu_constants, compiled_kernels, fb_fns, merged_pool)
 
     return wrapper

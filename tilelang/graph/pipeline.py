@@ -8,6 +8,8 @@ from tvm.target import Target
 
 from tilelang.schedule.gpu import default_schedule_rules
 from tilelang.graph.fuse_skip_reduction import FuseSkipReduction
+from tilelang.graph.pattern_rewrite import PatternRewritePass
+import tilelang.graph.patterns  # noqa: F401 — registers built-in patterns
 from tilelang.relax import FuseTIR
 
 logger = logging.getLogger(__name__)
@@ -33,11 +35,13 @@ def run_pipeline(mod: tvm.IRModule, target: Target) -> tvm.IRModule:
                         "ReorderPermuteDimsAfterConcat")
 
         seq = tvm.transform.Sequential([
+            # Pattern replacement: runs BEFORE LegalizeOps on high-level
+            # Relax ops. Matches registered graph patterns (RMSNorm, etc.)
+            # and replaces with optimized call_tir implementations.
+            PatternRewritePass(),
             relax.transform.LegalizeOps(),
             relax.transform.AnnotateTIROpPattern(),
-            # FoldConstant is skipped — it uses emit_te which can't
-            # handle symbolic shapes from dynamic dim propagation.
-            # relax.transform.FoldConstant(),
+            relax.transform.DeadCodeElimination(),
             relax.transform.FuseOps(),
             FuseSkipReduction(),
             FuseTIR(),
@@ -47,12 +51,6 @@ def run_pipeline(mod: tvm.IRModule, target: Target) -> tvm.IRModule:
             relax.transform.ToNonDataflow(),
             relax.transform.RemovePurityChecking(),
             relax.transform.CallTIRRewrite(),
-            # Memory planning: StaticPlanBlockMemory analyzes lifetimes and
-            # shares storage across non-overlapping allocs.  LowerAllocTensor
-            # converts R.builtin.alloc_tensor → R.memory.alloc_storage +
-            # R.memory.alloc_tensor with concrete byte offsets.
-            # ComputePrimValue / VMShapeLower are VM-specific and NOT used
-            # here — our codegen resolves symbolic shapes from input tensors.
             relax.transform.StaticPlanBlockMemory(),
             relax.transform.LowerAllocTensor(),
         ])

@@ -497,13 +497,30 @@ class RelaxToTIRVarMapCollector : public ExprVisitor {
       }
     }
 
-    // If the `expr` is already seen (present in the map), validate whether the mapped buffer is
-    // structurally equal to the `new_buf` passed
+    // Validate that two buffers mapped to the same Relax var are compatible
+    // (same shape and dtype).  Different call_tir functions may use different
+    // buffer *names* for the same Relax var (e.g. pattern-rewritten "out" vs
+    // legalized "T_transpose"), so we compare shape/dtype instead of full
+    // structural equality.
     auto ValidateBufferCompatibility = [this](tir::Buffer new_buf, Expr expr) {
       if (auto it = relax_to_tir_var_map_.find(expr); it != relax_to_tir_var_map_.end()) {
-        ICHECK(StructuralEqual()((*it).second, new_buf))
-            << "Inconsistent buffers " << (*it).second << " and " << new_buf
-            << " mapped to the same relax var: " << expr;
+        auto old_buf = (*it).second;
+        bool compatible = old_buf->dtype == new_buf->dtype &&
+                          old_buf->shape.size() == new_buf->shape.size();
+        if (compatible) {
+          for (size_t j = 0; j < old_buf->shape.size(); ++j) {
+            auto* a = old_buf->shape[j].as<IntImmNode>();
+            auto* b = new_buf->shape[j].as<IntImmNode>();
+            if (a && b) {
+              compatible = compatible && (a->value == b->value);
+            } else {
+              compatible = compatible && StructuralEqual()(old_buf->shape[j], new_buf->shape[j]);
+            }
+          }
+        }
+        ICHECK(compatible) << "Incompatible buffers " << old_buf << " and " << new_buf
+                           << " mapped to the same relax var: " << expr
+                           << " (shape/dtype mismatch)";
       }
     };
     for (size_t i = 0; i < tir_args.size(); ++i) {

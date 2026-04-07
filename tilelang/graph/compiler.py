@@ -32,8 +32,13 @@ def compile_tir_functions(
             func = func.with_attr("global_symbol", name)
 
         func_mod = tvm.IRModule({name: func})
-        with tvm.transform.PassContext(opt_level=3), target:
-            func_mod = NormalizeScheduledIR(func_mod)
+        # TileLang DSL kernels (from pattern builders) are already in
+        # tile-primitive form — skip NormalizeScheduledIR which is only
+        # for schedule-rule outputs. Detect via "tir.is_tilelang_kernel".
+        is_tilelang_kernel = bool(func.attrs.get("tir.is_tilelang_kernel", False))
+        if not is_tilelang_kernel:
+            with tvm.transform.PassContext(opt_level=3), target:
+                func_mod = NormalizeScheduledIR(func_mod)
 
         prim_func = list(func_mod.functions.values())[0]
         names.append(name)
