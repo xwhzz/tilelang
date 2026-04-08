@@ -337,6 +337,13 @@ class PatternRewritePass:
         rewrite_map = {}     # root_var → (tir_gvar, input_infos, name)
 
         for root_var, matched_bvars, intermediates_set, input_infos, check_result, builder_fn, name in all_replacements:
+            # Skip if root already claimed by a higher-priority pattern
+            if root_var in rewrite_map:
+                continue
+            # Skip if any matched binding overlaps with already-claimed vars
+            if matched_bvars & remove_vars:
+                continue
+
             try:
                 tir_func = builder_fn(input_infos, check_result.params)
                 tir_func = _normalize_tir_for_fusion(tir_func)
