@@ -106,20 +106,40 @@ def _choose_tile_gemv_params(
     return num_threads, tile_k, block_k, tile_m
 
 
+def _effective_rank(buf: tir.Buffer) -> int:
+    """Count non-unit dimensions in a buffer shape.
+
+    Unit leading dims (e.g. ``(1, K)`` from an HF LLaMA decode matmul
+    with batch=1, seq=1) do not contribute spatial information and
+    are dropped by ``normalize_prim_func`` at the block level.  We
+    mirror that behaviour here so the canonical
+    ``vector_rank + 1 == matrix_rank`` invariant still holds.
+    """
+    return sum(
+        1 for dim in buf.shape
+        if not (isinstance(dim, tir.IntImm) and int(dim.value) == 1)
+    )
+
+
 def _can_use_tile_schedule(
     target: Target,
     matrix_buffer: tir.Buffer,
     vector_buffer: tir.Buffer,
     output_buffer: tir.Buffer,
 ) -> bool:
-    """Check if the tile-based GEMV schedule can handle this workload."""
+    """Check if the tile-based GEMV schedule can handle this workload.
+
+    Uses effective (non-unit) rank for the vector and output so decode
+    matmuls ``(1, K) × (N, K) → (1, N)`` are accepted even though the
+    raw ranks of x and out are 2, not 1.
+    """
     if target.kind.name != "cuda":
         return False
     if len(matrix_buffer.shape) not in (2, 3):
         return False
-    if len(vector_buffer.shape) + 1 != len(matrix_buffer.shape):
+    if _effective_rank(vector_buffer) + 1 != len(matrix_buffer.shape):
         return False
-    return len(output_buffer.shape) + 1 == len(matrix_buffer.shape)
+    return _effective_rank(output_buffer) + 1 == len(matrix_buffer.shape)
 
 
 class GEMV(GPUScheduleRule):

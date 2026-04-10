@@ -29,11 +29,63 @@ from .reduction_utils import (
 )
 from .layernorm_like import LayerNormLike
 
-tir = tvm.tir
-Target = tvm.target.Target
-normalize_prim_func = tvm.dlight.normalize_prim_func
-try_inline_contiguous_spatial = tvm.dlight.try_inline_contiguous_spatial
-BlockInfo = tvm.dlight.analysis.BlockInfo
+from tvm import tir
+from tvm.target import Target
+from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
+from tvm.dlight.analysis import BlockInfo
+
+
+def _inline_trailing_injective_epilogues(
+    sch: TileSchedule,
+    block_infos: list[BlockInfo],
+    reduction_indices: list[int],
+) -> list[BlockInfo]:
+    """Fold pure-injective trailing blocks into their producers.
+
+    After the last reduction, a chain of injective blocks (e.g.
+    ``softmax_norm → cast``) leaves the schedule with two output-shape
+    candidates: the natural reduction-output anchor and the actual
+    function output.  When the chain length > 1 the rest of the
+    template incorrectly anchors on the trailing block, which leaves
+    the reduction temporaries at the outer scope and produces a
+    rank-mismatched ``T.reduce`` (see ``ReduceOpNode::InferLayout``).
+
+    The fix: walk the trailing chain from the end and call
+    ``reverse_compute_inline`` on each pure-injective block whose only
+    consumer is its (also pure-injective) successor.  This collapses
+    the trailing chain into a single block — the same shape the
+    no-cast case naturally produces.
+    """
+    if not reduction_indices:
+        return block_infos
+
+    last_reduction_idx = reduction_indices[-1]
+    while True:
+        trailing = block_infos[last_reduction_idx + 1 :]
+        if len(trailing) <= 1:
+            break
+
+        last_info = trailing[-1]
+        last_stmt = sch.get(last_info.block_rv)
+        if not last_info.is_injective() or len(last_stmt.writes) != 1:
+            break
+
+        try:
+            sch.reverse_compute_inline(last_info.block_rv)
+        except Exception:
+            break
+
+        block_infos = normalize_prim_func(sch)
+        if block_infos is None:
+            return []
+        reduction_indices = [
+            i for i, info in enumerate(block_infos) if info.is_reduction()
+        ]
+        if not reduction_indices:
+            return block_infos
+        last_reduction_idx = reduction_indices[-1]
+
+    return block_infos
 
 
 def _contains_exp_like_call(expr: tir.PrimExpr) -> bool:
@@ -429,6 +481,27 @@ class GeneralReduction(GPUScheduleRule):
         reduction_indices = [i for i, info in enumerate(block_infos) if info.is_reduction()]
         if len(reduction_indices) == 0:
             return None
+
+        # Fold pure-injective epilogue chains into the previous block via
+        # ``reverse_compute_inline``.  Patterns like
+        # ``softmax(x.float()).half()`` legalise to a softmax PrimFunc with
+        # an extra trailing cast block.  When that extra block survives,
+        # it becomes the schedule's output anchor and shifts the per-CTA
+        # ``bx`` loop onto the cast.  ``compute_at`` then hoists the
+        # reduction blocks under the cast's bx, but the reduction
+        # temporaries (max, expsum) keep their original full-shape
+        # allocation — leading to a layout-rank mismatch in
+        # ``ReduceOp::InferLayout`` because src is a 1-D row but dst is
+        # the 2-D output-shape buffer.
+        #
+        # By reverse-compute-inlining the trailing cast into the norm
+        # block here, we restore the same 4-block structure as the
+        # no-cast case and the existing template handles it cleanly.
+        block_infos = _inline_trailing_injective_epilogues(sch, block_infos, reduction_indices)
+        reduction_indices = [i for i, info in enumerate(block_infos) if info.is_reduction()]
+        if len(reduction_indices) == 0:
+            return None
+
         output_block_names = {sch.get(output_block).name_hint for output_block in get_output_blocks(sch, block_infos)}
 
         if len(reduction_indices) > 1:

@@ -633,11 +633,20 @@ def _try_match(root_var, root_value, root_pattern, ann_patterns,
     Returns (annotation_var_map, matched_binding_vars) or None.
     """
     from tvm.relax.dpl.pattern import (
-        WildcardPattern, CallPattern, DFPattern)
+        WildcardPattern, CallPattern, TuplePattern, DFPattern)
 
     # Simple recursive pattern matcher
     env = {}   # DFPattern → matched Relax Expr
     matched_binding_vars = set()
+
+    def resolve(expr):
+        """Follow a Var binding to its defining expression, recording the
+        intermediate binding var along the way so it gets added to the
+        matched set."""
+        if isinstance(expr, relax.Var) and expr in var_to_value:
+            matched_binding_vars.add(expr)
+            return var_to_value[expr]
+        return expr
 
     def match(pattern, expr):
         # Check if this pattern was already matched (diamond handling)
@@ -666,12 +675,18 @@ def _try_match(root_var, root_value, root_pattern, ann_patterns,
             if len(pattern.args) != len(expr.args):
                 return False
             for p_arg, e_arg in zip(pattern.args, expr.args):
-                # If the expr arg is a Var, resolve it through var_to_value
-                resolved = e_arg
-                if isinstance(e_arg, relax.Var) and e_arg in var_to_value:
-                    matched_binding_vars.add(e_arg)
-                    resolved = var_to_value[e_arg]
-                if not match(p_arg, resolved):
+                if not match(p_arg, resolve(e_arg)):
+                    return False
+            env[pattern] = expr
+            return True
+
+        if isinstance(pattern, TuplePattern):
+            if not isinstance(expr, relax.Tuple):
+                return False
+            if len(pattern.fields) != len(expr.fields):
+                return False
+            for p_field, e_field in zip(pattern.fields, expr.fields):
+                if not match(p_field, resolve(e_field)):
                     return False
             env[pattern] = expr
             return True

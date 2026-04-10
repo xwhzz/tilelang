@@ -269,10 +269,16 @@ def _choose_num_threads(target: Target, reduction_extent: tir.PrimExpr) -> int:
     Ensures each thread handles at least ``_MIN_ELEMS_PER_THREAD`` elements
     so that local accumulation amortises the cost of the cross-thread tree
     reduction (warp shuffles + shared-memory sync).
+
+    For very large reduction extents we let the thread count grow up to
+    512 threads/CTA — empirically this halves softmax(N=32k) and similar
+    wide-row reductions on H100 vs the previous 256-thread cap.  At
+    N≤4k the heuristic still picks 256 because of the elements-per-thread
+    minimum, so smaller reductions are unaffected.
     """
 
     max_threads = int(utils.max_threads_per_block(target))
-    max_threads = min(max_threads, 256)
+    max_threads = min(max_threads, 512)
     if max_threads <= 0:
         return 1
 
