@@ -188,8 +188,35 @@ Annotation helpers
 - `T.annotate_l2_hit_ratio(buf, ratio)`: Cache behavior hint.
 
 Synchronization helpers
+- `T.sync_threads([barrier_id, arrive_count])`: Block-wide barrier (`__syncthreads()`).
+- `T.sync_warp([mask])`: Warp-wide barrier (`__syncwarp([mask])`).
+- `T.sync_grid()`: Cooperative grid barrier (requires cooperative launch).
 - `T.pdl_trigger()`: Signal programmatic launch completion for the current kernel.
 - `T.pdl_sync()`: Wait until kernel dependencies are satisfied.
+
+Warp-vote / warp-ballot (CUDA ≥ 9 / HIP)
+- `T.any_sync(mask, predicate)` → `int32`: Non-zero if ANY lane in `mask` has non-zero predicate  (`__any_sync`).
+- `T.all_sync(mask, predicate)` → `int32`: Non-zero if ALL lanes in `mask` have non-zero predicate  (`__all_sync`).
+- `T.ballot_sync(mask, predicate)` → `uint64`: Bitmask of lanes in `mask` with non-zero predicate. CUDA: `__ballot_sync` zero-extended to 64 bits; HIP: `__ballot` returns natively as `uint64`, covering all 64 wavefront lanes.
+- `T.ballot(predicate)` → `uint64`: Full-warp/wavefront ballot (mask = `0xFFFFFFFF`). No truncation on HIP.
+- `T.activemask()` → `uint64`: Bitmask of currently active lanes. CUDA: `__activemask` zero-extended to 64 bits; HIP: `__ballot(1)` as `uint64`.
+
+Block-wide predicated sync
+- `T.syncthreads_count(predicate)` → `int32`: Sync all threads; return count with non-zero predicate (`__syncthreads_count`).
+- `T.syncthreads_and(predicate)` → `int32`: Sync; non-zero iff ALL threads have non-zero predicate (`__syncthreads_and`).
+- `T.syncthreads_or(predicate)` → `int32`: Sync; non-zero iff ANY thread has non-zero predicate (`__syncthreads_or`).
+
+Warp-shuffle (intra-warp data exchange)
+- `T.shfl_sync(mask, value, src_lane[, width])`: Broadcast value from `src_lane` to all lanes (`__shfl_sync`).
+- `T.shfl_xor(value, offset[, mask, width])`: XOR-swap across lanes (`__shfl_xor_sync`).
+- `T.shfl_down(value, offset[, mask, width])`: Shift down by `offset` lanes (`__shfl_down_sync`).
+- `T.shfl_up(value, offset[, mask, width])`: Shift up by `offset` lanes (`__shfl_up_sync`).
+
+Warp-match (CUDA sm_70+, not supported on HIP)
+- `T.match_any_sync(mask, value)` → `uint32`: Bitmask of lanes in `mask` whose `value` matches the calling lane's (`__match_any_sync`).
+- `T.match_all_sync(mask, value)` → `uint32`: Returns `mask` if all lanes in `mask` agree on `value`, else 0 (`__match_all_sync`). The C-level `int*` predicate output is hidden; reconstruct it as `result != 0`.
+
+> **Note on HIP:** `any_sync`/`all_sync` ignore the mask and call `__any`/`__all` directly. `ballot_sync`, `ballot`, and `activemask` call `__ballot` which returns `uint64` natively on 64-thread wavefronts — no truncation occurs. Shuffle intrinsics lower to `__shfl`/`__shfl_xor`/`__shfl_down`/`__shfl_up` (mask ignored). `syncthreads_count/and/or` have identical signatures on both platforms. `match_any_sync` and `match_all_sync` have no HIP equivalent and will fail to codegen on HIP.
 
 Atomics
 - `T.atomic_add(dst, value, memory_order=None, return_prev=False, use_tma=False)`.
