@@ -1,57 +1,6 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
-"""Axis-walk schedule rule for injective elementwise kernels.
-
-Unlike :class:`ElementWise`, this rule does **not** flatten the N-D
-layout into a 1-D buffer.  Instead it walks the spatial axes right →
-left, accumulating their extents until the running product reaches the
-target tile size, and splits the axis that pushed us over into
-``[outer, inner=need]``.  The remaining inner axes are fused into the
-tile dimension; the leading outer axes (plus the outer half of the
-split) are fused into ``blockIdx.x``.
-
-Motivation
-----------
-The flatten-based rule has to build an int32 ``IndexMap`` + explicit
-inverse, call ``transform_layout`` on every read/write, rewrite the
-block layout, and finally restore the original buffer_map so that
-``MakePackedAPI`` keeps the N-D ndim.  After all that plumbing the
-fragment produced by ``cache_read_at`` on the 1-D buffer ends up with
-register stride 2, and the emitted CUDA streams 2-fp16 ``uint1`` loads
-instead of 8-fp16 ``uint4``.
-
-Keeping the N-D shape preserves the stride relationship between axes
-and lets layout inference see "tile dim sits at the innermost
-contiguous stride" — which is what drives the 128-bit vectorised load
-emission.
-
-Strategy (static shapes only)
------------------------------
-1. Inline all injective producer blocks into a single output block.
-2. Choose ``(TILE, NUM_THREADS)`` from the total spatial extent and the
-   dominant read-buffer dtype.  ``elems_per_thread`` is anchored on the
-   128-bit vector width (``vec = 128 // dtype_bits``) so each thread
-   issues one or two ``uint4``-class global loads per input buffer,
-   regardless of dtype (fp32, fp16, bf16, int8, ...).
-3. Walk S-loops right → left:
-     - if the current axis alone would push ``acc`` over ``TILE``,
-       split it into ``[outer, inner = TILE / acc]`` and stop;
-     - otherwise fold the axis into ``acc`` and keep walking.
-4. Fuse the outer half into a single blockIdx loop and the inner half
-   into the tile loop.
-5. ``cache_read_at`` each input and ``cache_write_at`` the output at
-   the blockIdx level into ``local.fragment``.
-6. ``parallel(inner)`` + ``bind(bx, "blockIdx.x")`` + ``launch_thread``.
-
-Dynamic shapes, non-divisible splits, or tensors where the whole
-spatial extent already fits in a single tile fall through to the
-next rule in the pipeline (usually :class:`ElementWise`, whose own
-fallback path handles them).
-"""
-
 from __future__ import annotations
 
-from .. import Schedule as TileSchedule
+from ... import Schedule as TileSchedule
 from .base import GPUScheduleRule
 
 from tvm import tir
@@ -247,7 +196,12 @@ class ElementWiseNDim(GPUScheduleRule):
                     cutoff = i
                     continue
                 need = selected_tile // acc
-                if need >= 2 and extents[i] % need == 0:
+                if need >= 2:
+                    # Allow non-divisible splits — the non-unit inner factor
+                    # combined with preserve_unit_iters=True causes TVM to
+                    # emit a T.where predicate, so the tail block is handled
+                    # correctly while the common case still gets vectorised
+                    # 128-bit loads.
                     split_info = (i, need)
                 break
 

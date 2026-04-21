@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from tilelang import tvm
 
-from .. import Schedule as TileSchedule
+from ... import Schedule as TileSchedule
 from . import utils
 from .base import GPUScheduleRule
 

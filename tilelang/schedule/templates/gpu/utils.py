@@ -1,7 +1,3 @@
-# Copyright (c) Microsoft Corporation.
-# Licensed under the MIT License.
-
-# pylint: disable=missing-docstring
 """Utility methods for generic GPU."""
 
 from __future__ import annotations
@@ -33,6 +29,52 @@ def max_threads_per_block(target: Target) -> int:
     if target.kind.name == "cuda":
         return 1024
     return 256
+
+
+def suggest_threads_per_block(
+    target: Target,
+    loops: list[tir.For],
+    max_threads_for_dynamic_loop: int = 32,
+) -> list[int]:
+    if target.kind.name == "cuda":
+        threads = 1024
+    elif target.kind.name == "rocm" or target.kind.name == "metal":
+        threads = 256
+    else:
+        threads = 64
+    results: list[int | None] = []
+    dynamic: list[int] = []
+    for i, loop in enumerate(loops):
+        loop_extent = loop.extent
+        if isinstance(loop_extent, tir.IntImm):
+            loop_extent = loop_extent.value
+            extent = 1
+            while extent <= loop_extent and extent <= threads:
+                extent *= 2
+            extent //= 2
+            assert extent >= 1
+            assert threads % extent == 0
+            threads //= extent
+            results.append(extent)
+        else:
+            results.append(None)
+            dynamic.append(i)
+
+    for i in dynamic:
+        extent = 1
+        while extent <= max_threads_for_dynamic_loop and extent <= threads:
+            extent *= 2
+        extent //= 2
+        assert extent >= 1
+        assert threads % extent == 0
+        threads //= extent
+        results[i] = extent
+
+    if dynamic:
+        results[dynamic[0]] *= threads
+
+    return results
+
 
 def get_sm_version(target: Target) -> int:
     if target.kind.name != "cuda":

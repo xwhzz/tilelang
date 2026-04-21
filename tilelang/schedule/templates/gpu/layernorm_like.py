@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from tilelang import tvm
 
-from .. import Schedule as TileSchedule
+from ... import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
 from .base import GPUScheduleRule
 from .reduction_utils import (
@@ -25,11 +25,10 @@ from .reduction_utils import (
     _is_square_of_buffer_load,
 )
 
-tir = tvm.tir
-Target = tvm.target.Target
-normalize_prim_func = tvm.dlight.normalize_prim_func
-BlockInfo = tvm.dlight.analysis.BlockInfo
-
+from tvm import tir
+from tvm.target import Target
+from tvm.dlight import normalize_prim_func
+from tvm.dlight.analysis import BlockInfo
 
 def _schedule_single_source_reduction(
     sch: TileSchedule,

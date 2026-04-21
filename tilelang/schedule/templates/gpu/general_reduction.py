@@ -10,7 +10,7 @@ from functools import reduce
 
 from tilelang import tvm
 
-from .. import Schedule as TileSchedule
+from ... import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
 from .base import GPUScheduleRule
 from .reduction_utils import (

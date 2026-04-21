@@ -12,7 +12,7 @@ from tilelang import tvm
 from tilelang.carver.analysis import get_reduction_blocks, get_root_block
 from tilelang.carver.matmul_analysis import auto_inline_producers, normalize_to_matmul
 
-from .. import Schedule as TileSchedule
+from ... import Schedule as TileSchedule
 from . import utils
 from .base import GPUScheduleRule
 

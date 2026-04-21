@@ -8,10 +8,8 @@ from tilelang import tvm
 
 from . import utils
 
-ir = tvm.ir
-tir = tvm.tir
-Target = tvm.target.Target
-
+from tvm import ir, tir
+from tvm.target import Target
 
 _MIN_ELEMS_PER_THREAD = 16
 

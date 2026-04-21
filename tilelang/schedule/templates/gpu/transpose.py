@@ -8,14 +8,13 @@ from math import isqrt
 from tilelang import tvm
 from tilelang import _ffi_api as tl_ffi
 
-from .. import Schedule as TileSchedule
+from ... import Schedule as TileSchedule
 from . import utils
 from .base import GPUScheduleRule
 
 from tvm import tir
 from tvm.target import Target
 from tvm.dlight import normalize_prim_func
-
 
 def _largest_power_of_two_at_most(value: int) -> int:
     result = 1

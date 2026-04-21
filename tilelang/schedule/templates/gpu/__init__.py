@@ -6,7 +6,6 @@ For CUDA/ROCm/Vulkan/Metal-specific rules, use `tvm.dlight.cuda/rocm/vulkan/meta
 """
 
 from .fallback import Fallback  # noqa: F401
-from .element_wise import ElementWise  # noqa: F401
 from .element_wise_ndim import ElementWiseNDim  # noqa: F401
 from .general_reduction import GeneralReduction  # noqa: F401
 from .transpose import Transpose  # noqa: F401
@@ -23,6 +22,5 @@ def default_schedule_rules():
         GeneralReduction(),  # Subsumes former Reduction
         Transpose(),
         ElementWiseNDim(),   # Axis-walk (preserves N-D)
-        # ElementWise(),     # Disabled: NDim covers the same cases
         Fallback(),
     ]

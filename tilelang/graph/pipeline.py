@@ -5,8 +5,7 @@ import logging
 from tilelang import tvm as tvm
 from tvm import relax, dlight as dl, tir
 from tvm.target import Target
-
-from tilelang.schedule.gpu import default_schedule_rules
+from tilelang.schedule.templates import default_schedule_rules
 from tilelang.graph.pattern_rewrite import PatternRewritePass
 import tilelang.graph.patterns  # noqa: F401 — registers built-in patterns
 from tilelang.graph.patterns.fused_rope import fuse_qk_rope_pass
@@ -216,7 +215,7 @@ def _try_pass(mod, transform, name):
 def run_pipeline(mod: tvm.IRModule, target: Target,
                  use_cuda_graph: bool = False) -> tvm.IRModule:
     """Apply the TileLang Relax compilation pipeline."""
-    rules = default_schedule_rules()
+    rules = default_schedule_rules(target)
 
     with target:
         mod = _try_pass(mod, relax.transform.FuseTransposeMatmul(), "FuseTransposeMatmul")
