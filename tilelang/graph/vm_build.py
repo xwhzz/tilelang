@@ -54,53 +54,81 @@ def _register_torch_fallbacks(fallback_calls: dict) -> list[str]:
 
 
 def _make_fallback_wrapper(op_fn, arg_template, kwargs):
-    """Generic fallback wrapper — calls torch op and returns result directly.
+    """Build a torch fallback wrapper for the VM dispatch table.
 
-    Since fallback ops use regular ``Call`` (not ``call_dps_packed``),
-    the callee allocates the output and returns it.  No pre-allocation
-    or DtoD copy needed — the VM stores the returned tensor in a register.
+    Pre-compiles ``arg_template`` into a compact ("kind", payload) list
+    so each VM dispatch can build the torch call without re-iterating
+    the template.  In-place torch ops (name ending with ``_``) return
+    the first TVM arg directly, skipping the result DLPack conversion.
     """
-    def wrapper(*tvm_args):
-        # Zero-copy DLPack conversion for all inputs
-        torch_inputs = [torch.from_dlpack(t) for t in tvm_args]
+    arg_instrs = []
+    for kind, val in arg_template:
+        if kind is True:
+            arg_instrs.append(("tensor", None))
+        elif kind == "list":
+            sub = []
+            for name in val:
+                if isinstance(name, str):
+                    sub.append(("tensor", None))
+                else:
+                    sub.append(("const", name))
+            arg_instrs.append(("list", sub))
+        else:
+            arg_instrs.append(("const", val))
 
-        # Reconstruct positional args from template
+    const_kwargs = {}
+    tensor_kwarg_keys = []
+    for k, v in kwargs.items():
+        if isinstance(v, tuple) and len(v) == 2 and v[0] == "__tensor__":
+            tensor_kwarg_keys.append(k)
+        else:
+            const_kwargs[k] = v
+    has_tensor_kwargs = bool(tensor_kwarg_keys)
+
+    is_method_call = isinstance(op_fn, str)
+    is_inplace = isinstance(op_fn, str) and op_fn.endswith("_")
+
+    def wrapper(*tvm_args):
+        n = len(tvm_args)
+        torch_inputs = [None] * n
+        for i in range(n):
+            torch_inputs[i] = torch.from_dlpack(tvm_args[i])
+
         args = []
         tidx = 0
-        for kind, val in arg_template:
-            if kind is True:
+        for kind, payload in arg_instrs:
+            if kind == "tensor":
                 args.append(torch_inputs[tidx])
                 tidx += 1
             elif kind == "list":
                 lst = []
-                for name in val:
-                    if isinstance(name, str):
+                for sk, sv in payload:
+                    if sk == "tensor":
                         lst.append(torch_inputs[tidx])
                         tidx += 1
                     else:
-                        lst.append(name)
+                        lst.append(sv)
                 args.append(lst)
             else:
-                args.append(val)
+                args.append(payload)
 
-        # Reconstruct keyword args
-        resolved_kw = {}
-        for k, v in kwargs.items():
-            if isinstance(v, tuple) and len(v) == 2 and v[0] == "__tensor__":
+        if has_tensor_kwargs:
+            resolved_kw = dict(const_kwargs)
+            for k in tensor_kwarg_keys:
                 resolved_kw[k] = torch_inputs[tidx]
                 tidx += 1
-            else:
-                resolved_kw[k] = v
+        else:
+            resolved_kw = const_kwargs
 
-        # Call torch op — callee allocates output
-        if isinstance(op_fn, str):
+        if is_method_call:
             result = getattr(args[0], op_fn)(*args[1:], **resolved_kw)
         else:
             result = op_fn(*args, **resolved_kw)
 
-        # Return result to VM as TVM tensor
+        if is_inplace:
+            return tvm_args[0]
         if isinstance(result, torch.Tensor):
-            return _tvm_from_dlpack(result.contiguous())
+            return _tvm_from_dlpack(result)
         return result
 
     return wrapper
@@ -150,19 +178,27 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
     target_host = Target(target_host_str)
     full_target = Target(target, target_host)
 
-    with tvm.transform.PassContext(opt_level=3), full_target:
-        # Separate TileLang DSL kernels (already scheduled, skip NormalizeScheduledIR)
-        # from schedule-rule kernels (need NormalizeScheduledIR).
+    # Always define ENABLE_BF16 on the device compile line so bf16
+    # fallback headers (cuda_bf16_fallbacks.cuh) are pulled in; without
+    # this, kernels that touch bf16 fail to compile.
+    pass_configs = {"tl.device_compile_flags": ["-DENABLE_BF16"]}
+    with tvm.transform.PassContext(opt_level=3, config=pass_configs), full_target:
+        # TileLang DSL kernels (tir.is_tilelang_kernel) skip NormalizeScheduledIR;
+        # schedule-rule kernels run the full pipeline; unscheduled funcs are a
+        # safety net (they typically fail GPU VerifyMemory).
         tl_funcs = {}
         sched_funcs = {}
+        unsched_funcs = {}
         for gv, func in kernel_mod.functions.items():
             if isinstance(func, tir.PrimFunc) and func.attrs and \
                func.attrs.get("tir.is_tilelang_kernel", False):
                 tl_funcs[gv] = func
-            else:
+            elif isinstance(func, tir.PrimFunc) and func.attrs and \
+                 func.attrs.get("tir.is_scheduled", False):
                 sched_funcs[gv] = func
+            else:
+                unsched_funcs[gv] = func
 
-        # Schedule-rule kernels: full pipeline
         if sched_funcs:
             sm = tvm.IRModule(sched_funcs)
             sm = NormalizeScheduledIR(sm)
@@ -171,7 +207,16 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
         else:
             sm = tvm.IRModule({})
 
-        # TileLang DSL kernels: skip NormalizeScheduledIR (already scheduled)
+        if unsched_funcs:
+            logger.warning(
+                "Unscheduled TIR functions: %s — likely to fail GPU VerifyMemory.",
+                list(unsched_funcs.keys()))
+            um = tvm.IRModule(unsched_funcs)
+            um = LowerAndLegalize(um, full_target)
+            um = OptimizeForTarget(um, full_target)
+        else:
+            um = tvm.IRModule({})
+
         if tl_funcs:
             tm = tvm.IRModule(tl_funcs)
             tm = LowerAndLegalize(tm, full_target)
@@ -179,20 +224,19 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
         else:
             tm = tvm.IRModule({})
 
-        # Merge
         km = tvm.IRModule({})
         for gv, func in sm.functions.items():
             km[gv] = func
         for gv, func in tm.functions.items():
             km[gv] = func
+        for gv, func in um.functions.items():
+            km[gv] = func
 
-    # After OptimizeForTarget, functions are split into host wrappers + device kernels
     _is_host = get_host_call(False)
     _is_device = get_device_call(False)
     khost = tir.transform.Filter(_is_host)(km)
     kdevice = tir.transform.Filter(_is_device)(km)
 
-    # TileLang codegen: proper CUTLASS headers, half-precision support
     device_rt = device_codegen(kdevice, full_target)
     host_rt = host_codegen(khost, target_host)
     host_rt.import_module(device_rt)
@@ -208,7 +252,8 @@ def _compile_tir_for_vm(tir_mod: tvm.IRModule, target: Target) -> runtime.Module
        → Compiled via TileLang (NormalizeScheduledIR + LowerAndLegalize +
          OptimizeForTarget + TileLang CUDA codegen)
 
-    2. **Host-only scalar functions** (from ComputePrimValue for symbolic shapes)
+    2. **Host-only scalar functions** (from ComputePrimValue for symbolic
+       shapes, or from LegalizeOps on scalar binops)
        → Compiled via standard TVM TIR pipeline (MakePackedAPI + LLVM codegen)
 
     BindTarget classifies them: host-only functions have ``tir.is_host_func``
@@ -218,7 +263,6 @@ def _compile_tir_for_vm(tir_mod: tvm.IRModule, target: Target) -> runtime.Module
     target_host = Target(target_host_str)
     full_target = Target(target, target_host)
 
-    # BindTarget classifies functions: kIsHostFunc → CPU target, others → CUDA
     tir_mod = tir.transform.BindTarget(full_target)(tir_mod)
 
     kernel_mod = tir.transform.Filter(lambda f: not _is_host_target(f))(tir_mod)
@@ -253,6 +297,7 @@ def build_vm_executable(
     relax_mod: tvm.IRModule,
     target: Target,
     fallback_calls: dict = None,
+    use_cuda_graph: bool = False,
 ) -> relax.vm_build.VMExecutable:
     """Build a Relax VM executable from a Relax module.
 
@@ -272,7 +317,7 @@ def build_vm_executable(
         _register_torch_fallbacks(fallback_calls)
 
     # Step 1: TileLang's Relax optimization pipeline
-    mod = run_pipeline(relax_mod, target)
+    mod = run_pipeline(relax_mod, target, use_cuda_graph=use_cuda_graph)
 
     # Step 2: VM-specific lowering passes
     mod = _apply_vm_lowering(mod, target)
@@ -358,6 +403,7 @@ def build_vm_runner(
     fallback_calls: dict = None,
     func_name: str = "main",
     clone_output: bool = True,
+    use_cuda_graph: bool = False,
 ) -> VMRunner:
     """Build and return a torch-callable VM runner.
 
@@ -381,6 +427,7 @@ def build_vm_runner(
         A callable that takes torch tensors and returns torch tensors.
     """
     device = tvm.cuda() if "cuda" in str(target) else tvm.cpu()
-    vm_exe = build_vm_executable(relax_mod, target, fallback_calls)
+    vm_exe = build_vm_executable(relax_mod, target, fallback_calls,
+                                 use_cuda_graph=use_cuda_graph)
     logger.info("VM runner built for %s on %s", func_name, device)
     return VMRunner(vm_exe, device, func_name, clone_output=clone_output)

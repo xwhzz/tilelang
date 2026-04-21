@@ -2,9 +2,9 @@ from tilelang import tvm
 
 from . import _ffi_api
 
-TVMSchedule = tvm.tir.Schedule
-LoopRV = tvm.tir.schedule.LoopRV
-BlockRV = tvm.tir.schedule.BlockRV
+from tvm.tir import Schedule as TVMSchedule
+
+from tvm.tir.schedule import LoopRV, BlockRV
 
 
 class Schedule(TVMSchedule):
@@ -71,6 +71,7 @@ class Schedule(TVMSchedule):
         transform: str = "",
         cache_dtype: str = "",
         disable_tma: bool = False,
+        consumer_blocks: list[BlockRV] | None = None,
     ) -> None:
         """Insert a cached copy of a read buffer at the specified loop level.
 
@@ -102,6 +103,14 @@ class Schedule(TVMSchedule):
             so that the lowering pipeline uses SIMT copy instead of TMA
             even on Hopper targets.  Useful when SIMT copy with swizzled
             shared memory outperforms TMA (e.g. transpose).
+        consumer_blocks : list[BlockRV] | None
+            Optional list of EXTRA sibling blocks that also read the same
+            buffer and should share this cache.  Use this when multiple
+            blocks under the same loop read the same source — one call to
+            cache_read_at creates a single cache whose region is the union
+            of all consumers' accesses, and rewrites every listed block's
+            references to point at the cache.  The primary ``block`` is
+            always included automatically; pass only the extras here.
         """
         _ffi_api.ScheduleCacheReadAt(
             self,
@@ -112,6 +121,7 @@ class Schedule(TVMSchedule):
             transform,
             cache_dtype,
             disable_tma,
+            consumer_blocks or [],
         )
 
     def cache_write_at(

@@ -32,11 +32,13 @@ class _BackendConfig:
     def __init__(self):
         self.extern_dispatch: Callable[..., bool] | None = None
         self.vm_clone_output: bool = True  # Clone VM outputs (False for benchmarking)
+        self.use_cuda_graph: bool = False  # Capture static regions as CUDA graphs (WIP)
 
     def reset(self):
         """Restore all options to defaults."""
         self.extern_dispatch = None
         self.vm_clone_output = True
+        self.use_cuda_graph = False
 
 
 backend_config = _BackendConfig()
@@ -68,13 +70,18 @@ def tilelang_backend(
         return cached
 
     # Cold compile
-    target = _detect_target(example_inputs)
-    tensor_inputs = [inp for inp in example_inputs if isinstance(inp, torch.Tensor)]
-    relax_mod, fallback_calls = fx_to_relax(gm, tensor_inputs, extern_dispatch=dispatch)
+    try:
+        target = _detect_target(example_inputs)
+        tensor_inputs = [inp for inp in example_inputs if isinstance(inp, torch.Tensor)]
+        relax_mod, fallback_calls = fx_to_relax(gm, tensor_inputs, extern_dispatch=dispatch)
 
-    from tilelang.graph.vm_build import build_vm_runner
-    wrapper = build_vm_runner(relax_mod, target, fallback_calls=fallback_calls,
-                             clone_output=backend_config.vm_clone_output)
+        from tilelang.graph.vm_build import build_vm_runner
+        wrapper = build_vm_runner(relax_mod, target, fallback_calls=fallback_calls,
+                                 clone_output=backend_config.vm_clone_output,
+                                 use_cuda_graph=backend_config.use_cuda_graph)
+    except Exception:
+        logger.error("tilelang_backend compilation failed", exc_info=True)
+        raise
 
     graph_cache.put_memory_cached(key, wrapper)
     return wrapper

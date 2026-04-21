@@ -1,11 +1,13 @@
 """Convert PyTorch FX graph to Relax IR with automatic dtype cast insertion."""
 
 import logging
+import operator
 
 import torch
 from torch import fx
 from torch.fx.experimental.symbolic_shapes import is_symbolic
 
+import tilelang.language as T
 from tilelang import tvm as tvm
 from tvm import relax, tir
 from tvm.relax.frontend.torch.fx_translator import TorchFXImporter
@@ -13,6 +15,56 @@ from tvm.relax.frontend.torch.fx_translator import TorchFXImporter
 from tilelang.graph.utils import torch_dtype_to_tvm
 
 logger = logging.getLogger(__name__)
+
+_K_OPAQUE = 8
+
+_INDEX_COPY_KERNEL_CACHE: dict = {}
+
+
+def _build_index_copy_kernel(
+    x_shape: tuple,
+    src_shape: tuple,
+    dim: int,
+    dtype: str,
+    idx_dtype: str,
+) -> tir.PrimFunc:
+    """Build an in-place ``index_copy_`` kernel for the 1-element index case.
+
+    The output buffer is aliased to ``data`` at the call site via
+    ``call_tir_inplace``, so the kernel only writes the single row at
+    axis ``dim`` position ``index[0]`` — no full-tensor copy.
+    """
+    key = (tuple(x_shape), tuple(src_shape), dim, dtype, idx_dtype)
+    cached = _INDEX_COPY_KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    M = 1
+    for s in x_shape[:dim]:
+        M *= s
+    tail = 1
+    for s in x_shape[dim + 1:]:
+        tail *= s
+    S = x_shape[dim]
+    threads = min(1024, max(32, tail))
+
+    @T.prim_func
+    def kernel(
+        data: T.Tensor(x_shape, dtype),
+        index: T.Tensor((1,), idx_dtype),
+        source: T.Tensor(src_shape, dtype),
+    ):
+        src_flat = T.Tensor((M, tail), dtype, source.data)
+        data_flat = T.Tensor((M, S, tail), dtype, data.data)
+        with T.Kernel(M, threads=threads) as bm:
+            for t in T.Parallel(tail):
+                data_flat[bm, T.cast(index[0], "int32"), t] = src_flat[bm, t]
+
+    func = kernel.with_attr("tir.is_scheduled", True)
+    func = func.with_attr("tir.is_tilelang_kernel", True)
+    func = func.with_attr("op_pattern", _K_OPAQUE)
+    _INDEX_COPY_KERNEL_CACHE[key] = func
+    return func
 
 
 class SymbolicShapeEnv:
@@ -131,6 +183,23 @@ class TileLangFXImporter(TorchFXImporter):
         axis = node.kwargs.get("dim", 0)
         return self.block_builder.emit(relax.op.concat(non_empty, axis=axis))
 
+    def _sum(self, node: fx.Node) -> relax.Var:
+        """Override upstream ``_sum`` to accept ``dim``/``keepdim`` as kwargs.
+
+        ``BaseFXGraphImporter._sum`` only inspects positional ``args``, so the
+        kwarg form (``torch.sum(x, dim=-1)`` / ``aten.sum.dim_IntList``) silently
+        drops ``dim`` and reduces over all axes, producing a scalar.
+        """
+        args = self.retrieve_args(node)
+        dim = node.kwargs.get("dim", None)
+        keepdim = node.kwargs.get("keepdim", False)
+        if len(args) >= 2:
+            dim = args[1]
+        if len(args) >= 3:
+            keepdim = args[2]
+        return self.block_builder.emit(
+            relax.op.sum(args[0], dim, keepdims=keepdim))
+
     def _item(self, node: fx.Node) -> relax.Expr:
         """Handle .item() — extract scalar from 0-dim or 1-element tensor."""
         x = self.env[node.args[0]]
@@ -142,11 +211,93 @@ class TileLangFXImporter(TorchFXImporter):
                 return x
         return self.block_builder.emit(relax.op.take(x, relax.const(0, "int64"), axis=0))
 
+    def _index_copy_(self, node: fx.Node) -> relax.Expr:
+        """Handle ``tensor.index_copy_(dim, index, source)``.
+
+        Specialised for the static single-index case (cache_position
+        during decode); other cases fall back to torch.  Topi's
+        ``scatter_elements`` builds with ``te.extern`` which produces
+        raw TIR that no GPU schedule rule can handle, so we emit a
+        TileLang DSL kernel directly via ``call_tir_inplace`` to avoid
+        the full-tensor copy.
+        """
+        args = self.retrieve_args(node)
+        x, dim, index, source = args[0], args[1], args[2], args[3]
+
+        x_sinfo = x.struct_info_ if hasattr(x, "struct_info_") else None
+        idx_sinfo = index.struct_info_ if hasattr(index, "struct_info_") else None
+        src_sinfo = source.struct_info_ if hasattr(source, "struct_info_") else None
+
+        if not (isinstance(x_sinfo, relax.TensorStructInfo)
+                and isinstance(idx_sinfo, relax.TensorStructInfo)
+                and isinstance(src_sinfo, relax.TensorStructInfo)):
+            return self._emit_torch_fallback(node)
+        if x_sinfo.shape is None or src_sinfo.shape is None or idx_sinfo.shape is None:
+            return self._emit_torch_fallback(node)
+
+        try:
+            x_shape = [int(s) for s in x_sinfo.shape]
+            src_shape = [int(s) for s in src_sinfo.shape]
+            idx_shape = [int(s) for s in idx_sinfo.shape]
+        except (TypeError, ValueError):
+            return self._emit_torch_fallback(node)
+
+        if dim < 0:
+            dim += len(x_shape)
+        if not (0 <= dim < len(x_shape)):
+            return self._emit_torch_fallback(node)
+        if len(src_shape) != len(x_shape):
+            return self._emit_torch_fallback(node)
+        if idx_shape != [1] or src_shape[dim] != 1:
+            return self._emit_torch_fallback(node)
+        for i, (xs, ss) in enumerate(zip(x_shape, src_shape)):
+            if i != dim and xs != ss:
+                return self._emit_torch_fallback(node)
+
+        dtype = x_sinfo.dtype
+        prim_func = _build_index_copy_kernel(
+            tuple(x_shape), tuple(src_shape), dim, dtype, idx_sinfo.dtype)
+
+        gvar = self.block_builder.add_func(prim_func, "index_copy_tir")
+        out_sinfo = relax.TensorStructInfo(x_shape, dtype)
+        result = self.block_builder.emit(
+            relax.op.call_tir_inplace(
+                gvar, [x, index, source],
+                inplace_indices=0,
+                out_sinfo=out_sinfo))
+
+        # Propagate in-place mutation: subsequent FX nodes may read the
+        # original input var, which Dynamo has not rebound to result.
+        self.env[node.args[0]] = result
+        return result
+
     def __init__(self, *args, extern_dispatch=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.fallback_calls: dict[str, tuple] = {}
         self.extern_dispatch = extern_dispatch or default_extern_dispatch
         self.sym_env = SymbolicShapeEnv()
+
+        self.convert_map["add_"] = self._binary_op(relax.op.add, operator.add)
+        self.convert_map["index_copy_"] = self._index_copy_
+        self.convert_map["linear"] = self._linear_with_bias_cast
+
+    def _linear_with_bias_cast(self, node):
+        """Override base _linear to cast bias to out_dtype before add.
+
+        The base converter calls ``relax.op.linear(x, w, bias, "float32")``
+        which produces an fp32 matmul output + fp16 bias, triggering a
+        dtype-mismatch error in ``R.add``.  We cast the bias to fp32 first.
+        """
+        args = self.retrieve_args(node)
+        x = args[0]
+        weight = args[1]
+        bias = args[2] if len(args) > 2 else None
+        out_dtype = "float32"
+        if bias is not None:
+            bias_si = bias.struct_info if hasattr(bias, "struct_info") else None
+            if bias_si is not None and hasattr(bias_si, "dtype") and bias_si.dtype != out_dtype:
+                bias = self.block_builder.emit(relax.op.astype(bias, out_dtype))
+        return self.block_builder.emit(relax.op.linear(x, weight, bias, out_dtype))
 
     def _convert_or_fallback(self, node: fx.Node, key):
         """Try the converter for key; extern-dispatch ops fallback to torch."""

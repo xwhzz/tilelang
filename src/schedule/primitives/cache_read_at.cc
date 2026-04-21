@@ -40,6 +40,8 @@
 #include <tvm/tir/op.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include <unordered_set>
+
 // TVM internal headers (included via ${TVM_SOURCE}/src in the include path)
 #include "tir/schedule/analysis.h"
 #include "tir/schedule/transform.h"
@@ -115,17 +117,22 @@ static Stmt BuildSquareInplaceStmt(const Buffer &dst,
 class CacheBufferReplacer : public StmtExprMutator {
 public:
   // kept_dims: indices of original dimensions that are kept (not squeezed).
+  // target_blocks: the set of consumer BlockNodes whose src accesses should
+  //   be rewritten to dst.  An empty set means "rewrite everything under the
+  //   loop" (legacy caller behaviour).  A non-empty set scopes the rewrite
+  //   to those blocks only, allowing one CacheReadAt call to redirect
+  //   multiple independent consumer blocks to a shared cache.
   CacheBufferReplacer(const Buffer &src, const Buffer &dst,
                       const ffi::Array<PrimExpr> &region_mins,
                       const std::vector<int> &kept_dims,
                       ffi::Map<Block, Block> *block_sref_reuse,
-                      const BlockNode *target_block = nullptr)
+                      const std::unordered_set<const BlockNode *> &target_blocks)
       : src_(src), dst_(dst), region_mins_(region_mins), kept_dims_(kept_dims),
-        block_sref_reuse_(block_sref_reuse), target_block_(target_block),
-        block_only_(target_block != nullptr), in_target_scope_(false) {}
+        block_sref_reuse_(block_sref_reuse), target_blocks_(target_blocks),
+        block_only_(!target_blocks.empty()), target_scope_depth_(0) {}
 
 private:
-  bool ShouldRewriteAccess() const { return !block_only_ || in_target_scope_; }
+  bool ShouldRewriteAccess() const { return !block_only_ || target_scope_depth_ > 0; }
 
   bool ValueUsesDstBuffer(const PrimExpr &expr) const {
     bool found = false;
@@ -179,9 +186,10 @@ private:
   }
 
   Stmt VisitStmt_(const BlockNode *_block) final {
-    bool prev_in_target_scope = in_target_scope_;
-    if (block_only_ && _block == target_block_) {
-      in_target_scope_ = true;
+    bool entered_target_scope = false;
+    if (block_only_ && target_blocks_.count(_block) != 0) {
+      ++target_scope_depth_;
+      entered_target_scope = true;
     }
     Block old_block = ffi::GetRef<Block>(_block);
     Block block = Downcast<Block>(StmtExprMutator::VisitStmt_(_block));
@@ -192,7 +200,9 @@ private:
     }
     Block new_block(n);
     block_sref_reuse_->Set(old_block, new_block);
-    in_target_scope_ = prev_in_target_scope;
+    if (entered_target_scope) {
+      --target_scope_depth_;
+    }
     return new_block;
   }
 
@@ -220,9 +230,9 @@ private:
   const ffi::Array<PrimExpr> &region_mins_;
   const std::vector<int> &kept_dims_;
   ffi::Map<Block, Block> *block_sref_reuse_;
-  const BlockNode *target_block_;
+  std::unordered_set<const BlockNode *> target_blocks_;
   bool block_only_;
-  bool in_target_scope_;
+  int target_scope_depth_;
 };
 
 static ffi::Array<Range>
@@ -351,7 +361,8 @@ static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
                         const ffi::String &storage_scope,
                         const ffi::String &transform,
                         const ffi::String &cache_dtype,
-                        bool disable_tma = false) {
+                        bool disable_tma = false,
+                        const ffi::Array<StmtSRef> &consumer_block_srefs = {}) {
   // ---- Step 1: Obtain source buffer and loop --------------------------------
   const BlockNode *block = TVM_SREF_TO_BLOCK(block_sref);
   Block block_ref = ffi::GetRef<Block>(block);
@@ -360,29 +371,71 @@ static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
 
   const ForNode *loop = TVM_SREF_TO_FOR(loop_sref);
 
-  // ---- Step 2: Gather inner-loop domains and block bindings -----------------
-  BlockRealize realize = GetBlockRealize(self, block_sref);
-  ffi::Map<Var, PrimExpr> bindings = GetBindings(realize);
+  // Primary + extra consumer block srefs whose src accesses should all be
+  // rewritten to use the shared cache.  The extras allow one CacheReadAt
+  // call to create a single cache buffer shared across multiple sibling
+  // blocks under the same loop (e.g. sum_x and sum_x_sq reductions that
+  // both read x).
+  std::vector<StmtSRef> all_consumer_srefs;
+  all_consumer_srefs.push_back(block_sref);
+  for (const StmtSRef &extra_sref : consumer_block_srefs) {
+    const BlockNode *extra_block = TVM_SREF_TO_BLOCK(extra_sref);
+    if (extra_block != block) {
+      all_consumer_srefs.push_back(extra_sref);
+    }
+  }
 
+  // ---- Step 2: Gather inner-loop domains and block bindings -----------------
   runtime::StorageScope scope = runtime::StorageScope::Create(storage_scope);
-  ffi::Map<Var, arith::IntSet> var_dom =
-      arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
-          /*low_inclusive=*/ffi::GetRef<StmtSRef>(
-              self->stmt2ref.at(block)->parent),
-          /*high_exclusive=*/loop_sref,
-          /*extra_relax_scope=*/scope));
+
+  // Verify that `loop_sref` is an ancestor of every consumer block.  Without
+  // this, the walk inside LoopDomainOfSRefTreePathSkipBlocks could run past
+  // the target loop and dereference a null parent pointer.
+  for (const StmtSRef &cb_sref : all_consumer_srefs) {
+    bool found = false;
+    for (const StmtSRefNode *p = cb_sref->parent; p != nullptr;
+         p = p->parent) {
+      if (p == loop_sref.get()) {
+        found = true;
+        break;
+      }
+    }
+    ICHECK(found)
+        << "ValueError: cache_read_at requires the target loop to be an "
+        << "ancestor of every consumer block.  When sharing a cache across "
+        << "sibling consumers (via consumer_blocks), pass their common "
+        << "ancestor loop, not a per-consumer inner loop.";
+  }
 
   // ---- Step 3: Relax the buffer read region over the inner loops ------------
+  // Union the relaxed read regions of EVERY consumer block so the shared
+  // cache covers all accessed slices of src.
   std::vector<NDIntSet> relaxed_regions;
-  for (const BufferRegion &buffer_region : block->reads) {
-    if (buffer_region->buffer.same_as(src)) {
-      ffi::Array<arith::IntSet> relaxed =
-          arith::EvalSet(Substitute(buffer_region->region, bindings), var_dom);
-      relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
+  std::vector<const BlockNode *> all_consumer_blocks;
+  for (const StmtSRef &cb_sref : all_consumer_srefs) {
+    const BlockNode *cb = TVM_SREF_TO_BLOCK(cb_sref);
+    all_consumer_blocks.push_back(cb);
+    BlockRealize cb_realize = GetBlockRealize(self, cb_sref);
+    ffi::Map<Var, PrimExpr> cb_bindings = GetBindings(cb_realize);
+    ffi::Map<Var, arith::IntSet> cb_var_dom =
+        arith::AsIntSet(LoopDomainOfSRefTreePathSkipBlocks(
+            /*low_inclusive=*/ffi::GetRef<StmtSRef>(cb_sref->parent),
+            /*high_exclusive=*/loop_sref,
+            /*extra_relax_scope=*/scope));
+    for (const BufferRegion &buffer_region : cb->reads) {
+      if (buffer_region->buffer.same_as(src)) {
+        ffi::Array<arith::IntSet> relaxed = arith::EvalSet(
+            Substitute(buffer_region->region, cb_bindings), cb_var_dom);
+        relaxed_regions.push_back({relaxed.begin(), relaxed.end()});
+      }
     }
   }
   ICHECK(!relaxed_regions.empty()) << "ValueError: buffer " << src->name
                                    << " is not read in the specified block";
+
+  // Keep `bindings` as the primary block's bindings for backwards-compat
+  // paths below that still reference it.
+  ffi::Map<Var, PrimExpr> bindings = GetBindings(GetBlockRealize(self, block_sref));
 
   // Union all relaxed regions
   NDIntSet unified = support::NDIntSetUnion(relaxed_regions);
@@ -484,12 +537,13 @@ static void CacheReadAt(ScheduleState self, const StmtSRef &loop_sref,
     square_stmt = BuildSquareInplaceStmt(dst, squeezed_shape);
   }
 
-  // ---- Step 6: Rewrite buffer references in the target consumer block -------
+  // ---- Step 6: Rewrite buffer references in every consumer block -----------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
+  std::unordered_set<const BlockNode *> target_block_set(
+      all_consumer_blocks.begin(), all_consumer_blocks.end());
   CacheBufferReplacer replacer(src, dst, region_mins, kept_dims,
-                               &block_sref_reuse,
-                               /*target_block=*/block);
+                               &block_sref_reuse, target_block_set);
   for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
     Stmt old_stmt = subtrees[i];
     subtrees.Set(i, Stmt(nullptr));
@@ -676,8 +730,9 @@ static void CacheWriteAt(ScheduleState self, const StmtSRef &loop_sref,
   // ---- Step 6: Rewrite buffer references in the loop body -------------------
   ffi::Array<Stmt> subtrees = AsArray(loop->body);
   ffi::Map<Block, Block> block_sref_reuse;
+  std::unordered_set<const BlockNode *> empty_target_set;
   CacheBufferReplacer replacer(src, dst, region_mins, kept_dims,
-                               &block_sref_reuse);
+                               &block_sref_reuse, empty_target_set);
   for (int i = 0; i < static_cast<int>(subtrees.size()); ++i) {
     Stmt old_stmt = subtrees[i];
     subtrees.Set(i, Stmt(nullptr));
@@ -973,10 +1028,15 @@ TVM_FFI_STATIC_INIT_BLOCK() {
       [](Schedule self, const LoopRV &loop_rv, const BlockRV &block_rv,
          int read_buffer_index, const ffi::String &storage_scope,
          const ffi::String &transform, const ffi::String &cache_dtype,
-         bool disable_tma) {
+         bool disable_tma,
+         const ffi::Array<BlockRV> &consumer_block_rvs) {
+        ffi::Array<StmtSRef> consumer_block_srefs;
+        for (const BlockRV &rv : consumer_block_rvs) {
+          consumer_block_srefs.push_back(self->GetSRef(rv));
+        }
         CacheReadAt(self->state(), self->GetSRef(loop_rv),
                     self->GetSRef(block_rv), read_buffer_index, storage_scope,
-                    transform, cache_dtype, disable_tma);
+                    transform, cache_dtype, disable_tma, consumer_block_srefs);
       });
 
   refl::GlobalDef().def(
