@@ -11,7 +11,7 @@ residual_rmsnorm which has higher priority.
 from tvm.relax.dpl.pattern import wildcard, is_op
 from tvm import tir, te, relax
 
-from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.pattern_rewrite import make_pattern, InputInfo
 from tilelang.graph.utils import get_static_shape
 
 
@@ -116,5 +116,5 @@ def _rmsnorm_builder(inputs: dict[str, InputInfo], params: dict):
     return te.create_prim_func([x, w, out])
 
 
-register_pattern("rmsnorm", _rmsnorm_pattern,
-                 _rmsnorm_builder, check_fn=_rmsnorm_check)
+PATTERN = make_pattern("rmsnorm", _rmsnorm_pattern,
+                       _rmsnorm_builder, check_fn=_rmsnorm_check)

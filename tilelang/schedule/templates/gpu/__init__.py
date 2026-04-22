@@ -8,6 +8,7 @@ For CUDA/ROCm/Vulkan/Metal-specific rules, use `tvm.dlight.cuda/rocm/vulkan/meta
 from .fallback import Fallback  # noqa: F401
 from .element_wise_ndim import ElementWiseNDim  # noqa: F401
 from .general_reduction import GeneralReduction  # noqa: F401
+from .layernorm_like import LayerNormLike  # noqa: F401
 from .transpose import Transpose  # noqa: F401
 
 from .gemv import GEMV  # noqa: F401
@@ -19,6 +20,7 @@ def default_schedule_rules():
     return [
         Matmul(),
         GEMV(),
+        LayerNormLike(),     # Specialised two-reduction chain; try before GeneralReduction
         GeneralReduction(),  # Subsumes former Reduction
         Transpose(),
         ElementWiseNDim(),   # Axis-walk (preserves N-D)

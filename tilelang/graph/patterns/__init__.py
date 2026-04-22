@@ -1,23 +1,33 @@
 """Built-in pattern rewriters for common LLM kernels.
 
-Importing this module registers all built-in patterns with the
-PatternRewritePass framework. Users can register additional patterns
-via ``register_pattern()`` from their own code.
+Each submodule exposes its pattern(s) as module-level constants of type
+:class:`tilelang.graph.pattern_rewrite._RegisteredPattern`, built via
+:func:`tilelang.graph.pattern_rewrite.make_pattern`.  ``DEFAULT_PATTERNS``
+is the ordered list used by the default pipeline; the order is also the
+matching priority.
 
-Active patterns (registration order = matching priority):
-  - residual_rmsnorm: add(hidden, residual) + RMSNorm → fused dual-output kernel
-  - rmsnorm: standalone RMSNorm → fused te.compute kernel
-  - layernorm: standalone LayerNorm → fused two-pass te.compute kernel
-  - fused_rope: reshape + permute + RoPE → single te.compute
-  - reshape_permute: (B,S,H*D) → reshape → permute → (B,H,S,D)
-  - permute_reshape: (B,H,S,D) → permute → reshape → (B,S,H*D)
+Callers compose their own list explicitly and pass it to
+:class:`PatternRewritePass`::
+
+    from tilelang.graph.patterns import DEFAULT_PATTERNS
+    PatternRewritePass(DEFAULT_PATTERNS)
+
+To use a subset or add your own pattern, build a list::
+
+    from tilelang.graph.patterns import DEFAULT_PATTERNS
+    from tilelang.graph.pattern_rewrite import make_pattern
+    custom = make_pattern(...)
+    PatternRewritePass(DEFAULT_PATTERNS + [custom])
 """
 
-from . import residual_rmsnorm  # noqa: F401
-from . import rmsnorm  # noqa: F401
-# from . import layernorm  # noqa: F401
-# from . import softmax  # noqa: F401
-# from . import sum  # noqa: F401
-# from . import mean  # noqa: F401
-from . import fused_rope  # noqa: F401
-from . import reshape_transpose  # noqa: F401
+from . import residual_rmsnorm, rmsnorm, fused_rope, reshape_transpose
+
+DEFAULT_PATTERNS = [
+    residual_rmsnorm.PATTERN,
+    rmsnorm.PATTERN,
+    fused_rope.PATTERN,
+    reshape_transpose.RESHAPE_PERMUTE,
+    reshape_transpose.PERMUTE_RESHAPE,
+]
+
+__all__ = ["DEFAULT_PATTERNS"]

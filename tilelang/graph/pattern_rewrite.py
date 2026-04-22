@@ -50,8 +50,8 @@ TIR Attributes
 
 Usage::
 
-    register_pattern("my_pattern", pattern_fn, builder_fn, check_fn)
-    # In pipeline: PatternRewritePass() before LegalizeOps
+    my_pattern = make_pattern("my_pattern", pattern_fn, builder_fn, check_fn)
+    # In pipeline: PatternRewritePass([my_pattern, ...]) before LegalizeOps
 """
 
 import logging
@@ -64,7 +64,7 @@ from tvm.relax.transform import FusionPattern
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Global registry
+# Pattern data types and factory
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -109,11 +109,8 @@ class InputInfo:
     dtype: str
 
 
-_REGISTRY: list[_RegisteredPattern] = []
-
-
-def register_pattern(name, pattern_fn, builder_fn, check_fn=None):
-    """Register a pattern for automatic replacement.
+def make_pattern(name, pattern_fn, builder_fn, check_fn=None):
+    """Build a reusable :class:`_RegisteredPattern` describing one rewrite.
 
     Parameters
     ----------
@@ -132,13 +129,13 @@ def register_pattern(name, pattern_fn, builder_fn, check_fn=None):
         Validate semantics of the matched subgraph and extract op-specific
         parameters (e.g. half_dim, axis). Return a dict of params on success,
         None to reject the match.
+
+    The returned object is plain data — pass it (usually several at once) to
+    :class:`PatternRewritePass` to activate.
     """
-    _REGISTRY.append(_RegisteredPattern(name, pattern_fn, builder_fn, check_fn))
+    return _RegisteredPattern(name, pattern_fn, builder_fn, check_fn)
 
 
-def clear_patterns():
-    """Remove all registered patterns."""
-    _REGISTRY.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -185,13 +182,17 @@ def _normalize_tir_for_fusion(tir_func):
 
 @tvm.transform.module_pass(opt_level=0, name="PatternRewritePass")
 class PatternRewritePass:
-    """Relax pass: match registered patterns and replace with call_tir.
+    """Relax pass: match an explicit list of patterns and replace with call_tir.
 
-    Place before ``LegalizeOps`` in the pipeline.
+    Place before ``LegalizeOps`` in the pipeline.  ``patterns`` is a list of
+    objects returned by :func:`make_pattern`.
     """
 
+    def __init__(self, patterns):
+        self._patterns = list(patterns)
+
     def transform_module(self, mod: tvm.IRModule, _ctx) -> tvm.IRModule:
-        if not _REGISTRY:
+        if not self._patterns:
             return mod
 
         main_func = None
@@ -218,7 +219,7 @@ class PatternRewritePass:
         # For each registered pattern, find all matches
         all_replacements = []  # (matched_var, input_infos, builder_fn, name)
 
-        for reg in _REGISTRY:
+        for reg in self._patterns:
             root_pat, annotations = reg.pattern_fn()
 
             # Build FusionPattern with optional check

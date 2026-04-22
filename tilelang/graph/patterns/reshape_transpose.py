@@ -9,7 +9,7 @@ Replaces with te.compute that does the reorder in one pass.
 from tvm.relax.dpl.pattern import wildcard, is_op
 from tvm import tir, te, relax
 
-from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.pattern_rewrite import make_pattern, InputInfo
 from tilelang.graph.utils import get_static_shape
 
 
@@ -103,8 +103,9 @@ def _permute_reshape_builder(inputs, params):
     return te.create_prim_func([x, out])
 
 
-# ── Register ──
-register_pattern("reshape_permute", _reshape_permute_pattern,
-                 _reshape_permute_builder, check_fn=_reshape_permute_check)
-register_pattern("permute_reshape", _permute_reshape_pattern,
-                 _permute_reshape_builder, check_fn=_permute_reshape_check)
+RESHAPE_PERMUTE = make_pattern("reshape_permute", _reshape_permute_pattern,
+                               _reshape_permute_builder,
+                               check_fn=_reshape_permute_check)
+PERMUTE_RESHAPE = make_pattern("permute_reshape", _permute_reshape_pattern,
+                               _permute_reshape_builder,
+                               check_fn=_permute_reshape_check)

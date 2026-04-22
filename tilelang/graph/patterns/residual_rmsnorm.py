@@ -11,7 +11,7 @@ from tvm.relax.dpl.pattern import wildcard, is_op
 from tvm import tir, relax
 
 import tilelang.language as T
-from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.pattern_rewrite import make_pattern, InputInfo
 from tilelang.graph.utils import get_static_shape
 
 
@@ -152,5 +152,6 @@ def _residual_rmsnorm_builder(inputs: dict[str, InputInfo], params: dict):
     return func
 
 
-register_pattern("residual_rmsnorm", _residual_rmsnorm_pattern,
-                 _residual_rmsnorm_builder, check_fn=_residual_rmsnorm_check)
+PATTERN = make_pattern("residual_rmsnorm", _residual_rmsnorm_pattern,
+                       _residual_rmsnorm_builder,
+                       check_fn=_residual_rmsnorm_check)

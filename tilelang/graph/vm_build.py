@@ -12,7 +12,7 @@ import logging
 import torch
 import tvm_ffi
 
-from tilelang import tvm as tvm
+from tilelang import tvm
 from tvm import relax, tir, runtime
 from tvm.runtime import from_dlpack as _tvm_from_dlpack
 from tvm.target import Target
@@ -173,64 +173,62 @@ def _is_host_target(func: tir.PrimFunc) -> bool:
 
 
 def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runtime.Module:
-    """Compile GPU kernel PrimFuncs through TileLang's full pipeline + codegen."""
+    """Compile GPU kernel PrimFuncs through TileLang's full pipeline + codegen.
+
+    Every GPU kernel that reaches this stage must be marked with exactly one of:
+      * ``tir.is_tilelang_kernel`` — DSL kernel, skips ``NormalizeScheduledIR``.
+      * ``tir.is_scheduled``       — schedule-rule kernel, runs the full pipeline.
+
+    An unmarked PrimFunc is treated as a bug (likely a schedule rule that
+    produced a TIR function without stamping ``tir.is_scheduled``, or a pattern
+    builder that forgot ``tir.is_tilelang_kernel``).
+    """
     target_host_str = "llvm" if runtime.enabled("llvm") else "c"
     target_host = Target(target_host_str)
     full_target = Target(target, target_host)
 
-    # Always define ENABLE_BF16 on the device compile line so bf16
-    # fallback headers (cuda_bf16_fallbacks.cuh) are pulled in; without
-    # this, kernels that touch bf16 fail to compile.
+    # Always define ENABLE_BF16 on the device compile line so bf16 fallback
+    # headers (cuda_bf16_fallbacks.cuh) are pulled in; without this, kernels
+    # that touch bf16 fail to compile.
     pass_configs = {"tl.device_compile_flags": ["-DENABLE_BF16"]}
     with tvm.transform.PassContext(opt_level=3, config=pass_configs), full_target:
-        # TileLang DSL kernels (tir.is_tilelang_kernel) skip NormalizeScheduledIR;
-        # schedule-rule kernels run the full pipeline; unscheduled funcs are a
-        # safety net (they typically fail GPU VerifyMemory).
-        tl_funcs = {}
         sched_funcs = {}
-        unsched_funcs = {}
+        tl_funcs = {}
+        unlabeled = []
         for gv, func in kernel_mod.functions.items():
-            if isinstance(func, tir.PrimFunc) and func.attrs and \
-               func.attrs.get("tir.is_tilelang_kernel", False):
+            if not isinstance(func, tir.PrimFunc):
+                continue
+            attrs = func.attrs
+            if attrs and attrs.get("tir.is_tilelang_kernel", False):
                 tl_funcs[gv] = func
-            elif isinstance(func, tir.PrimFunc) and func.attrs and \
-                 func.attrs.get("tir.is_scheduled", False):
+            elif attrs and attrs.get("tir.is_scheduled", False):
                 sched_funcs[gv] = func
             else:
-                unsched_funcs[gv] = func
+                unlabeled.append(gv.name_hint)
 
-        if sched_funcs:
-            sm = tvm.IRModule(sched_funcs)
-            sm = NormalizeScheduledIR(sm)
-            sm = LowerAndLegalize(sm, full_target)
-            sm = OptimizeForTarget(sm, full_target)
-        else:
-            sm = tvm.IRModule({})
-
-        if unsched_funcs:
-            logger.warning(
-                "Unscheduled TIR functions: %s — likely to fail GPU VerifyMemory.",
-                list(unsched_funcs.keys()))
-            um = tvm.IRModule(unsched_funcs)
-            um = LowerAndLegalize(um, full_target)
-            um = OptimizeForTarget(um, full_target)
-        else:
-            um = tvm.IRModule({})
-
-        if tl_funcs:
-            tm = tvm.IRModule(tl_funcs)
-            tm = LowerAndLegalize(tm, full_target)
-            tm = OptimizeForTarget(tm, full_target)
-        else:
-            tm = tvm.IRModule({})
+        if unlabeled:
+            raise RuntimeError(
+                "TIR kernels reached device codegen without "
+                "`tir.is_scheduled` or `tir.is_tilelang_kernel`: "
+                f"{unlabeled}. Fix the upstream schedule rule or pattern "
+                "builder to stamp the appropriate attribute."
+            )
 
         km = tvm.IRModule({})
-        for gv, func in sm.functions.items():
-            km[gv] = func
-        for gv, func in tm.functions.items():
-            km[gv] = func
-        for gv, func in um.functions.items():
-            km[gv] = func
+
+        def _run_lowering(funcs, *, normalize_scheduled):
+            if not funcs:
+                return
+            mod = tvm.IRModule(funcs)
+            if normalize_scheduled:
+                mod = NormalizeScheduledIR(mod)
+            mod = LowerAndLegalize(mod, full_target)
+            mod = OptimizeForTarget(mod, full_target)
+            for gv, func in mod.functions.items():
+                km[gv] = func
+
+        _run_lowering(sched_funcs, normalize_scheduled=True)
+        _run_lowering(tl_funcs, normalize_scheduled=False)
 
     _is_host = get_host_call(False)
     _is_device = get_device_call(False)

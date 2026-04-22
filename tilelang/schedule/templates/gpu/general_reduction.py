@@ -27,8 +27,6 @@ from .reduction_utils import (
     _is_direct_buffer_load,
     _is_square_of_buffer_load,
 )
-from .layernorm_like import LayerNormLike
-
 from tvm import tir
 from tvm.target import Target
 from tvm.dlight import normalize_prim_func, try_inline_contiguous_spatial
@@ -471,12 +469,6 @@ class GeneralReduction(GPUScheduleRule):
     ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
-
-        # LayerNorm-like two-reduction chains are handled by a dedicated rule
-        # to avoid fragile rewrite interactions in the generic template.
-        layernorm_schedule = LayerNormLike().apply(func, target, False)
-        if layernorm_schedule is not None:
-            return layernorm_schedule
 
         sch = TileSchedule(func)
         block_infos = normalize_prim_func(sch)

@@ -33,12 +33,14 @@ class _BackendConfig:
         self.extern_dispatch: Callable[..., bool] | None = None
         self.vm_clone_output: bool = True  # Clone VM outputs (False for benchmarking)
         self.use_cuda_graph: bool = False  # Capture static regions as CUDA graphs (WIP)
+        self.auto_fp32_promote: bool = True  # Match Inductor: run math ops at fp32 for fp16/bf16 inputs
 
     def reset(self):
         """Restore all options to defaults."""
         self.extern_dispatch = None
         self.vm_clone_output = True
         self.use_cuda_graph = False
+        self.auto_fp32_promote = True
 
 
 backend_config = _BackendConfig()

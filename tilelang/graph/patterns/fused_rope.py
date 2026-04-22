@@ -24,7 +24,7 @@ from tvm import tir, te, relax
 
 import tilelang.language as T
 from tilelang import tvm
-from tilelang.graph.pattern_rewrite import register_pattern, InputInfo
+from tilelang.graph.pattern_rewrite import make_pattern, InputInfo
 from tilelang.graph.utils import get_static_shape
 
 logger = logging.getLogger(__name__)
@@ -134,8 +134,8 @@ def _fused_rope_builder(inputs: dict[str, InputInfo], params: dict):
     return te.create_prim_func([x, cos_t, sin_t, out])
 
 
-register_pattern("fused_rope", _fused_rope_pattern, _fused_rope_builder,
-                 check_fn=_fused_rope_check)
+PATTERN = make_pattern("fused_rope", _fused_rope_pattern, _fused_rope_builder,
+                       check_fn=_fused_rope_check)
 
 
 # ---------------------------------------------------------------------------

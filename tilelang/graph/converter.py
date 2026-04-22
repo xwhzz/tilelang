@@ -18,6 +18,30 @@ logger = logging.getLogger(__name__)
 
 _K_OPAQUE = 8
 
+# Inductor's `register_pointwise_numeric*` list — pointwise transcendentals
+# whose Triton codegen computes at opmath (fp32) for fp16/bf16 inputs.  Source:
+# ``torch/_inductor/lowering.py`` ``register_pointwise_numeric*`` calls.
+_FP32_POINTWISE_OPS = frozenset({
+    "rsqrt", "exp", "exp2", "expm1", "sigmoid", "sqrt",
+    "cos", "sin", "log", "log1p", "tan", "tanh",
+    "reciprocal", "lgamma", "erf",
+})
+
+# Composite ops that decompose to transcendentals.  Promoted explicitly in case
+# torch.compile does not expand them before they reach this importer.
+_FP32_COMPOSITE_OPS = frozenset({
+    "gelu", "silu", "softplus", "softmax", "log_softmax",
+})
+
+# Matmul family: Inductor decomposes these with ``@pw_cast_for_opmath`` which
+# casts inputs to fp32.  We keep inputs in their original dtype (so tensor
+# cores are used) and force the matmul's ``out_dtype`` to fp32, which tensor
+# cores already compute internally via fp32 accumulation.  Numerically
+# equivalent to Inductor; faster in TileLang's CUDA codegen.
+_FP32_MATMUL_OPS = frozenset({"linear", "matmul", "mm", "bmm", "addmm"})
+
+_LOW_PRECISION_DTYPES = frozenset({"float16", "bfloat16"})
+
 _INDEX_COPY_KERNEL_CACHE: dict = {}
 
 
@@ -279,36 +303,136 @@ class TileLangFXImporter(TorchFXImporter):
 
         self.convert_map["add_"] = self._binary_op(relax.op.add, operator.add)
         self.convert_map["index_copy_"] = self._index_copy_
-        self.convert_map["linear"] = self._linear_with_bias_cast
+        self.convert_map["linear"] = self._linear_fp32_output
+        self.convert_map["matmul"] = self._matmul_fp32_output
+        self.convert_map["mm"] = self._matmul_fp32_output
+        self.convert_map["bmm"] = self._matmul_fp32_output
+        self.convert_map["addmm"] = self._addmm_fp32_output
 
-    def _linear_with_bias_cast(self, node):
-        """Override base _linear to cast bias to out_dtype before add.
+    # ------------------------------------------------------------------ matmul
+    # Inductor-equivalent semantics for low-precision float inputs (fp16/bf16):
+    # force ``out_dtype="float32"`` so downstream sees stable accumulation.
+    # Inputs stay in their original dtype so tensor cores handle the multiply;
+    # the fp32 accumulation happens inside the tensor core itself.
+    # For any other input dtype (fp32, fp64, int*, bool), output dtype tracks
+    # the inputs — an int32 matmul stays int32 end-to-end.
 
-        The base converter calls ``relax.op.linear(x, w, bias, "float32")``
-        which produces an fp32 matmul output + fp16 bias, triggering a
-        dtype-mismatch error in ``R.add``.  We cast the bias to fp32 first.
-        """
+    def _cast_to(self, expr: relax.Expr, dtype: str) -> relax.Expr:
+        sinfo = getattr(expr, "struct_info_", None)
+        if (isinstance(sinfo, relax.TensorStructInfo)
+                and sinfo.dtype == dtype):
+            return expr
+        return self.block_builder.emit(relax.op.astype(expr, dtype))
+
+    @staticmethod
+    def _matmul_out_dtype(*inputs) -> str | None:
+        """Return ``"float32"`` iff every tensor input is fp16 or bf16."""
+        dtypes = []
+        for x in inputs:
+            sinfo = getattr(x, "struct_info_", None)
+            if isinstance(sinfo, relax.TensorStructInfo):
+                dtypes.append(sinfo.dtype)
+        if not dtypes:
+            return None
+        if all(d in _LOW_PRECISION_DTYPES for d in dtypes):
+            return "float32"
+        return None
+
+    def _linear_fp32_output(self, node):
         args = self.retrieve_args(node)
-        x = args[0]
-        weight = args[1]
+        x, weight = args[0], args[1]
         bias = args[2] if len(args) > 2 else None
-        out_dtype = "float32"
-        if bias is not None:
-            bias_si = bias.struct_info if hasattr(bias, "struct_info") else None
-            if bias_si is not None and hasattr(bias_si, "dtype") and bias_si.dtype != out_dtype:
-                bias = self.block_builder.emit(relax.op.astype(bias, out_dtype))
-        return self.block_builder.emit(relax.op.linear(x, weight, bias, out_dtype))
+        out_dtype = self._matmul_out_dtype(x, weight)
+        if out_dtype is not None and bias is not None:
+            bias = self._cast_to(bias, out_dtype)
+        return self.block_builder.emit(
+            relax.op.linear(x, weight, bias, out_dtype))
+
+    def _matmul_fp32_output(self, node):
+        args = self.retrieve_args(node)
+        out_dtype = self._matmul_out_dtype(args[0], args[1])
+        return self.block_builder.emit(
+            relax.op.matmul(args[0], args[1], out_dtype=out_dtype))
+
+    def _addmm_fp32_output(self, node):
+        args = self.retrieve_args(node)
+        out_dtype = self._matmul_out_dtype(args[1], args[2])
+        product = self.block_builder.emit(
+            relax.op.matmul(args[1], args[2], out_dtype=out_dtype))
+        bias = args[0]
+        if out_dtype is not None:
+            bias = self._cast_to(bias, out_dtype)
+        return self.block_builder.emit(relax.op.add(bias, product))
+
+    # -------------------------------------------------------- fp32 promotion
+    def _should_promote_fp32(self, node: fx.Node, key) -> bool:
+        from tilelang.graph.backend import backend_config
+        if not getattr(backend_config, "auto_fp32_promote", True):
+            return False
+        if key in _FP32_MATMUL_OPS:
+            # Matmul handled by dedicated overrides (fp32 output, low-prec
+            # inputs preserved); do not additionally promote inputs.
+            return False
+        if key not in _FP32_POINTWISE_OPS and key not in _FP32_COMPOSITE_OPS:
+            return False
+        return self._inputs_are_low_precision(node)
+
+    def _inputs_are_low_precision(self, node: fx.Node) -> bool:
+        """True iff at least one tensor input has a low-precision dtype."""
+        for src in self._tensor_fx_inputs(node):
+            sinfo = getattr(self.env[src], "struct_info_", None)
+            if (isinstance(sinfo, relax.TensorStructInfo)
+                    and sinfo.dtype in _LOW_PRECISION_DTYPES):
+                return True
+        return False
+
+    def _tensor_fx_inputs(self, node: fx.Node) -> list[fx.Node]:
+        """FX nodes that (a) appear in args/kwargs and (b) are in env."""
+        seen = []
+        def _collect(v):
+            if isinstance(v, fx.Node) and v in self.env and v not in seen:
+                seen.append(v)
+            elif isinstance(v, (list, tuple)):
+                for item in v:
+                    _collect(item)
+        for a in node.args:
+            _collect(a)
+        for v in node.kwargs.values():
+            _collect(v)
+        return seen
+
+    def _call_with_fp32_promotion(self, converter, node: fx.Node) -> relax.Expr:
+        """Cast low-precision tensor inputs to fp32, call the converter, restore env."""
+        saved = {}
+        for src in self._tensor_fx_inputs(node):
+            expr = self.env[src]
+            sinfo = getattr(expr, "struct_info_", None)
+            if (isinstance(sinfo, relax.TensorStructInfo)
+                    and sinfo.dtype in _LOW_PRECISION_DTYPES):
+                saved[src] = expr
+                self.env[src] = self.block_builder.emit(
+                    relax.op.astype(expr, "float32"))
+        try:
+            return converter(node)
+        finally:
+            for src, expr in saved.items():
+                self.env[src] = expr
 
     def _convert_or_fallback(self, node: fx.Node, key):
         """Try the converter for key; extern-dispatch ops fallback to torch."""
         if self.extern_dispatch(node):
             return self._emit_torch_fallback(node)
-        if key in self.convert_map:
-            try:
-                result = self.convert_map[key](node)
-                return self._maybe_cast(node, result)
-            except Exception as e:
-                logger.debug("Converter failed for %s, falling back to torch: %s", key, e)
+        converter = self.convert_map.get(key)
+        if converter is None:
+            return self._emit_torch_fallback(node)
+        try:
+            if self._should_promote_fp32(node, key):
+                result = self._call_with_fp32_promotion(converter, node)
+            else:
+                result = converter(node)
+            return self._maybe_cast(node, result)
+        except Exception as e:
+            logger.debug("Converter failed for %s, falling back to torch: %s", key, e)
         return self._emit_torch_fallback(node)
 
     def _emit_torch_fallback(self, node: fx.Node) -> relax.Expr:

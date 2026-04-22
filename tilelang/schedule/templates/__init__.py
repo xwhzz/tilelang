@@ -34,7 +34,14 @@ def default_schedule_rules(target: Target | str):
         from .gpu import default_schedule_rules as _rules
         return _rules()
     if kind in _CPU_KINDS:
-        from .cpu import default_schedule_rules as _rules  # type: ignore[import-not-found]
+        try:
+            from .cpu import default_schedule_rules as _rules  # type: ignore[import-not-found]
+        except ImportError as e:
+            raise NotImplementedError(
+                f"Target kind {kind!r} is reserved for future CPU schedule "
+                "rules but tilelang.schedule.templates.cpu is not yet "
+                "implemented. Contributions welcome."
+            ) from e
         return _rules()
     raise ValueError(
         f"No default schedule rules registered for target kind {kind!r}. "
