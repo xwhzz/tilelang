@@ -717,15 +717,15 @@ def default_extern_dispatch(node: fx.Node, *, gemv_threshold: int = 1) -> bool:
         compiled = torch.compile(model, backend="tilelang")
         # Or via fx_to_relax(gm, inputs, extern_dispatch=my_dispatch)
     """
-    fn_name = node.target.__name__ if node.op == "call_function" else ""
-    if fn_name in ("scaled_dot_product_attention", "embedding"):
-        return True
+    # fn_name = node.target.__name__ if node.op == "call_function" else ""
+    # if fn_name in ("scaled_dot_product_attention", "embedding"):
+    #     return True
 
-    mnk = _get_matmul_mnk(node)
-    if mnk is not None:
-        M, N, K = mnk
-        # GEMV (M <= gemv_threshold) → TileLang; GEMM → cuBLAS
-        return M > gemv_threshold
+    # mnk = _get_matmul_mnk(node)
+    # if mnk is not None:
+    #     M, N, K = mnk
+    #     # GEMV (M <= gemv_threshold) → TileLang; GEMM → cuBLAS
+    #     return M > gemv_threshold
 
     return False
 
