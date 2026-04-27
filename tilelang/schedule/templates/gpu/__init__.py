@@ -12,12 +12,14 @@ from .layernorm_like import LayerNormLike  # noqa: F401
 from .transpose import Transpose  # noqa: F401
 
 from .gemv import GEMV  # noqa: F401
+from .indexed_gemv import IndexedGEMV  # noqa: F401
 from .matmul import Matmul  # noqa: F401
 
 
 def default_schedule_rules():
     """Return the default TileLang GPU rule order with generic fallback last."""
     return [
+        IndexedGEMV(),
         Matmul(),
         GEMV(),
         LayerNormLike(),     # Specialised two-reduction chain; try before GeneralReduction
