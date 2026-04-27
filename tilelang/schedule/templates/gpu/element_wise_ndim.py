@@ -27,6 +27,27 @@ def _largest_pow2_at_most(n: int) -> int:
     return p
 
 
+def _is_power_of_two(n: int) -> bool:
+    return n > 0 and (n & (n - 1)) == 0
+
+
+def _choose_inner_factor(
+    axis_extent: int,
+    suffix_extent: int,
+    max_factor: int,
+    num_threads: int,
+) -> int | None:
+    """Choose a split factor that avoids predicated tail tiles when possible."""
+    limit = min(axis_extent, max_factor)
+    for factor in range(limit, 0, -1):
+        if axis_extent % factor != 0:
+            continue
+        if (factor * suffix_extent) % num_threads != 0:
+            continue
+        return factor
+    return None
+
+
 def _choose_tile_and_threads(
     total: int,
     dtype_bits: int = 16,
@@ -79,6 +100,30 @@ def _dtype_bits(dtype: str) -> int:
         return int(tir.DataType(dtype).bits)
     except Exception:
         return 16
+
+
+def _has_cropped_read(block_stmt: tir.Block) -> bool:
+    """Return True for elementwise crops/slices whose input is larger than output.
+
+    The axis-walk schedule stages read buffers into local fragments.  For slice
+    patterns such as ``input[:, offset:offset+n] -> output[:, :n]`` that creates
+    fragment indices involving normalized expressions like ``v - block_offset``,
+    which currently trips TileLang layout inference.  Let the simple Fallback
+    rule handle these view/copy kernels without fragment caching.
+    """
+    if not block_stmt.writes:
+        return False
+    out_shape = block_stmt.writes[0].buffer.shape
+    for read in block_stmt.reads:
+        in_shape = read.buffer.shape
+        if len(in_shape) != len(out_shape):
+            continue
+        for in_dim, out_dim in zip(in_shape, out_shape):
+            in_extent = _as_const_int(in_dim)
+            out_extent = _as_const_int(out_dim)
+            if in_extent is not None and out_extent is not None and in_extent > out_extent:
+                return True
+    return False
 
 
 def _inline_to_single_block(sch):
@@ -162,6 +207,7 @@ class ElementWiseNDim(GPUScheduleRule):
         # dtype; for mixed-precision injective chains this is the
         # producer's precision, which dominates memory traffic.
         block_stmt = sch.get(block)
+        has_cropped_read = _has_cropped_read(block_stmt)
         if block_stmt.reads:
             dtype_bits = _dtype_bits(block_stmt.reads[0].buffer.dtype)
         elif block_stmt.writes:
@@ -196,13 +242,18 @@ class ElementWiseNDim(GPUScheduleRule):
                     cutoff = i
                     continue
                 need = selected_tile // acc
-                if need >= 2:
-                    # Allow non-divisible splits — the non-unit inner factor
-                    # combined with preserve_unit_iters=True causes TVM to
-                    # emit a T.where predicate, so the tail block is handled
-                    # correctly while the common case still gets vectorised
-                    # 128-bit loads.
-                    split_info = (i, need)
+                factor = _choose_inner_factor(
+                    extents[i],
+                    acc,
+                    need,
+                    NUM_THREADS,
+                )
+                if factor is not None:
+                    # Prefer factors that divide the split axis and make the
+                    # fused inner work a whole number of thread blocks.  This
+                    # avoids predicated tail tiles that TileLang layout
+                    # inference currently struggles to assign a layout for.
+                    split_info = (i, factor)
                 break
 
             walk_ok = split_info is not None or cutoff < len(s_loop_rvs)
@@ -235,9 +286,18 @@ class ElementWiseNDim(GPUScheduleRule):
             else:
                 outer_rvs = list(s_loop_rvs[:cutoff])
                 inner_rvs = list(s_loop_rvs[cutoff:])
+                inner_extents = extents[cutoff:]
 
             if not outer_rvs or not inner_rvs:
                 return None
+
+            if split_info is not None:
+                axis, factor = split_info
+                inner_extents = [factor] + extents[axis + 1:]
+            use_fragment_cache = (
+                not has_cropped_read
+                and all(_is_power_of_two(ext) for ext in inner_extents)
+            )
 
             # Fuse outer loops into blockIdx.x
             bx = outer_rvs[0] if len(outer_rvs) == 1 else sch.fuse(*outer_rvs)
@@ -248,11 +308,11 @@ class ElementWiseNDim(GPUScheduleRule):
             if o_loop_rvs:
                 sch.reorder(bx, inner, *o_loop_rvs)
 
-            # Fragment caching at blockIdx level
-            block_stmt = sch.get(block)
-            for i in range(len(block_stmt.reads)):
-                sch.cache_read_at(bx, block, i, "local.fragment")
-            sch.cache_write_at(bx, block, 0, "local.fragment")
+            if use_fragment_cache:
+                block_stmt = sch.get(block)
+                for i in range(len(block_stmt.reads)):
+                    sch.cache_read_at(bx, block, i, "local.fragment")
+                sch.cache_write_at(bx, block, 0, "local.fragment")
 
             sch.parallel(inner)
             sch.bind(bx, "blockIdx.x")
