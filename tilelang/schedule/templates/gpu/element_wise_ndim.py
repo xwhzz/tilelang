@@ -126,6 +126,36 @@ def _has_cropped_read(block_stmt: tir.Block) -> bool:
     return False
 
 
+def _has_broadcast_read(block_stmt: tir.Block) -> bool:
+    """Return True when an input broadcasts a unit axis over the output.
+
+    The axis-walk schedule can still bind the output iteration space for these
+    kernels, but staging broadcasted reads into ``local.fragment`` may introduce
+    vector ``tir.Broadcast`` index expressions during layout/legalization.  TVM's
+    late ``RenormalizeSplitPattern`` prover expects scalar integer index
+    arithmetic there and fails on those vector expressions.  Leave such reads in
+    global memory and only use the axis-walk loop mapping.
+    """
+    if not block_stmt.writes:
+        return False
+    out_shape = block_stmt.writes[0].buffer.shape
+    for read in block_stmt.reads:
+        in_shape = read.buffer.shape
+        if len(in_shape) != len(out_shape):
+            continue
+        for in_dim, out_dim in zip(in_shape, out_shape):
+            in_extent = _as_const_int(in_dim)
+            out_extent = _as_const_int(out_dim)
+            if (
+                in_extent is not None
+                and out_extent is not None
+                and in_extent == 1
+                and out_extent > 1
+            ):
+                return True
+    return False
+
+
 def _inline_to_single_block(sch):
     """Inline all blocks except the last, mirroring element_wise.py."""
     block_infos = normalize_prim_func(sch)
@@ -208,6 +238,8 @@ class ElementWiseNDim(GPUScheduleRule):
         # producer's precision, which dominates memory traffic.
         block_stmt = sch.get(block)
         has_cropped_read = _has_cropped_read(block_stmt)
+        if _has_broadcast_read(block_stmt):
+            return None
         if block_stmt.reads:
             dtype_bits = _dtype_bits(block_stmt.reads[0].buffer.dtype)
         elif block_stmt.writes:
