@@ -351,7 +351,17 @@ def _analyze_original_chain(sch: TileSchedule) -> tuple[str, list[str]] | None:
 
 
 class Matmul(GPUScheduleRule):
-    """Tile-first matmul scheduling with shared staging and fragment accumulation."""
+    """Tile-first matmul scheduling with shared staging and fragment accumulation.
+
+    Parameters
+    ----------
+    tile_override : tuple[int, int, int] | None
+        If set to (block_m, block_n, block_k), use these tile sizes instead
+        of the auto-selected ones.
+    """
+
+    def __init__(self, tile_override: tuple[int, int, int] | None = None):
+        self.tile_override = tile_override
 
     def apply(
         self,
@@ -409,7 +419,16 @@ class Matmul(GPUScheduleRule):
             if k_ext is not None and k_ext < 16:
                 return None
 
-            config = _choose_tile_config(target, block_stmt, has_epilogue=bool(epilogue_names))
+            if self.tile_override is not None:
+                config = _MatmulTileConfig(
+                    block_m=self.tile_override[0],
+                    block_n=self.tile_override[1],
+                    block_k=self.tile_override[2],
+                    num_stages=2,
+                    num_threads=128,
+                )
+            else:
+                config = _choose_tile_config(target, block_stmt, has_epilogue=bool(epilogue_names))
             epilogue_shared_scope = _choose_epilogue_shared_scope(target, use_tile_gemm)
 
             if epilogue_names:
@@ -503,7 +522,7 @@ class Matmul(GPUScheduleRule):
                     main_block,
                     transpose_a=transpose_a,
                     transpose_b=transpose_b,
-                    use_py=True,
+                    use_py=False,
                 )
                 if has_epilogue:
                     bridge_block = sch.get_block(materialize_block_name)
