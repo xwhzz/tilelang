@@ -10,7 +10,7 @@ from tilelang.graph.pattern_rewrite import PatternRewritePass
 from tilelang.graph.patterns import DEFAULT_PATTERNS
 from tilelang.graph.patterns.fused_rope import fuse_qk_rope_pass
 from tilelang.graph.passes import eliminate_reshape_kernels, fold_zero_binops
-from tilelang.relax import FuseTIR
+from tilelang.relax import FuseTIR, FuseChainedGemm
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +56,10 @@ def run_pipeline(mod: tvm.IRModule, target: Target,
         # from broadcast/shape legalisation, so re-run after.
         mod = _try_pass(mod, fold_zero_binops, "FoldZeroBinops_post_fuse")
         mod = _try_pass(mod, fuse_qk_rope_pass, "FuseQKRope")
+
+        # Fuse chained GEMMs so the intermediate tensor stays in shared
+        # memory.
+        mod = _try_pass(mod, FuseChainedGemm(), "FuseChainedGemm")
 
         # eliminate_reshape_kernels needs unscheduled TIR with original loop
         # structure, so run it before ApplyDefaultSchedule.

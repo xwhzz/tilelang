@@ -194,6 +194,7 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
     with tvm.transform.PassContext(opt_level=3, config=pass_configs), full_target:
         sched_funcs = {}
         tl_funcs = {}
+        lowered_funcs = {}
         unlabeled = []
         for gv, func in kernel_mod.functions.items():
             if not isinstance(func, tir.PrimFunc):
@@ -201,6 +202,8 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
             attrs = func.attrs
             if attrs and attrs.get("tir.is_tilelang_kernel", False):
                 tl_funcs[gv] = func
+            elif attrs and attrs.get("tir.is_lowered", False):
+                lowered_funcs[gv] = func
             elif attrs and attrs.get("tir.is_scheduled", False):
                 sched_funcs[gv] = func
             else:
@@ -209,7 +212,8 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
         if unlabeled:
             raise RuntimeError(
                 "TIR kernels reached device codegen without "
-                "`tir.is_scheduled` or `tir.is_tilelang_kernel`: "
+                "`tir.is_scheduled`, `tir.is_lowered`, or "
+                "`tir.is_tilelang_kernel`: "
                 f"{unlabeled}. Fix the upstream schedule rule or pattern "
                 "builder to stamp the appropriate attribute."
             )
@@ -229,6 +233,7 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
 
         _run_lowering(sched_funcs, normalize_scheduled=True)
         _run_lowering(tl_funcs, normalize_scheduled=False)
+        _run_lowering(lowered_funcs, normalize_scheduled=False)
 
     _is_host = get_host_call(False)
     _is_device = get_device_call(False)
