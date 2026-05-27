@@ -14,7 +14,7 @@ from tilelang.carver.matmul_analysis import auto_inline_producers, normalize_to_
 
 from ... import Schedule as TileSchedule
 from . import utils
-from .base import GPUScheduleRule
+from .base import GPUScheduleRule, spatial_tile_from_config
 
 from tvm import tir
 from tvm.target import Target
@@ -225,6 +225,36 @@ def _choose_tile_config(
     )
 
 
+def _override_tile_config(
+    config: _MatmulTileConfig,
+    block_stmt: tir.Block,
+    spatial_tile,
+) -> _MatmulTileConfig | None:
+    tile = spatial_tile_from_config(spatial_tile)
+    if tile is None:
+        return None
+    if len(tile) < 2:
+        return None
+    iter_extents = [_as_static_int(iter_var.dom.extent) for iter_var in block_stmt.iter_vars]
+    m_extent = iter_extents[1] if len(iter_extents) >= 4 else None
+    n_extent = iter_extents[2] if len(iter_extents) >= 4 else None
+    block_m = int(tile[-2])
+    block_n = int(tile[-1])
+    if m_extent is not None:
+        block_m = min(block_m, m_extent)
+    if n_extent is not None:
+        block_n = min(block_n, n_extent)
+    if block_m <= 0 or block_n <= 0:
+        return None
+    return _MatmulTileConfig(
+        block_m=block_m,
+        block_n=block_n,
+        block_k=config.block_k,
+        num_stages=config.num_stages,
+        num_threads=config.num_threads,
+    )
+
+
 def _is_injective_block(block_stmt: tir.Block) -> bool:
     return all(iter_var.iter_type == tir.IterVar.DataPar for iter_var in block_stmt.iter_vars)
 
@@ -373,11 +403,36 @@ class Matmul(GPUScheduleRule):
             return result
         return self._apply_impl(func, target, try_reverse_inline=False)
 
+    def apply_config(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        config,
+        _: bool = False,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
+            return None
+        result = self._apply_impl(
+            func,
+            target,
+            try_reverse_inline=True,
+            fixed_spatial_tile=config,
+        )
+        if result is not None:
+            return result
+        return self._apply_impl(
+            func,
+            target,
+            try_reverse_inline=False,
+            fixed_spatial_tile=config,
+        )
+
     def _apply_impl(
         self,
         func: tir.PrimFunc,
         target: Target,
         try_reverse_inline: bool = True,
+        fixed_spatial_tile=None,
     ) -> None | tir.Schedule | list[tir.Schedule]:
         try:
             sch = TileSchedule(func)
@@ -410,6 +465,10 @@ class Matmul(GPUScheduleRule):
                 return None
 
             config = _choose_tile_config(target, block_stmt, has_epilogue=bool(epilogue_names))
+            if fixed_spatial_tile is not None:
+                config = _override_tile_config(config, block_stmt, fixed_spatial_tile)
+                if config is None:
+                    return None
             epilogue_shared_scope = _choose_epilogue_shared_scope(target, use_tile_gemm)
 
             if epilogue_names:
@@ -503,7 +562,7 @@ class Matmul(GPUScheduleRule):
                     main_block,
                     transpose_a=transpose_a,
                     transpose_b=transpose_b,
-                    use_py=True,
+                    use_py=False,
                 )
                 if has_epilogue:
                     bridge_block = sch.get_block(materialize_block_name)
@@ -561,4 +620,3 @@ class Matmul(GPUScheduleRule):
             return sch
         except Exception:  # pylint: disable=broad-except
             return None
-

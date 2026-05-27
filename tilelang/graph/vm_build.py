@@ -18,7 +18,7 @@ from tvm.runtime import from_dlpack as _tvm_from_dlpack
 from tvm.target import Target
 
 from tilelang.graph.pipeline import run_pipeline
-from tilelang.engine.phase import NormalizeScheduledIR, LowerAndLegalize, OptimizeForTarget
+from tilelang.engine.phase import LowerAndLegalize, OptimizeForTarget
 from tilelang.engine.lower import (
     device_codegen,
     host_codegen,
@@ -216,19 +216,17 @@ def _compile_kernels_tilelang(kernel_mod: tvm.IRModule, target: Target) -> runti
 
         km = tvm.IRModule({})
 
-        def _run_lowering(funcs, *, normalize_scheduled):
+        def _run_lowering(funcs):
             if not funcs:
                 return
             mod = tvm.IRModule(funcs)
-            if normalize_scheduled:
-                mod = NormalizeScheduledIR(mod)
             mod = LowerAndLegalize(mod, full_target)
             mod = OptimizeForTarget(mod, full_target)
             for gv, func in mod.functions.items():
                 km[gv] = func
 
-        _run_lowering(sched_funcs, normalize_scheduled=True)
-        _run_lowering(tl_funcs, normalize_scheduled=False)
+        _run_lowering(sched_funcs)
+        _run_lowering(tl_funcs)
 
     _is_host = get_host_call(False)
     _is_device = get_device_call(False)

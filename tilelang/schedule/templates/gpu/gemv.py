@@ -15,7 +15,7 @@ from tilelang import tvm
 
 from ... import Schedule as TileSchedule
 from . import utils
-from .base import GPUScheduleRule
+from .base import GPUScheduleRule, spatial_tile_product_for_extents
 
 from tvm import tir
 from tvm.target import Target
@@ -177,6 +177,7 @@ class GEMV(GPUScheduleRule):
         matrix_buffer: tir.Buffer,
         vector_buffer: tir.Buffer,
         output_buffer: tir.Buffer,
+        fixed_spatial_tile=None,
     ) -> tir.Schedule | None:
         if not _can_use_tile_schedule(target, matrix_buffer, vector_buffer, output_buffer):
             return None
@@ -207,7 +208,6 @@ class GEMV(GPUScheduleRule):
                 sch.get(r).extent,
                 matrix_buffer.dtype,
             )
-
             # ---- Loop transforms ----
             bx = sch.fuse(batch, s)
 
@@ -335,4 +335,60 @@ class GEMV(GPUScheduleRule):
             matrix_buffer,
             vector_buffer,
             output_buffer,
+        )
+
+    def apply_config(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        config,
+        _: bool = False,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
+            return None
+
+        sch = TileSchedule(func)
+        block_infos = normalize_prim_func(sch)
+        block_infos = try_inline_contiguous_spatial(sch, block_infos)
+        if block_infos is None:
+            return None
+
+        epilogue_name = _find_epilogue_name(block_infos, sch)
+        if epilogue_name is None and len(block_infos) != 1:
+            return None
+
+        block_info = block_infos[0]
+        if len(block_info.iters) not in [2, 3]:
+            return None
+
+        block = block_info.block_rv
+        vector_input_buffers = is_gemv(sch, block_info)
+        if vector_input_buffers is None or len(vector_input_buffers) != 1:
+            return None
+
+        is_inner_reduction = normalize(sch, block_info)
+        if is_inner_reduction is None or not is_inner_reduction:
+            return None
+
+        block_stmt = sch.get(block)
+        if len(block_stmt.writes) != 1:
+            return None
+
+        vector_buffer = vector_input_buffers[0]
+        output_buffer = block_stmt.writes[0].buffer
+        matrix_buffer = None
+        for read_region in block_stmt.reads:
+            if not read_region.buffer.same_as(vector_buffer) and not read_region.buffer.same_as(output_buffer):
+                matrix_buffer = read_region.buffer
+                break
+        if matrix_buffer is None:
+            return None
+
+        return self._apply_tile_schedule(
+            func,
+            target,
+            matrix_buffer,
+            vector_buffer,
+            output_buffer,
+            fixed_spatial_tile=config,
         )
