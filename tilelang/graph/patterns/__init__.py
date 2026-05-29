@@ -23,11 +23,11 @@ To use a subset or add your own pattern, build a list::
 from . import residual_rmsnorm, rmsnorm, fused_rope, reshape_transpose
 
 DEFAULT_PATTERNS = [
-    residual_rmsnorm.PATTERN,
-    rmsnorm.PATTERN,
-    fused_rope.PATTERN,
-    reshape_transpose.RESHAPE_PERMUTE,
-    reshape_transpose.PERMUTE_RESHAPE,
+    # residual_rmsnorm.PATTERN,
+    # rmsnorm.PATTERN,
+    # fused_rope.PATTERN,
+    # reshape_transpose.RESHAPE_PERMUTE,
+    # reshape_transpose.PERMUTE_RESHAPE,
 ]
 
 __all__ = ["DEFAULT_PATTERNS"]

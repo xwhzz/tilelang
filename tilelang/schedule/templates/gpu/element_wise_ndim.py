@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from ... import Schedule as TileSchedule
-from .base import GPUScheduleRule
+from .base import (
+    GPUScheduleRule,
+    align_spatial_tile_to_extents,
+    spatial_tile_product_for_extents,
+)
 
 from tvm import tir
 from tvm.target import Target
@@ -73,11 +77,16 @@ def _choose_tile_and_threads(
 
     vec = max(1, 128 // dtype_bits)
     threads = 256
-    # Fall back to fewer threads only when the tensor is smaller than a
-    # single vectorised block; the outer guard (total >= 1024) makes this
-    # almost never fire, but keep it for safety.
-    while threads > 32 and threads * vec > total:
-        threads //= 2
+    if threads % total != 0:
+        threads = total
+        vec = 1
+    else:
+        # Fall back to fewer threads only when the tensor is smaller than a
+        # single vectorised block; the outer guard (total >= 1024) makes this
+        # almost never fire, but keep it for safety.
+        
+        while threads > 32 and threads * vec > total:
+            threads //= 2
 
     # ept = vec locks one 128-bit (``uint4``-class) global load per
     # thread per input buffer.  Doubling to 2*vec was explored but
@@ -202,6 +211,23 @@ class ElementWiseNDim(GPUScheduleRule):
         target: Target,
         _: bool,
     ) -> None | tir.Schedule | list[tir.Schedule]:
+        return self._apply_impl(func, target)
+
+    def apply_config(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        config,
+        _: bool = False,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        return self._apply_impl(func, target, fixed_spatial_tile=config)
+
+    def _apply_impl(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        fixed_spatial_tile=None,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
 
@@ -248,9 +274,18 @@ class ElementWiseNDim(GPUScheduleRule):
             dtype_bits = 16
         n_buffers = len(block_stmt.reads) + len(block_stmt.writes)
 
-        TILE, NUM_THREADS = _choose_tile_and_threads(
-            total, dtype_bits=dtype_bits, n_buffers=n_buffers,
-        )
+        if fixed_spatial_tile is None:
+            TILE, NUM_THREADS = _choose_tile_and_threads(
+                total, dtype_bits=dtype_bits, n_buffers=n_buffers,
+            )
+        else:
+            TILE = spatial_tile_product_for_extents(fixed_spatial_tile, extents)
+            if TILE is None:
+                return None
+            TILE = min(TILE, total)
+            _, NUM_THREADS = _choose_tile_and_threads(
+                total, dtype_bits=dtype_bits, n_buffers=n_buffers,
+            )
 
         # --- Axis walk: decide outer / inner split ---
         # Retry with a smaller tile when the largest candidate fails to
@@ -306,7 +341,34 @@ class ElementWiseNDim(GPUScheduleRule):
             if o_loop_rvs:
                 sch.reorder(*s_loop_rvs, *o_loop_rvs)
 
-            if split_info is not None:
+            fixed_axis_tiles = None
+            if fixed_spatial_tile is not None:
+                fixed_axis_tiles = align_spatial_tile_to_extents(
+                    fixed_spatial_tile,
+                    extents,
+                )
+                if fixed_axis_tiles is None:
+                    return None
+
+            if fixed_axis_tiles is not None:
+                outer_rvs = []
+                inner_rvs = []
+                inner_extents = []
+                for loop_rv, extent, axis_tile in zip(s_loop_rvs, extents, fixed_axis_tiles):
+                    axis_tile = max(1, min(int(axis_tile), int(extent)))
+                    if axis_tile == extent:
+                        inner_rvs.append(loop_rv)
+                        inner_extents.append(axis_tile)
+                    else:
+                        outer, inner_axis = sch.split(
+                            loop_rv,
+                            factors=[None, axis_tile],
+                            preserve_unit_iters=True,
+                        )
+                        outer_rvs.append(outer)
+                        inner_rvs.append(inner_axis)
+                        inner_extents.append(axis_tile)
+            elif split_info is not None:
                 axis, factor = split_info
                 out_part, in_part = sch.split(
                     s_loop_rvs[axis],

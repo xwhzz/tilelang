@@ -10,7 +10,7 @@ from tilelang import tvm
 
 from ... import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
-from .base import GPUScheduleRule
+from .base import GPUScheduleRule, spatial_tile_product_for_extents
 from .reduction_utils import (
     _analyze_reduction_update,
     _as_const_int,
@@ -158,11 +158,28 @@ def _schedule_center_bridge(
 class LayerNormLike(GPUScheduleRule):
     """LayerNorm-like two-reduction schedule rule."""
 
+    def apply_config(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        config,
+        _: bool = False,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        return self._apply_impl(func, target, fixed_spatial_tile=config)
+
     def apply(
         self,
         func: tir.PrimFunc,
         target: Target,
         _: bool,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        return self._apply_impl(func, target)
+
+    def _apply_impl(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        fixed_spatial_tile=None,
     ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
@@ -301,7 +318,22 @@ class LayerNormLike(GPUScheduleRule):
                 if len(output_s_loops) > 1
                 else output_s_loops[0]
             )
-            bx, _ = sch.split(bx_s_fused, factors=[None, 1], preserve_unit_iters=True)
+            spatial_tile = 1
+            if fixed_spatial_tile is not None:
+                spatial_tile = spatial_tile_product_for_extents(
+                    fixed_spatial_tile,
+                    [sch.get(loop).extent for loop in output_s_loops],
+                )
+                if spatial_tile is None:
+                    return None
+                spatial_extent = _as_const_int(sch.get(bx_s_fused).extent)
+                if spatial_extent is not None:
+                    spatial_tile = min(spatial_tile, spatial_extent)
+            bx, _ = sch.split(
+                bx_s_fused,
+                factors=[None, spatial_tile],
+                preserve_unit_iters=True,
+            )
         else:
             # M=1 path: M loop eliminated from output; first output loop is N.
             # Split with [1, None] → bx(1) forces blockIdx.x=1.

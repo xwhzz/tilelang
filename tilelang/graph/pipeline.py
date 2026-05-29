@@ -3,14 +3,14 @@
 import logging
 
 from tilelang import tvm as tvm
-from tvm import relax, dlight as dl
+from tvm import relax
 from tvm.target import Target
-from tilelang.schedule.templates import default_schedule_rules
 from tilelang.graph.pattern_rewrite import PatternRewritePass
 from tilelang.graph.patterns import DEFAULT_PATTERNS
 from tilelang.graph.patterns.fused_rope import fuse_qk_rope_pass
 from tilelang.graph.passes import eliminate_reshape_kernels, fold_zero_binops
 from tilelang.relax import FuseTIR
+from tilelang.graph.fusion import fuse_all
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,6 @@ def _try_pass(mod, transform, name):
 def run_pipeline(mod: tvm.IRModule, target: Target,
                  use_cuda_graph: bool = False) -> tvm.IRModule:
     """Apply the TileLang Relax compilation pipeline."""
-    rules = default_schedule_rules(target)
 
     with target:
         mod = _try_pass(mod, relax.transform.FuseTransposeMatmul(), "FuseTransposeMatmul")
@@ -62,8 +61,11 @@ def run_pipeline(mod: tvm.IRModule, target: Target,
         mod = _try_pass(mod, eliminate_reshape_kernels,
                         "EliminateReshapeKernels")
 
+        print(mod)
+        mod = fuse_all(mod, target, use_cuda_graph)
+        print(mod)
+
         lowering_passes = [
-            dl.ApplyDefaultSchedule(*rules),
             relax.transform.RewriteDataflowReshape(),
             relax.transform.ToNonDataflow(),
             relax.transform.RemovePurityChecking(),

@@ -12,7 +12,7 @@ from tilelang import tvm
 
 from ... import Schedule as TileSchedule
 from tilelang.carver.common_schedules import get_output_blocks
-from .base import GPUScheduleRule
+from .base import GPUScheduleRule, spatial_tile_product_for_extents
 from .reduction_utils import (
     _as_const_int,
     _analyze_reduction_update,
@@ -461,11 +461,28 @@ def _schedule_reduction_stage_at_bx(
 class GeneralReduction(GPUScheduleRule):
     """General Reduction rule for operators including softmax, layer norm, RMS norm, etc"""
 
+    def apply_config(
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        config,
+        _: bool = False,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        return self._apply_impl(func, target, fixed_spatial_tile=config)
+
     def apply(  # pylint: disable=too-many-locals,too-many-return-statements
         self,
         func: tir.PrimFunc,
         target: Target,
         _: bool,
+    ) -> None | tir.Schedule | list[tir.Schedule]:
+        return self._apply_impl(func, target)
+
+    def _apply_impl(  # pylint: disable=too-many-locals,too-many-return-statements
+        self,
+        func: tir.PrimFunc,
+        target: Target,
+        fixed_spatial_tile=None,
     ) -> None | tir.Schedule | list[tir.Schedule]:
         if not isinstance(func, tir.PrimFunc) or not self.is_target_available(target):
             return None
@@ -645,11 +662,25 @@ class GeneralReduction(GPUScheduleRule):
                     if num_threads < 1:
                         return None
 
-                    # Keep row tile at 1. Larger row tiles can trigger invalid
-                    # copy-back index vars in current cache_reduce_at lowering.
+                    output_tile = 1
+                    if fixed_spatial_tile is not None:
+                        output_extents = [sch.get(loop).extent for loop in output_bx_loops]
+                        output_tile = spatial_tile_product_for_extents(
+                            fixed_spatial_tile,
+                            output_extents,
+                        )
+                        if output_tile is None:
+                            return None
+                        output_extent = _as_const_int(sch.get(output_s_fused).extent)
+                        if output_extent is not None:
+                            output_tile = min(output_tile, output_extent)
+
+                    # Default row tile stays at 1. Larger row tiles can trigger
+                    # invalid copy-back index vars in current cache_reduce_at
+                    # lowering, so only the fixed-config fusion path overrides it.
                     bx, output_inner = sch.split(
                         output_s_fused,
-                        factors=[None, 1],
+                        factors=[None, output_tile],
                         preserve_unit_iters=True,
                     )
                     if output_inner_fused is not None:
@@ -890,8 +921,19 @@ class GeneralReduction(GPUScheduleRule):
                     if len(anchor_bx_loops) > 1
                     else anchor_bx_loops[0]
                 )
-                anchor_tile = 1
-                if has_reduction_prologue:
+                if fixed_spatial_tile is not None:
+                    anchor_tile = spatial_tile_product_for_extents(
+                        fixed_spatial_tile,
+                        [sch.get(loop).extent for loop in anchor_bx_loops],
+                    )
+                    if anchor_tile is None:
+                        return None
+                    lead_extent = _as_const_int(sch.get(anchor_s_fused).extent)
+                    if lead_extent is not None:
+                        anchor_tile = min(anchor_tile, lead_extent)
+                else:
+                    anchor_tile = 1
+                if fixed_spatial_tile is None and has_reduction_prologue:
                     lead_extent = _as_const_int(sch.get(anchor_s_fused).extent)
                     if lead_extent is not None and lead_extent > 1:
                         anchor_tile = min(8, lead_extent)
@@ -970,8 +1012,25 @@ class GeneralReduction(GPUScheduleRule):
             s_fused = sch.fuse(*s_loops) if len(s_loops) > 1 else s_loops[0]
             r_fused = sch.fuse(*r_loops) if len(r_loops) > 1 else r_loops[0]
 
-            # One output element per CTA, same strategy as the reduction template.
-            bx, inner_s = sch.split(s_fused, factors=[None, 1], preserve_unit_iters=True)
+            spatial_tile = 1
+            if fixed_spatial_tile is not None:
+                spatial_tile = spatial_tile_product_for_extents(
+                    fixed_spatial_tile,
+                    [sch.get(loop).extent for loop in s_loops],
+                )
+                if spatial_tile is None:
+                    return None
+                spatial_extent = _as_const_int(sch.get(s_fused).extent)
+                if spatial_extent is not None:
+                    spatial_tile = min(spatial_tile, spatial_extent)
+
+            # One output element per CTA by default; fixed-config fusion may
+            # widen this tile so producers and consumers share one CTA grid.
+            bx, inner_s = sch.split(
+                s_fused,
+                factors=[None, spatial_tile],
+                preserve_unit_iters=True,
+            )
             sch.parallel(inner_s)
 
             reduce_step = _choose_reduction_step(target, sch.get(r_fused).extent)
