@@ -77,11 +77,16 @@ def _choose_tile_and_threads(
 
     vec = max(1, 128 // dtype_bits)
     threads = 256
-    # Fall back to fewer threads only when the tensor is smaller than a
-    # single vectorised block; the outer guard (total >= 1024) makes this
-    # almost never fire, but keep it for safety.
-    while threads > 32 and threads * vec > total:
-        threads //= 2
+    if threads % total != 0:
+        threads = total
+        vec = 1
+    else:
+        # Fall back to fewer threads only when the tensor is smaller than a
+        # single vectorised block; the outer guard (total >= 1024) makes this
+        # almost never fire, but keep it for safety.
+        
+        while threads > 32 and threads * vec > total:
+            threads //= 2
 
     # ept = vec locks one 128-bit (``uint4``-class) global load per
     # thread per input buffer.  Doubling to 2*vec was explored but

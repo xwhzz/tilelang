@@ -156,6 +156,190 @@ class TileLangFXImporter(TorchFXImporter):
       fusion barriers; the codegen layer maps them back to torch ops.
     """
 
+    def _retrieve_kwargs(self, node: fx.Node):
+        return self._retrieve_args(node.kwargs)
+
+    @staticmethod
+    def _arg_or_kwarg(args, kwargs, index, name, default):
+        return args[index] if len(args) > index else kwargs.get(name, default)
+
+    def _conv_transpose1d(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        kwargs = self._retrieve_kwargs(node)
+        x = args[0]
+        weight = args[1]
+        bias = self._arg_or_kwarg(args, kwargs, 2, "bias", None)
+        stride = self._arg_or_kwarg(args, kwargs, 3, "stride", 1)
+        padding = self._arg_or_kwarg(args, kwargs, 4, "padding", 0)
+        output_padding = self._arg_or_kwarg(args, kwargs, 5, "output_padding", 0)
+        groups = self._arg_or_kwarg(args, kwargs, 6, "groups", 1)
+        dilation = self._arg_or_kwarg(args, kwargs, 7, "dilation", 1)
+        return self._conv_transpose1d_impl(
+            x,
+            weight,
+            bias=bias,
+            strides=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            output_padding=output_padding,
+        )
+
+    def _conv_transpose2d(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        kwargs = self._retrieve_kwargs(node)
+        x = args[0]
+        weight = args[1]
+        bias = self._arg_or_kwarg(args, kwargs, 2, "bias", None)
+        stride = self._arg_or_kwarg(args, kwargs, 3, "stride", 1)
+        padding = self._arg_or_kwarg(args, kwargs, 4, "padding", 0)
+        output_padding = self._arg_or_kwarg(args, kwargs, 5, "output_padding", 0)
+        groups = self._arg_or_kwarg(args, kwargs, 6, "groups", 1)
+        dilation = self._arg_or_kwarg(args, kwargs, 7, "dilation", 1)
+        return self._conv_transpose2d_impl(
+            x,
+            weight,
+            bias=bias,
+            strides=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+            output_padding=output_padding,
+        )
+
+    def _conv1d(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        kwargs = self._retrieve_kwargs(node)
+        x = args[0]
+        weight = args[1]
+        bias = self._arg_or_kwarg(args, kwargs, 2, "bias", None)
+        stride = self._arg_or_kwarg(args, kwargs, 3, "stride", 1)
+        padding = self._arg_or_kwarg(args, kwargs, 4, "padding", 0)
+        dilation = self._arg_or_kwarg(args, kwargs, 5, "dilation", 1)
+        groups = self._arg_or_kwarg(args, kwargs, 6, "groups", 1)
+        return self._conv1d_impl(
+            x,
+            weight,
+            bias=bias,
+            strides=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+        )
+
+    def _conv2d(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        kwargs = self._retrieve_kwargs(node)
+        x = args[0]
+        weight = args[1]
+        bias = self._arg_or_kwarg(args, kwargs, 2, "bias", None)
+        stride = self._arg_or_kwarg(args, kwargs, 3, "stride", 1)
+        padding = self._arg_or_kwarg(args, kwargs, 4, "padding", 0)
+        dilation = self._arg_or_kwarg(args, kwargs, 5, "dilation", 1)
+        groups = self._arg_or_kwarg(args, kwargs, 6, "groups", 1)
+        return self._conv2d_impl(
+            x,
+            weight,
+            bias=bias,
+            strides=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+        )
+
+    def _conv3d(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        kwargs = self._retrieve_kwargs(node)
+        x = args[0]
+        weight = args[1]
+        bias = self._arg_or_kwarg(args, kwargs, 2, "bias", None)
+        stride = self._arg_or_kwarg(args, kwargs, 3, "stride", 1)
+        padding = self._arg_or_kwarg(args, kwargs, 4, "padding", 0)
+        dilation = self._arg_or_kwarg(args, kwargs, 5, "dilation", 1)
+        groups = self._arg_or_kwarg(args, kwargs, 6, "groups", 1)
+        return self._conv3d_impl(
+            x,
+            weight,
+            bias=bias,
+            strides=stride,
+            padding=padding,
+            dilation=dilation,
+            groups=groups,
+        )
+
+    def _convolution(self, node: fx.Node) -> relax.Var:
+        args = self.retrieve_args(node)
+        kwargs = self._retrieve_kwargs(node)
+        x = args[0]
+        weight = args[1]
+        bias = self._arg_or_kwarg(args, kwargs, 2, "bias", None)
+        stride = self._arg_or_kwarg(args, kwargs, 3, "stride", 1)
+        padding = self._arg_or_kwarg(args, kwargs, 4, "padding", 0)
+        dilation = self._arg_or_kwarg(args, kwargs, 5, "dilation", 1)
+        transposed = self._arg_or_kwarg(args, kwargs, 6, "transposed", False)
+        output_padding = self._arg_or_kwarg(args, kwargs, 7, "output_padding", 0)
+        groups = self._arg_or_kwarg(args, kwargs, 8, "groups", 1)
+
+        input_shape = self.shape_of(x)
+        ndim = len(input_shape)
+
+        if transposed:
+            if ndim == 3:
+                return self._conv_transpose1d_impl(
+                    x,
+                    weight,
+                    bias=bias,
+                    strides=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                    output_padding=output_padding,
+                )
+            if ndim == 4:
+                return self._conv_transpose2d_impl(
+                    x,
+                    weight,
+                    bias=bias,
+                    strides=stride,
+                    padding=padding,
+                    dilation=dilation,
+                    groups=groups,
+                    output_padding=output_padding,
+                )
+            raise ValueError(f"Unsupported transposed convolution dimensionality: {ndim}")
+
+        if ndim == 3:
+            return self._conv1d_impl(
+                x,
+                weight,
+                bias=bias,
+                strides=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+        if ndim == 4:
+            return self._conv2d_impl(
+                x,
+                weight,
+                bias=bias,
+                strides=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+        if ndim == 5:
+            return self._conv3d_impl(
+                x,
+                weight,
+                bias=bias,
+                strides=stride,
+                padding=padding,
+                dilation=dilation,
+                groups=groups,
+            )
+        raise ValueError(f"Unsupported convolution dimensionality: {ndim}")
+
     def _get_expected_dtype(self, node: fx.Node):
         val = node.meta.get("val", node.meta.get("example_value"))
         if val is not None and isinstance(val, torch.Tensor):
